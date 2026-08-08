@@ -1,0 +1,3 @@
+# Make the database handle the sole owner of an open session
+
+The move-only `Database` handle exclusively owns the open session; transactions, cursors, and Blob streams are subordinate and do not extend its lifetime through shared ownership. Explicit `close()` with live subordinate handles throws `ContractError` without changing any handle state. Destroying a database with live children is an assertion failure in debug builds; release builds defensively invalidate the children, roll back or release their transactions, and attempt non-throwing best-effort shutdown. Destruction with no live children also attempts best-effort shutdown, but only successful explicit `close()` guarantees that committed state is consolidated into the portable database file.

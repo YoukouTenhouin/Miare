@@ -1,0 +1,3 @@
+# Conflate wrong keys with encrypted-header authentication failure
+
+Opening an encrypted database returns `Result<Database, AuthenticationFailed>` and selects the alternative outcome when its bootstrap/header cannot be authenticated. That outcome intentionally covers an incorrect caller key as well as header tampering or corruption because the database stores no separate key-related material and must not create an oracle that distinguishes the cause. After the header authenticates and establishes the database identity and format, authentication failure in later protected units is reported as `DatabaseError` with the stable corruption category.

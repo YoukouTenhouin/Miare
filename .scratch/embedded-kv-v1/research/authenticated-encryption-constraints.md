@@ -1,5 +1,7 @@
 # Authenticated-encryption constraints for the embedded KV database
 
+> Historical research note: the AES-256-GCM-SIV and HKDF-SHA-256 recommendations in this document were agent assumptions and were superseded by the explicit product decisions in [ADR 0015](../../../docs/adr/0015-use-xchacha20-poly1305-ietf.md) and [ADR 0018](../../../docs/adr/0018-derive-database-keys-with-blake2b.md). Construction-independent conclusions about bounded authenticated units, canonical associated data, domain separation, fail-closed behavior, and the offline threat boundary remain applicable.
+
 Researched 2026-08-08. Sources are limited to primary standards and official provider documentation.
 
 ## Recommendation

@@ -1,0 +1,500 @@
+# Public and transactional contract
+
+Status: v1 frozen
+
+This document is the canonical public C++20 and transactional contract for Miare. Later storage, recovery, provider, and verification work may deepen implementation details, but may not change behavior described here without an explicit compatibility-breaking decision.
+
+## Public boundary and naming
+
+Applications include the single documented project header:
+
+```cpp
+#include <miare/database.hpp>
+```
+
+Public symbols live in `miare`; implementation details live in `miare::detail`. Types and enum values use `CamelCase`, methods and variables use `camelCase`, and namespaces use `snake_case`.
+
+The project's implementation is header-only C++20. Provider libraries may be vendored or linked separately. Public database, transaction, cursor, and Blob handles are move-constructible, non-copyable, non-move-assignable, and not publicly default-constructible. Moving a handle leaves the source inert; operations other than destruction or state inspection throw `ContractError{Errc::InvalidState}`.
+
+## Core types
+
+The declarations below fix names, ownership, and semantic shapes. They are a contract sketch rather than the literal final header layout.
+
+```cpp
+namespace miare {
+
+using ByteView = std::span<const std::byte>;
+using MutableByteView = std::span<std::byte>;
+
+class EncryptionKeyView; // borrowed bytes; the suite validates length
+
+enum class StorageBackend : std::uint32_t {
+    BTree
+};
+
+enum class Compression : std::uint32_t {
+    None,
+    ZStd
+};
+
+enum class EncryptionSuite : std::uint32_t {
+    XChaCha20Poly1305Ietf
+};
+
+struct CreateOptions {
+    StorageBackend storageBackend = StorageBackend::BTree;
+    Compression compression = Compression::ZStd;
+    EncryptionSuite encryptionSuite =
+        EncryptionSuite::XChaCha20Poly1305Ietf;
+};
+
+struct OpenOptions {
+    std::size_t cacheCapacityBytes = 64U * 1024U * 1024U;
+    std::uint32_t maxReaders = 256;
+};
+
+template<class T, class E>
+class Result;
+
+class AuthenticationFailed;
+class WriterBusy;
+class ProviderSet;
+class BlobId;
+class KeyRangeView;
+struct DefaultLimits;
+class BackupReport;
+class VerificationReport;
+class DiagnosticsSnapshot;
+class WriteTransactionStats;
+
+template<
+    class Allocator = std::allocator<std::byte>,
+    class Limits = DefaultLimits>
+requires DatabaseAllocator<Allocator> && LimitPolicy<Limits>
+class Database;
+
+} // namespace miare
+```
+
+Persisted algorithm and profile identifiers have a canonical byte encoding; implementations never serialize the in-memory enum representation directly.
+
+### Result
+
+`Result<T, E>` represents only an operation's explicitly modeled alternative outcome. It never transports exceptional `Errc` values.
+
+```cpp
+static Result success(T value);
+static Result failure(E error);
+
+bool hasValue() const noexcept;
+explicit operator bool() const noexcept;
+
+T& value() &;
+const T& value() const&;
+T&& value() &&;
+
+E& error() &;
+const E& error() const&;
+E&& error() &&;
+```
+
+It stores one alternative inline, supports move-only types, and performs no allocation itself. Accessing the inactive alternative throws `ContractError{Errc::InvalidState}`. V1 has no implicit converting constructors, monadic helpers, or `Result<void, E>`.
+
+Ordinary absence uses `std::optional`, including an absent key or Blob. `AuthenticationFailed` and `WriterBusy` are detail-free tag types.
+
+### Bytes and allocation
+
+Inputs are borrowed only for the duration of a call. Point reads return allocator-aware owned bytes; cursor results are borrowed views. Each `Database` instantiation scopes its allocator-dependent aliases, including `OwnedBytes` and all handle types.
+
+The stateful allocator supplied to `create` or `open` is stored by value and rebound with `std::allocator_traits` for project-owned caches, transaction metadata, bounds, and returned buffers. Provider-owned allocation, standard exception internals, and operating-system resources are outside this boundary. Custom allocators must support concurrent use through equivalent copies. External allocator state must outlive the database and every returned owned buffer. Allocation failure propagates as `std::bad_alloc`.
+
+Mutation inputs may alias views returned by the same transaction. An operation captures and validates input bytes before it mutates state or invalidates cursors.
+
+### Blob identifier
+
+`BlobId` is an opaque random 128-bit database-local identity with canonical serialization:
+
+```cpp
+class BlobId {
+public:
+    static constexpr std::size_t encodedSize = 16;
+
+    static BlobId fromBytes(
+        std::span<const std::byte, encodedSize> bytes) noexcept;
+    std::array<std::byte, encodedSize> toBytes() const noexcept;
+
+    friend bool operator==(BlobId, BlobId) noexcept = default;
+    friend std::strong_ordering
+        operator<=>(BlobId, BlobId) noexcept = default;
+};
+```
+
+`std::hash<miare::BlobId>` is provided. Blob identifiers are generated by the provider CSPRNG and collision-checked in the write transaction's view. An aborted identifier is never deliberately reused. An identifier carries no database identity, generation, timestamp, or global uniqueness promise; using an identifier from another database simply observes absence.
+
+## Exceptions and semantic outcomes
+
+A returned alternative is a legitimate outcome in the stated semantics of an operation. Failure to fulfill the operation's contract is exceptional. Public operations do not have a blanket `noexcept` guarantee.
+
+```cpp
+enum class Errc : std::uint16_t {
+    InvalidArgument,
+    InvalidConfiguration,
+    InvalidState,
+    WrongThread,
+    LiveChildren,
+
+    Io,
+    Durability,
+    Corrupt,
+    UnsupportedFormat,
+    UnsupportedFeature,
+    IncompatibleProfile,
+    ProviderUnavailable,
+    ResourceLimit,
+    RecoveryRequired,
+    CommitFailed,
+    CommitOutcomeUnknown,
+    InUse
+};
+
+class ContractError : public std::logic_error {
+public:
+    Errc code() const noexcept;
+};
+
+class DatabaseError : public std::runtime_error {
+public:
+    Errc code() const noexcept;
+    std::optional<std::error_code> nativeCode() const noexcept;
+};
+```
+
+Existing numeric `Errc` values and meanings are stable. Later API versions may append categories. `nativeCode()` is populated only for an underlying operating-system error. Provider details and `what()` text are diagnostics and are not stable control-flow inputs. `std::bad_alloc` remains outside this hierarchy.
+
+Examples of semantic alternatives and exceptions:
+
+- `open` returns `AuthenticationFailed` when the encrypted bootstrap cannot authenticate.
+- `tryBeginWrite` returns `WriterBusy` when it cannot acquire the writer immediately.
+- `get`, `openBlob`, and `replaceBlob` return empty optionals for absence.
+- Invalid arguments, configuration, state, handle lifetime, or thread use throw `ContractError`.
+- I/O, durability, corruption, unsupported format or features, incompatible profiles, unavailable providers, capacity exhaustion, and uncertain persistence throw `DatabaseError`.
+
+## Database construction and opening
+
+```cpp
+template<class Allocator, class Limits>
+class Database {
+public:
+    using OwnedBytes = std::vector<
+        std::byte,
+        typename std::allocator_traits<Allocator>::template rebind_alloc<
+            std::byte>>;
+
+    static Database create(
+        const std::filesystem::path& path,
+        EncryptionKeyView key,
+        ProviderSet providers,
+        CreateOptions options = {},
+        Allocator allocator = {});
+
+    static Result<Database, AuthenticationFailed> open(
+        const std::filesystem::path& path,
+        EncryptionKeyView key,
+        ProviderSet providers,
+        OpenOptions options = {},
+        Allocator allocator = {});
+};
+```
+
+`ProviderSet` is an owned, type-erased value moved into the database session. It supplies narrow randomness, KDF, encryption, and compression capabilities. Persisted files identify algorithms and profiles, never provider implementations or versions. A missing required capability throws `DatabaseError{Errc::ProviderUnavailable}`. There is no silent process-global provider registry.
+
+`CreateOptions` contains persisted choices. `OpenOptions` contains runtime budgets only. `open` discovers backend, compression, encryption, format, features, and capacity profile from the authenticated file rather than accepting caller expectations.
+
+V1 uses:
+
+- `StorageBackend::BTree`, fixed for the database's lifetime;
+- `Compression::ZStd` by default, or explicit `Compression::None`;
+- libsodium-compatible `EncryptionSuite::XChaCha20Poly1305Ietf`;
+- a suite-selected 32-byte derived key, fresh random 24-byte nonce per independently authenticated unit, and full 16-byte tag;
+- libsodium-compatible BLAKE2b-256 derivation with separate header, main-data, recovery-data, and Blob keys.
+
+The XChaCha20-Poly1305-IETF suite accepts exactly 32 bytes of caller-supplied high-entropy encryption key material. The length belongs to the suite contract rather than `EncryptionKeyView`; invalid length throws `ContractError{Errc::InvalidArgument}`. Passwords and password KDF policy remain outside the database. The original key and a key verifier are never stored; only derived internal keys remain for the session and receive best-effort erasure.
+
+Key derivation has two fixed stages:
+
+1. Generate and persist a random 16-byte KDF salt when creating the database. Derive a 32-byte database root with keyed BLAKE2b-256 over the canonical database identity, encryption-suite identifier, and derivation version. Use the caller's 32-byte key as the BLAKE2b key, the stored salt as the BLAKE2b salt parameter, and the 16-byte personalization `MiareDbRootV1` followed by three zero bytes.
+2. Use libsodium-compatible `crypto_kdf_derive_from_key()` with the database root, the exact 8-byte context `MiareV1K`, 32-byte outputs, and stable subkey identifiers `1` for header, `2` for main data, `3` for recovery data, and `4` for Blob data.
+
+The bounded visible bootstrap persists the database identity, KDF identifier, derivation version, and salt needed to reproduce this derivation; header authentication binds all of them before they are trusted. The canonical root input encoding and all derived outputs have cross-provider fixtures. Changing any personalization, context, subkey identifier, or input encoding is a format change. The caller-key copy and intermediate database root receive best-effort erasure after derivation.
+
+Failure to authenticate the encrypted bootstrap returns `AuthenticationFailed`, intentionally conflating an incorrect key with bootstrap tampering or corruption. No plaintext or finer reason is exposed. After bootstrap authentication establishes database identity and format, failure to authenticate a protected unit is corruption and throws `DatabaseError{Errc::Corrupt}`.
+
+`create` never overwrites or adopts an existing path. It prepares a unique sibling temporary file, validates it, and installs it exclusively. Failure before installation removes the temporary file best-effort and leaves the target absent. Failure after installation may leave a valid self-identifying database at the target, but returns no handle; the caller must explicitly open or remove it. Cleanup failure is secondary diagnostic detail.
+
+`open` may perform deterministic crash recovery, selecting the last provably committed generation and resolving interrupted recovery or maintenance records. It never performs a format, backend, compression, encryption, key, or capacity-profile migration. Unknown required features and incompatible identities fail explicitly.
+
+Open tightly bounds and parses the visible envelope fields needed to select a suite. An unknown envelope or suite throws `UnsupportedFormat` or `UnsupportedFeature`; no unauthenticated field controls allocation, offsets, backend dispatch, or recovery decisions beyond those fixed parsing bounds.
+
+One database file may have only one open session. An in-process registry uses resolved file identity, including aliases and hard links where the platform supports it, and the library also takes the strongest practical exclusive OS lock. A second open throws `DatabaseError{Errc::InUse}`. OS locking is defensive detection, not a multi-process correctness guarantee.
+
+## Ownership, lifetime, and threads
+
+The move-only `Database` handle is the sole owner of the open session. Transactions, cursors, and Blob streams are subordinate and never extend the session through shared ownership.
+
+The database handle is safe for concurrent calls. Each transaction is permanently bound to its creating thread; its cursors and Blob streams inherit that affinity. Moving a handle does not transfer affinity. Functional use on another thread throws `ContractError{Errc::WrongThread}`, and no subordinate handle may be used concurrently.
+
+Non-throwing terminal release is the exception to affinity: read-transaction `end`, write-transaction `rollback`, Blob-reader `close`, Blob-writer `abort`, and destruction may occur on another thread, provided they do not run concurrently with another operation.
+
+Successful transaction termination invalidates its cursors and Blob readers. Rollback also aborts unfinished Blob writers. Inert child objects no longer count as live database resources and reject functional use with `InvalidState`. Destroying a transaction with live children asserts in debug builds; release builds defensively invalidate them and end or roll back.
+
+## Transactions and writer admission
+
+Read and write transactions are distinct types with no public base class, runtime mode, upgrade, downgrade, nesting, or refresh operation.
+
+```cpp
+ReadTransaction beginRead();
+WriteTransaction beginWrite();
+Result<WriteTransaction, WriterBusy> tryBeginWrite();
+```
+
+Many read transactions may coexist. There is one admitted writer or writer-lane maintenance operation. `beginWrite` waits without an implicit timeout. Blocking writer and maintenance admission is FIFO. `tryBeginWrite` never waits and never jumps queued work; it returns `WriterBusy` when immediate admission would violate exclusivity or fairness.
+
+Read transactions never expire. Long-lived snapshots may delay reclamation and increase storage pressure. The database surfaces that pressure rather than advancing or terminating readers.
+
+`beginRead` captures the latest committed state at one linearization point during the call. Its snapshot never advances. `beginWrite` captures the latest committed state after it wins writer admission. A writer sees its own key and finalized Blob changes immediately. Readers started while it is active see only the previous committed state. A successful commit becomes visible to transactions created afterward, never to existing readers.
+
+### Exact operations
+
+```cpp
+class ReadTransaction {
+public:
+    std::optional<OwnedBytes> get(ByteView key);
+    bool contains(ByteView key);
+    ReadCursor scan(KeyRangeView range = KeyRangeView::all());
+    std::optional<BlobReader> openBlob(BlobId id);
+
+    void end() noexcept;
+    bool active() const noexcept;
+};
+
+class WriteTransaction {
+public:
+    std::optional<OwnedBytes> get(ByteView key);
+    bool contains(ByteView key);
+    WriteCursor scan(KeyRangeView range = KeyRangeView::all());
+    std::optional<BlobReader> openBlob(BlobId id);
+
+    void put(ByteView key, ByteView value);
+    bool erase(ByteView key);
+
+    BlobWriter createBlob();
+    std::optional<BlobWriter> replaceBlob(BlobId id);
+    bool eraseBlob(BlobId id);
+
+    WriteTransactionStats stats() const;
+    void commit();
+    void rollback() noexcept;
+    bool active() const noexcept;
+};
+```
+
+`put` unconditionally inserts or replaces and does not report which. `erase` reports whether a key existed. Empty keys and values are valid. V1 has no insert-only, update-only, compare-and-swap, or conditional mutation API. Every `put`, including identical bytes, and every successful `erase` is a mutation and invalidates all existing write-transaction cursors. Blob-only changes do not invalidate ordered-keyspace cursors because the database gives no meaning to application Blob references stored in values.
+
+### Ordered cursors and ranges
+
+Keys use unsigned-byte lexicographic order. Ranges are solely half-open `[lower, upper)` intervals with either bound optionally absent.
+
+```cpp
+class KeyRangeView {
+public:
+    static KeyRangeView all() noexcept;
+    static KeyRangeView halfOpen(
+        std::optional<ByteView> lowerInclusive,
+        std::optional<ByteView> upperExclusive) noexcept;
+    static KeyRangeView prefix(ByteView prefix) noexcept;
+};
+
+class ReadCursor { // WriteCursor has the same surface
+public:
+    bool first();
+    bool last();
+    bool seekLowerBound(ByteView key);
+    bool next();
+    bool previous();
+
+    bool positioned() const noexcept;
+    ByteView key() const;
+    ByteView value() const;
+};
+```
+
+`KeyRangeView` borrows only for the `scan` call; the cursor copies its bounds with the database allocator. An empty prefix covers the complete ordered keyspace. An all-`0xFF` prefix may have no finite upper bound. Stored and seek keys are limited to `maxKeyBytes`; comparison-only half-open bounds may be `maxKeyBytes + 1` bytes so an inclusive logical endpoint can be represented by appending `0x00`.
+
+Cursors are navigation-only. A new cursor is unpositioned. `first`, `last`, and `seekLowerBound` return whether they positioned it. `next` and `previous` require a position; crossing a range boundary returns `false` and makes the cursor unpositioned. After `false`, the caller explicitly repositions. `key` and `value` on an unpositioned or invalidated cursor throw `ContractError{Errc::InvalidState}`.
+
+Cursor byte views remain valid simultaneously until the next positioning or movement operation, cursor destruction, transaction termination, or write-cursor invalidation. They never expose mutable mapped storage. Exceptional movement preserves the previous position.
+
+## Transactional Blobs
+
+A Blob identifier names mutable database-local object identity, not immutable content. The database does not discover or enforce relationships between values and Blob identifiers; referential integrity belongs to the application.
+
+Creation reserves a fresh identifier. Replacement streams new content under an existing identity. A write transaction sees a replacement only after its writer finishes. Existing Blob readers retain the content version they opened; new readers follow read-your-writes. Commit publishes key and Blob changes atomically, while rollback preserves prior committed content.
+
+Multiple Blob writers may be open and their writes interleaved on the transaction thread. Writers are sequential from byte zero; readers are seekable. V1 has no append-specific, sparse, truncate, writable-seek, or partial-update API.
+
+```cpp
+class BlobReader {
+public:
+    BlobId id() const;
+    std::uint64_t size() const;
+    std::uint64_t position() const;
+
+    std::size_t read(MutableByteView destination);
+    void seek(std::uint64_t absoluteOffset);
+
+    void close() noexcept;
+    bool active() const noexcept;
+};
+
+class BlobWriter {
+public:
+    BlobId id() const;
+    std::uint64_t position() const;
+
+    void write(ByteView source);
+    void finish();
+    void abort() noexcept;
+
+    bool active() const noexcept;
+};
+```
+
+Empty Blobs and empty stream operations are valid. `read` advances and returns bytes read, with zero indicating end-of-Blob. `seek` accepts offsets from zero through `size`; a larger offset throws `InvalidArgument`.
+
+Destroying or aborting an unfinished writer aborts only that Blob creation or replacement. Until replacement finalization, the old content remains visible to the write transaction; an unfinished new Blob is not readable. `commit` with any unfinished writer throws `ContractError{Errc::InvalidState}` before persistence and leaves the transaction active.
+
+`eraseBlob` reports whether the Blob exists in the transaction view. Erasing while that identifier has an unfinished writer throws `InvalidState` without changes. Erasing after a finished replacement discards that replacement and marks the identifier absent. Existing readers retain their opened version; readers in other snapshots are unaffected.
+
+## Commit, rollback, and failure states
+
+A successful `commit()` returns `void`, makes all transaction changes atomic and durable, and makes the transaction terminal. The API exposes no backend generation as an application idempotency token. Applications needing retry detection store their own operation identity within the transaction and inspect it after reopening.
+
+`rollback()` is non-throwing, makes the transaction terminal, and discards all uncommitted changes logically. Destruction of an active writer performs the same rollback. Physical staging garbage is reclaimed later and cannot make rolled-back state visible. Reusing a committed, rolled-back, ended, failed, or moved-from transaction throws `InvalidState`.
+
+Before persistence begins, public operations provide a strong logical exception guarantee: `ContractError`, `std::bad_alloc`, `ProviderUnavailable`, `ResourceLimit`, and ordinary I/O failure preserve public handle states, cursor position, and transaction contents. A failed mutable-buffer read may leave unspecified bytes in the caller buffer, but never releases unauthenticated plaintext.
+
+After commit persistence begins, a `DatabaseError` makes the writer terminal and places the session in `DatabaseState::RecoveryRequired`. `CommitFailed` means the new state is known not to have been published; `CommitOutcomeUnknown` means only reopen recovery can determine whether it committed. Neither is retryable library state. New transactions and mutations are rejected until close and reopen. Existing safe read snapshots may finish. Commit persistence is prepared to avoid further allocation; if `std::bad_alloc` nevertheless escapes after persistence starts, it propagates unchanged while the writer becomes terminal and the session records `CommitOutcomeUnknown`.
+
+Confirmed corruption in an open session throws `Corrupt`, atomically enters `RecoveryRequired`, and makes all subordinate handles terminal. Later operations throw `RecoveryRequired`. Operations fully linearized before corruption publication remain valid; concurrent operations either complete before that point or fail. Corruption never permits continued access to apparently healthy cached regions.
+
+`DatabaseState::RecoveryRequired` therefore has cause-dependent reader handling: commit or close persistence uncertainty preserves existing safe readers, while confirmed corruption invalidates them. `DiagnosticsSnapshot::recoveryCause` exposes the stable cause.
+
+## Mutation and memory limits
+
+Hard limits belong to the compile-time `Limits` policy and its persisted exact-match profile:
+
+```cpp
+struct DefaultLimits {
+    static constexpr std::uint64_t maxKeyBytes = 4ULL * 1024ULL;
+    static constexpr std::uint64_t maxValueBytes =
+        16ULL * 1024ULL * 1024ULL;
+    static constexpr std::uint64_t maxBlobBytes = 1ULL << 40;
+    static constexpr std::uint64_t maxDatabaseBytes = 16ULL << 40;
+
+    static constexpr std::uint64_t maxKeyMutationsPerTransaction = 1'000'000;
+    static constexpr std::uint64_t maxBlobMutationsPerTransaction = 1'024;
+    static constexpr std::uint64_t maxBlobBytesPerTransaction = 1ULL << 40;
+    static constexpr std::uint64_t maxFileGrowthPerTransaction = 2ULL << 40;
+
+    static constexpr std::uint32_t maxCursorsPerTransaction = 1'024;
+    static constexpr std::uint32_t maxBlobReadersPerTransaction = 1'024;
+    static constexpr std::uint32_t maxOpenBlobWritersPerTransaction = 1'024;
+};
+```
+
+`LimitPolicy` validates internal consistency at compile time. The file records a canonical identity for every profile value. `open` requires an exact profile match even if current contents would fit a different policy. Portability is guaranteed only among implementations with identical profiles.
+
+Successful mutating calls count toward transaction limits, not merely distinct final objects: every `put` counts; `erase` and `eraseBlob` count only when true; Blob creation or replacement counts when the writer is created and releases its count on abort. Replacing then erasing one Blob counts twice. `WriteTransactionStats` exposes `keyMutations`, `blobMutations`, `blobBytesWritten`, `estimatedFileGrowthBytes`, and `openBlobWriters`.
+
+A transaction may grow aggregate database-owned main and data-bearing sidecar storage by at most 2 TiB before reclamation, accommodating a worst-case 1 TiB incompressible Blob plus copy-on-write and authenticated metadata. Commit preflight must satisfy this allowance and the 16 TiB main-file maximum. Bytes retained only for old snapshots do not count against the current transaction allowance but do consume the database-size envelope.
+
+Runtime `OpenOptions` permit 1 through 65,535 readers and cache capacity from 4 MiB through 64 GiB, capped by addressable `std::size_t`. The cache budget covers retained decoded pages and Blob chunks, not returned buffers, active transaction state, provider workspace, or application memory. Pressure evicts unpinned entries; if pinned entries prevent another required allocation within the budget, the operation throws `ResourceLimit` rather than silently exceeding it.
+
+Read transactions never expire. Diagnostics expose active reader count, oldest snapshot generation and age, bytes retained solely by snapshots, and estimated reclaimable bytes. If snapshot retention prevents a write from fitting, preflight throws `ResourceLimit` with the transaction active and session usable. If capacity failure occurs only after persistence starts, the fail-stop commit rule applies.
+
+## Maintenance, verification, diagnostics, and shutdown
+
+```cpp
+void checkpoint();
+void compact();
+BackupReport backupTo(const std::filesystem::path& destination);
+VerificationReport verify();
+
+static Result<VerificationReport, AuthenticationFailed> verifyFile(
+    const std::filesystem::path& path,
+    EncryptionKeyView key,
+    ProviderSet providers,
+    Allocator allocator = {});
+
+DatabaseState state() const noexcept;
+DiagnosticsSnapshot diagnostics() const;
+void close();
+```
+
+These operations are synchronous and intended for an application worker thread. V1 has no callback, future, progress, or cancellation protocol. `checkpoint`, `compact`, and `backupTo` join the FIFO writer lane. `verify` may coexist with readers but excludes writers and other maintenance. `verifyFile` acquires exclusive file ownership and never repairs or mutates its input.
+
+`verify` performs one full verification level: it authenticates and structurally validates every reachable unit, ordered-keyspace invariant, Blob manifest and chunk chain, and relevant recovery metadata. `VerificationReport` owns a validity result, counts and bytes checked, a fixed bounded number of physical findings, and a truncation flag; it never contains application keys, values, Blob content, or encryption material. Online confirmed corruption returns the report and enters `RecoveryRequired`. Offline verification has no session to affect. Bootstrap rejection from `verifyFile` returns `AuthenticationFailed`.
+
+`backupTo` creates a clean, portable, consistent single-file snapshot and never overwrites its destination. Destination failure preserves the source session and uses best-effort temporary cleanup. Source corruption follows the normal corruption rule. Checkpoint or compaction preflight failure leaves the session open; persistence-stage source failure enters `RecoveryRequired`. Detailed algorithms, interruption points, and workspace requirements are fixed by the dedicated maintenance contract.
+
+`DatabaseState` is `Open`, `Closing`, `RecoveryRequired`, or `Closed`; a moved-from database reports `Closed`. `state()` is always non-throwing. `diagnostics()` is allowed while open or recovery-required and throws `InvalidState` after close. Its internally consistent point-in-time snapshot includes:
+
+- format and capacity profile, backend, compression, and encryption identities;
+- last known committed generation;
+- main-file and sidecar bytes;
+- live, reclaimable, and snapshot-retained byte estimates;
+- cache capacity, use, pinned bytes, and eviction count;
+- active reader count, oldest reader generation and age;
+- writer or maintenance activity and FIFO queue depth;
+- recovery-required status and stable cause.
+
+Diagnostics never include keys, values, Blob identifiers, key material, paths, or native error messages.
+
+### Close and destruction
+
+`close()` atomically enters `Closing`. Calls already running may complete, while queued writer and maintenance acquisition is cancelled with `ContractError{Errc::InvalidState}` so shutdown cannot wait behind unacquired work. New calls are rejected.
+
+After in-flight handle creation settles, live subordinate handles cause `ContractError{Errc::LiveChildren}`; the database returns to its prior `Open` or `RecoveryRequired` state and every handle remains valid. An active writer is never forcibly committed. Otherwise close obtains exclusive maintenance access, consolidates committed state into the portable database file, removes the need for data-bearing sidecars, and closes resources. A concurrent losing `close` call throws `InvalidState`.
+
+Preflight close failure restores the prior state and may be retried. Failure after consolidation or durability work begins enters `RecoveryRequired`; diagnostics, another explicit close attempt, and destruction remain permitted. A later successful close restores the portable-file guarantee. The next `open` performs normal crash recovery if close never succeeds.
+
+Successful close leaves an inert `Closed` database handle. Only successful explicit `close()` guarantees that the portable database file contains all committed state without required data-bearing sidecars. Destruction with no children attempts non-throwing best-effort shutdown. Destruction with live children asserts in debug builds; release builds invalidate children, roll back or end transactions, and attempt best-effort shutdown. Destructors never throw.
+
+## Representative desktop workload
+
+The default contract is qualified against this intended workload rather than its absolute correctness ceilings:
+
+- up to 1 TiB of committed data and 100 million keys;
+- typical keys of 16–256 bytes and values of 100 bytes–64 KiB;
+- media Blobs commonly 1 MiB–10 GiB, with a small number potentially larger;
+- up to 256 concurrent readers across application worker threads;
+- typical write transactions of 1–10,000 key mutations and up to 10 GiB of streamed Blob content;
+- read snapshots lasting minutes during export or UI workflows, with observable reclamation pressure and no forced expiry.
+
+The larger hard limits are correctness and interoperability limits for a matching profile, not performance promises. Later qualification work fixes measurable latency, throughput, memory, amplification, and maintenance targets within this envelope.
+
+## Explicit v1 exclusions
+
+- Multi-process access correctness, server operation, remote access, replication, or synchronization.
+- A second production storage backend or migration between backends.
+- Named collections, custom comparators, typed serialization, secondary indexes, or query processing.
+- Nested transactions, transaction upgrade/downgrade, conditional writes, or configurable weaker durability.
+- Treating large media as ordinary values instead of Blobs.
+- Blob append, sparse, truncate, writable-seek, partial update, or database-managed referential integrity.
+- User-defined compression codecs, persistent compression dictionaries without a separate lifecycle contract, or changing compression for an existing database.
+- Password handling, password KDF policy, OS keychain integration, rekeying, or encryption-suite migration.
+- Protection from a compromised running process or whole-file rollback without trusted external state.
+- Implicit format upgrades, implicit destructive repair, or salvage during normal `open`.
+- Writable memory mapping as the canonical write path.
+- Custom allocator control over provider, standard-library exception, or OS-owned allocation.
+- Public asynchronous maintenance, callbacks, progress reporting, or cancellation in v1.

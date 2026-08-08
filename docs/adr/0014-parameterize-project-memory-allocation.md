@@ -1,0 +1,3 @@
+# Parameterize project-owned allocation at the database type
+
+`Database` accepts an allocator type, defaulting to `std::allocator<std::byte>`, and its scoped handle and owned-buffer types use copies rebound through `std::allocator_traits`. A stateful allocator instance is supplied when creating or opening a session and covers project-owned caches, transaction metadata, and returned buffers, while provider allocations, standard exception internals, and operating-system resources remain outside that boundary. Custom allocators must support concurrent use through equivalent copies and their external state must outlive the session and every returned owned buffer.

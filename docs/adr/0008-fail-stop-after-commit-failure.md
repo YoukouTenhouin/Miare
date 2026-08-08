@@ -1,0 +1,3 @@
+# Require recovery after a persistence-stage commit failure
+
+Once persistence processing has begun, a `DatabaseError` from `commit()` makes the write transaction terminal and the open database rejects new transactions and mutations until close and reopen establish the committed generation. Existing read transactions may finish against their snapshots. The error distinguishes a transaction known not to have been published from an outcome only recovery can determine; the database does not retain or retry uncommitted changes, so applications that require retry or idempotency must model it in their own data and operation flow.

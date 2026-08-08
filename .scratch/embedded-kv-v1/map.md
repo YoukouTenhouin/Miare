@@ -19,14 +19,18 @@ Produce an implementation-ready v1 product and architecture specification for a 
 - Encryption protects confidentiality and integrity against offline file access, not a compromised running process. The caller supplies high-entropy key material; passwords, KDF policy, and OS key storage remain application concerns.
 - A cleanly closed database's committed state is portable as one cross-platform file. Runtime lock, journal, or WAL sidecars are permitted, but data-bearing sidecars must be encrypted and must not be needed after a successful close.
 - Read transactions retain stable snapshots and do not block the writer, but may delay reclamation; diagnostics should expose that pressure rather than forcibly expiring readers.
-- Public operations return explicit result/error values for routine failures rather than throwing exceptions.
+- Public operations use `Result<T, E>` only for legitimate semantic alternatives; invalid contracts and failures to fulfill an operation throw stable `ContractError` or `DatabaseError` categories.
 - Canonical terminology lives in [CONTEXT.md](../../CONTEXT.md); settled architectural constraints are recorded in [the ADRs](../../docs/adr/).
 
 ## Decisions so far
 
 <!-- Resolved tickets are indexed here; the detailed answer lives in each ticket. -->
 
-- [Establish authenticated-encryption constraints](issues/06-establish-authenticated-encryption-constraints.md) — Fixes v1 on AES-256-GCM-SIV with HKDF-separated domains, fresh random nonces, full 128-bit tags, independently authenticated bounded units, canonical AAD, and explicit use/rollback limits.
+- [Freeze the public and transactional contract](../embedded-kv-v1-implementation/issues/01-freeze-public-and-transactional-contract.md) — Fixes the C++20 surface, semantic outcomes and exceptions, handle lifecycles, concurrency and snapshots, Blob streams, maintenance, diagnostics, shutdown, capacity profiles, and representative desktop workload.
+
+- [Use XChaCha20-Poly1305-IETF](../../docs/adr/0015-use-xchacha20-poly1305-ietf.md) — Replaces the earlier agent-assumed AES suite with the explicit product choice of libsodium-compatible XChaCha20-Poly1305-IETF using fresh random 24-byte nonces and full tags.
+
+- [Derive database keys with BLAKE2b](../../docs/adr/0018-derive-database-keys-with-blake2b.md) — Replaces the inherited HKDF-SHA-256 assumption with a salted database-root derivation and libsodium BLAKE2b KDF domain keys.
 
 - [Evaluate compression provider options](issues/08-evaluate-compression-provider-options.md) — Select RFC 8878 Zstandard with `libzstd` as v1's sole bounded, streamable provider; retain LZ4 Frame as a benchmark-driven future option behind database-owned codec/profile IDs.
 
@@ -37,7 +41,7 @@ Produce an implementation-ready v1 product and architecture specification for a 
 - Exact page, extent, free-space, and overflow layouts; these become sharp after the B+ tree update/recovery strategy and Blob model are chosen.
 - Format upgrade and backward-compatibility mechanics beyond the already-required cross-platform byte representation; these depend on the physical format and encryption envelope.
 - Concrete salvage and repair behavior for partially corrupt databases; this depends on what integrity metadata and failure boundaries the selected formats provide.
-- Exact cache controls, memory-pressure behavior, database-size limits, key/value limits, and performance targets; these depend on the API and storage architecture.
+- Measurable latency, throughput, memory, and amplification targets within the frozen representative workload; correctness limits and public cache-pressure behavior are fixed by ticket 01.
 - Detailed fuzzing, fault-injection, crash-matrix, interoperability, and long-duration tests; these become precise after the observable contracts and file states are settled.
 - Distribution and provider-discovery details across build systems; these depend on the final provider interfaces and supported configurations.
 

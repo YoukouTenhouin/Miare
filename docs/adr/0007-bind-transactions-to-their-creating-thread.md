@@ -1,0 +1,3 @@
+# Bind transactions and subordinate handles to one thread
+
+The `Database` handle is safe for concurrent calls, while each transaction is permanently bound to its creating thread and its cursors and Blob streams inherit that affinity. Moving a handle does not transfer affinity, and wrong-thread functional operations throw `ContractError`; no subordinate handle may be used concurrently. Non-throwing terminal release and destruction may occur on another thread only to release resources, end, abort, or roll back, accepting this restriction to keep the desktop-oriented transaction model and backend synchronization simple.

@@ -1,0 +1,7 @@
+# Report failures according to operation semantics
+
+Public operations will return legitimate alternative outcomes that are part of their stated semantics, such as an absent key, writer contention from a `try_` operation, or rejected authentication. Failures that prevent an operation from fulfilling its contract—including invalid configuration or handle state, corruption, unsupported formats, I/O and durability failures, provider unavailability, and resource failures—will be reported by exceptions; `std::bad_alloc` may propagate normally. This semantic boundary avoids forcing exceptional failures into routine control flow while requiring the contract to specify affected-handle states.
+
+Operations with a meaningful non-success outcome use the public expected-like `Result<T, E>` type, where `E` is an operation-specific semantic alternative rather than a general error category. Ordinary absence may use `std::optional`; exceptional `Errc` values never travel through `Result`.
+
+The public exception surface has two families rather than one subclass per failure: `ContractError`, derived from `std::logic_error`, reports invalid configuration, arguments, thread use, or handle state; `DatabaseError`, derived from `std::runtime_error`, reports stored-state, I/O, durability, provider, and storage-resource failures. Both expose a stable `Errc` category. Native operating-system and provider details are diagnostic only, while `std::bad_alloc` remains outside this hierarchy.

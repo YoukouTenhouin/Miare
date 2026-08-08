@@ -1,0 +1,3 @@
+# Enter recovery-required state when corruption is confirmed
+
+If an operation confirms corruption in an already-open database, it atomically places the session in the recovery-required state and makes all subordinate handles terminal. Subsequent access is rejected until the application destroys those handles, closes the session, and explicitly reopens or invokes the later-defined offline recovery workflow. This rejects best-effort access to apparently healthy snapshots because continuing after the integrity boundary has failed would make safety dependent on which units happened to be cached or visited first.
