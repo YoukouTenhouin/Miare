@@ -1,0 +1,15 @@
+add_executable(miare_public_primitives_test public_primitives_test.cpp)
+target_link_libraries(miare_public_primitives_test PRIVATE miare::miare)
+add_test(NAME miare.public_primitives COMMAND miare_public_primitives_test)
+
+add_executable(miare_minimal_consumer minimal_consumer.cpp)
+target_link_libraries(miare_minimal_consumer PRIVATE miare::miare)
+add_test(NAME miare.minimal_consumer COMMAND miare_minimal_consumer)
+
+add_executable(miare_durable_file_test durable_file_test.cpp)
+target_link_libraries(miare_durable_file_test PRIVATE miare::miare)
+add_test(NAME miare.durable_file COMMAND miare_durable_file_test)
+
+add_executable(miare_provider_test provider_test.cpp)
+target_link_libraries(miare_provider_test PRIVATE miare::miare)
+add_test(NAME miare.provider COMMAND miare_provider_test)
