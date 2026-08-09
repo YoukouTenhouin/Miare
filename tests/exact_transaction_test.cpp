@@ -45,6 +45,10 @@ public:
         std::allocator<T>{}.deallocate(allocation, count);
     }
 
+    [[nodiscard]] CountingAllocator select_on_container_copy_construction() const {
+        return CountingAllocator{};
+    }
+
     template<class U>
     friend class CountingAllocator;
 
@@ -545,7 +549,9 @@ void transactionStateUsesTheDatabaseAllocator() {
     write.put(bytes("allocated-key"), bytes("allocated-value"));
     assert(counts->allocatedBytes.load(std::memory_order_relaxed) > beforeMutation);
     write.commit();
+    const auto beforeRead = counts->allocatedBytes.load(std::memory_order_relaxed);
     auto read = database.beginRead();
+    assert(counts->allocatedBytes.load(std::memory_order_relaxed) > beforeRead);
     auto value = read.get(bytes("allocated-key"));
     assert(value);
     assert(value->get_allocator().counts == counts);

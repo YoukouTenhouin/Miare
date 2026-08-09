@@ -370,7 +370,8 @@ public:
         if (session.activeReaders == session.maxReaders) {
             throw DatabaseError{Errc::ResourceLimit, "reader limit reached"};
         }
-        auto snapshot = session.values;
+        auto snapshot = detail::makeOrderedKeyValues(session.allocator);
+        snapshot = session.values;
         ++session.activeReaders;
         ++session.liveTransactions;
         return ReadTransaction{session_, std::move(snapshot)};
@@ -420,7 +421,8 @@ public:
         if (session.writerActive || session.waitingWriters != 0) {
             return Result<WriteTransaction, WriterBusy>::failure(WriterBusy{});
         }
-        auto snapshot = session.values;
+        auto snapshot = detail::makeOrderedKeyValues(session.allocator);
+        snapshot = session.values;
         session.writerActive = true;
         ++session.liveTransactions;
         return Result<WriteTransaction, WriterBusy>::success(

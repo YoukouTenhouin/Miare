@@ -613,7 +613,8 @@ inline void commitExact(
     }
     const auto startBlock =
         session.opened.format.highWaterBytes / Limits::allocationQuantumBytes;
-    auto committedValues = values;
+    auto committedValues = makeOrderedKeyValues(session.allocator);
+    committedValues = values;
     std::optional<PreparedExactExtent> leaf;
     ExtentReference root;
     std::uint64_t highWaterBytes = session.opened.format.highWaterBytes;

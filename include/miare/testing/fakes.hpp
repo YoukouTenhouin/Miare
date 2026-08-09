@@ -396,23 +396,17 @@ public:
         file->writeExactAt(0, commonRegion);
         file->resize(detail::commonRegionBytes);
         file->stableStorageBarrier();
-        auto opened = detail::openFormat<Limits>(*file, key, providers);
+        auto opened = open<Allocator, Limits>(
+            std::move(file),
+            key,
+            std::move(providers),
+            std::move(allocator));
         if (!opened) {
             throw DatabaseError{
                 Errc::ProviderUnavailable,
                 "in-memory database failed authentication"};
         }
-        auto openedDatabase = std::move(opened).value();
-        auto values = detail::loadExactValues<Limits>(
-            *file, openedDatabase, providers, allocator);
-        std::unique_ptr<detail::DurableFile> durableFile = std::move(file);
-        return Database<Allocator, Limits>{
-            std::move(durableFile),
-            std::move(providers),
-            std::move(allocator),
-            std::move(openedDatabase),
-            std::move(values),
-            256};
+        return std::move(opened).value();
     }
 
     template<class Allocator = std::allocator<std::byte>, class Limits = DefaultLimits>
