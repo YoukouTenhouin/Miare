@@ -514,6 +514,7 @@ private:
         }
         const auto startBlock =
             session.opened.format.highWaterBytes / Limits::allocationQuantumBytes;
+        auto committedValues = values;
         std::optional<detail::PreparedExactExtent> leaf;
         detail::ExtentReference root;
         std::uint64_t highWaterBytes = session.opened.format.highWaterBytes;
@@ -568,7 +569,7 @@ private:
         session.opened.format.generation = generation;
         session.opened.format.highWaterBytes = highWaterBytes;
         session.opened.format.orderedRoot = detail::encodeExtentReference(root);
-        session.values = values;
+        session.values = std::move(committedValues);
     }
 
     static void validateTargetDoesNotExist(const std::filesystem::path& path) {
