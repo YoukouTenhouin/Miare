@@ -13,3 +13,10 @@ add_test(NAME miare.durable_file COMMAND miare_durable_file_test)
 add_executable(miare_provider_test provider_test.cpp)
 target_link_libraries(miare_provider_test PRIVATE miare::miare)
 add_test(NAME miare.provider COMMAND miare_provider_test)
+
+add_test(
+    NAME miare.zstd_header_compat
+    COMMAND
+        ${CMAKE_COMMAND}
+        -DPROVIDER_HEADER=${PROJECT_SOURCE_DIR}/include/miare/detail/providers.hpp
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/zstd_header_compat_test.cmake)

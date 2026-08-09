@@ -305,7 +305,7 @@ public:
             throwCorrupt("compressed frame exceeds its bound");
         }
 
-        ZSTD_FrameHeader header{};
+        ZSTD_frameHeader header{};
         const auto headerStatus = ZSTD_getFrameHeader(&header, frame.data(), frame.size());
         if (ZSTD_isError(headerStatus) || headerStatus != 0 ||
             header.frameType != ZSTD_frame ||
