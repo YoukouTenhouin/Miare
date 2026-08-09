@@ -6,10 +6,12 @@
 #include <miare/result.hpp>
 #include <miare/types.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -32,31 +34,9 @@ requires DatabaseAllocator<Allocator> && LimitPolicy<Limits>
 class Database {
 private:
     friend class testing::DatabaseAccess;
-
-    struct Session {
-        Session(
-            std::unique_ptr<detail::DurableFile> openedFile,
-            ProviderSet openedProviders,
-            Allocator openedAllocator,
-            detail::OpenedDatabase openedDatabase,
-            detail::ExactValues openedValues)
-            : file(std::move(openedFile)),
-              providers(std::move(openedProviders)),
-              allocator(std::move(openedAllocator)),
-              opened(std::move(openedDatabase)),
-              values(std::move(openedValues)) {}
-
-        std::unique_ptr<detail::DurableFile> file;
-        std::optional<ProviderSet> providers;
-        Allocator allocator;
-        detail::OpenedDatabase opened;
-        detail::ExactValues values;
-        std::mutex mutex;
-        std::condition_variable writerAvailable;
-        bool writerActive = false;
-        std::size_t liveTransactions = 0;
-        std::atomic<DatabaseState> state{DatabaseState::Open};
-    };
+    using Session = detail::DatabaseSession<Allocator, Limits>;
+    using OrderedKeyValues = detail::OrderedKeyValues<Allocator>;
+    using StoredBytes = detail::StoredBytes<Allocator>;
 
 public:
     using OwnedBytes = std::vector<
@@ -83,21 +63,13 @@ public:
         [[nodiscard]] std::optional<OwnedBytes> get(ByteView key) {
             requireFunctional();
             requireKey(key);
-            const auto found = values_.find(detail::ExactBytes{key.begin(), key.end()});
-            if (found == values_.end()) {
-                return std::nullopt;
-            }
-            using ByteAllocator = typename std::allocator_traits<Allocator>::
-                template rebind_alloc<std::byte>;
-            OwnedBytes result{ByteAllocator{session_->allocator}};
-            result.assign(found->second.begin(), found->second.end());
-            return result;
+            return copyValue(*session_, values_, key);
         }
 
         [[nodiscard]] bool contains(ByteView key) {
             requireFunctional();
             requireKey(key);
-            return values_.contains(detail::ExactBytes{key.begin(), key.end()});
+            return values_.contains(key);
         }
 
         void end() noexcept {
@@ -115,7 +87,7 @@ public:
 
         ReadTransaction(
             std::shared_ptr<Session> session,
-            detail::ExactValues values)
+            OrderedKeyValues values)
             : session_(std::move(session)),
               values_(std::move(values)),
               thread_(std::this_thread::get_id()),
@@ -135,7 +107,7 @@ public:
         }
 
         std::shared_ptr<Session> session_;
-        detail::ExactValues values_;
+        OrderedKeyValues values_;
         std::thread::id thread_;
         bool active_;
     };
@@ -162,21 +134,13 @@ public:
         [[nodiscard]] std::optional<OwnedBytes> get(ByteView key) {
             requireFunctional();
             requireKey(key);
-            const auto found = values_.find(detail::ExactBytes{key.begin(), key.end()});
-            if (found == values_.end()) {
-                return std::nullopt;
-            }
-            using ByteAllocator = typename std::allocator_traits<Allocator>::
-                template rebind_alloc<std::byte>;
-            OwnedBytes result{ByteAllocator{session_->allocator}};
-            result.assign(found->second.begin(), found->second.end());
-            return result;
+            return copyValue(*session_, values_, key);
         }
 
         [[nodiscard]] bool contains(ByteView key) {
             requireFunctional();
             requireKey(key);
-            return values_.contains(detail::ExactBytes{key.begin(), key.end()});
+            return values_.contains(key);
         }
 
         void put(ByteView key, ByteView value) {
@@ -186,8 +150,12 @@ public:
                 throw ContractError{Errc::InvalidArgument, "value exceeds the capacity profile"};
             }
             requireMutationCapacity();
-            detail::ExactBytes ownedKey{key.begin(), key.end()};
-            detail::ExactBytes ownedValue{value.begin(), value.end()};
+            using ByteAllocator = typename std::allocator_traits<Allocator>::
+                template rebind_alloc<std::byte>;
+            StoredBytes ownedKey{ByteAllocator{session_->allocator}};
+            StoredBytes ownedValue{ByteAllocator{session_->allocator}};
+            ownedKey.assign(key.begin(), key.end());
+            ownedValue.assign(value.begin(), value.end());
             values_.insert_or_assign(std::move(ownedKey), std::move(ownedValue));
             ++keyMutations_;
             changed_ = true;
@@ -196,12 +164,12 @@ public:
         [[nodiscard]] bool erase(ByteView key) {
             requireFunctional();
             requireKey(key);
-            const detail::ExactBytes ownedKey{key.begin(), key.end()};
-            if (!values_.contains(ownedKey)) {
+            const auto found = values_.find(key);
+            if (found == values_.end()) {
                 return false;
             }
             requireMutationCapacity();
-            values_.erase(ownedKey);
+            values_.erase(found);
             ++keyMutations_;
             changed_ = true;
             return true;
@@ -209,11 +177,16 @@ public:
 
         [[nodiscard]] WriteTransactionStats stats() const {
             requireFunctional();
+            const auto estimatedGrowth = changed_ && !values_.empty()
+                ? std::max<std::uint64_t>(
+                      16U * 1024U,
+                      Limits::allocationQuantumBytes)
+                : 0;
             return WriteTransactionStats{
                 keyMutations_,
                 0,
                 0,
-                0,
+                estimatedGrowth,
                 0};
         }
 
@@ -225,7 +198,7 @@ public:
                 return;
             }
             try {
-                commitExact(*session_, values_);
+                detail::commitExact<Limits>(*session_, values_);
             } catch (...) {
                 if (session_->state.load(std::memory_order_acquire) ==
                     DatabaseState::RecoveryRequired) {
@@ -253,7 +226,7 @@ public:
 
         WriteTransaction(
             std::shared_ptr<Session> session,
-            detail::ExactValues values)
+            OrderedKeyValues values)
             : session_(std::move(session)),
               values_(std::move(values)),
               thread_(std::this_thread::get_id()),
@@ -282,7 +255,7 @@ public:
         }
 
         std::shared_ptr<Session> session_;
-        detail::ExactValues values_;
+        OrderedKeyValues values_;
         std::thread::id thread_;
         std::uint64_t keyMutations_;
         bool changed_;
@@ -315,14 +288,14 @@ public:
             }
             {
                 auto temporaryValidation = openValidated(
-                    temporaryPath, key, providers);
+                    temporaryPath, key, providers, allocator);
                 auto validated = requireCreatedAuthentication(
                     std::move(temporaryValidation));
                 (void)validated;
             }
             detail::NativeDurableFile::installExclusive(temporaryPath, path);
 
-            auto finalValidation = openValidated(path, key, providers);
+            auto finalValidation = openValidated(path, key, providers, allocator);
             auto validated = requireCreatedAuthentication(
                 std::move(finalValidation));
             return Database{
@@ -330,7 +303,8 @@ public:
                 std::move(providers),
                 std::move(allocator),
                 std::move(validated.opened),
-                std::move(validated.values)};
+                std::move(validated.values),
+                256};
         } catch (...) {
             std::error_code ignored;
             std::filesystem::remove(temporaryPath, ignored);
@@ -344,12 +318,16 @@ public:
         ProviderSet providers,
         OpenOptions options = {},
         Allocator allocator = {}) {
-        if (options.cacheCapacityBytes == 0 || options.maxReaders == 0) {
+        constexpr std::uint64_t minCacheBytes = 4ULL * 1024ULL * 1024ULL;
+        constexpr std::uint64_t maxCacheBytes = 64ULL * 1024ULL * 1024ULL * 1024ULL;
+        if (options.cacheCapacityBytes < minCacheBytes ||
+            options.cacheCapacityBytes > maxCacheBytes ||
+            options.maxReaders == 0 || options.maxReaders > 65'535) {
             throw ContractError{
                 Errc::InvalidConfiguration,
-                "open runtime budgets must be positive"};
+                "open runtime budgets are outside their supported bounds"};
         }
-        auto validation = openValidated(path, key, providers);
+        auto validation = openValidated(path, key, providers, allocator);
         if (!validation) {
             return Result<Database, AuthenticationFailed>::failure(
                 AuthenticationFailed{});
@@ -360,7 +338,8 @@ public:
             std::move(providers),
             std::move(allocator),
             std::move(validated.opened),
-            std::move(validated.values)});
+            std::move(validated.values),
+            options.maxReaders});
     }
 
     Database(const Database&) = delete;
@@ -388,7 +367,11 @@ public:
         auto& session = requireSession();
         std::lock_guard lock{session.mutex};
         requireOpen(session);
+        if (session.activeReaders == session.maxReaders) {
+            throw DatabaseError{Errc::ResourceLimit, "reader limit reached"};
+        }
         auto snapshot = session.values;
+        ++session.activeReaders;
         ++session.liveTransactions;
         return ReadTransaction{session_, std::move(snapshot)};
     }
@@ -397,12 +380,34 @@ public:
         auto& session = requireSession();
         std::unique_lock lock{session.mutex};
         requireOpen(session);
+        if (session.nextWriterTicket == std::numeric_limits<std::uint64_t>::max()) {
+            throw DatabaseError{Errc::ResourceLimit, "writer admission sequence exhausted"};
+        }
+        const auto ticket = session.nextWriterTicket++;
+        ++session.waitingWriters;
         session.writerAvailable.wait(lock, [&] {
-            return !session.writerActive ||
+            return (!session.writerActive &&
+                    ticket == session.servingWriterTicket) ||
                 session.state.load(std::memory_order_acquire) != DatabaseState::Open;
         });
-        requireOpen(session);
-        auto snapshot = session.values;
+        if (session.state.load(std::memory_order_acquire) != DatabaseState::Open) {
+            --session.waitingWriters;
+            if (ticket == session.servingWriterTicket) {
+                ++session.servingWriterTicket;
+                session.writerAvailable.notify_all();
+            }
+            requireOpen(session);
+        }
+        OrderedKeyValues snapshot = detail::makeOrderedKeyValues(session.allocator);
+        try {
+            snapshot = session.values;
+        } catch (...) {
+            --session.waitingWriters;
+            ++session.servingWriterTicket;
+            session.writerAvailable.notify_all();
+            throw;
+        }
+        --session.waitingWriters;
         session.writerActive = true;
         ++session.liveTransactions;
         return WriteTransaction{session_, std::move(snapshot)};
@@ -412,7 +417,7 @@ public:
         auto& session = requireSession();
         std::lock_guard lock{session.mutex};
         requireOpen(session);
-        if (session.writerActive) {
+        if (session.writerActive || session.waitingWriters != 0) {
             return Result<WriteTransaction, WriterBusy>::failure(WriterBusy{});
         }
         auto snapshot = session.values;
@@ -456,7 +461,7 @@ private:
     struct ValidatedFile {
         std::unique_ptr<detail::DurableFile> file;
         detail::OpenedDatabase opened;
-        detail::ExactValues values;
+        OrderedKeyValues values;
     };
 
     Database(
@@ -464,13 +469,15 @@ private:
         ProviderSet providers,
         Allocator allocator,
         detail::OpenedDatabase opened,
-        detail::ExactValues values)
+        OrderedKeyValues values,
+        std::uint32_t maxReaders)
         : session_(std::make_shared<Session>(
               std::move(file),
               std::move(providers),
               std::move(allocator),
               std::move(opened),
-              std::move(values))) {}
+              std::move(values),
+              maxReaders)) {}
 
     [[nodiscard]] Session& requireSession() {
         if (!session_) {
@@ -495,81 +502,34 @@ private:
         }
     }
 
+    [[nodiscard]] static std::optional<OwnedBytes> copyValue(
+        Session& session,
+        const OrderedKeyValues& values,
+        ByteView key) {
+        const auto found = values.find(key);
+        if (found == values.end()) {
+            return std::nullopt;
+        }
+        using ByteAllocator = typename std::allocator_traits<Allocator>::
+            template rebind_alloc<std::byte>;
+        OwnedBytes result{ByteAllocator{session.allocator}};
+        result.assign(found->second.begin(), found->second.end());
+        return result;
+    }
+
     static void releaseTransaction(Session& session, bool writer) noexcept {
         try {
             std::lock_guard lock{session.mutex};
             --session.liveTransactions;
             if (writer) {
                 session.writerActive = false;
-                session.writerAvailable.notify_one();
+                ++session.servingWriterTicket;
+                session.writerAvailable.notify_all();
+            } else {
+                --session.activeReaders;
             }
         } catch (...) {
         }
-    }
-
-    static void commitExact(Session& session, const detail::ExactValues& values) {
-        const auto generation = session.opened.format.generation + 1;
-        if (generation == 0) {
-            throw DatabaseError{Errc::ResourceLimit, "database generation is exhausted"};
-        }
-        const auto startBlock =
-            session.opened.format.highWaterBytes / Limits::allocationQuantumBytes;
-        auto committedValues = values;
-        std::optional<detail::PreparedExactExtent> leaf;
-        detail::ExtentReference root;
-        std::uint64_t highWaterBytes = session.opened.format.highWaterBytes;
-        if (!values.empty()) {
-            leaf = detail::prepareLeafExtent<Limits>(
-                values,
-                generation,
-                startBlock,
-                session.opened,
-                *session.providers);
-            root = leaf->reference;
-            highWaterBytes += leaf->bytes.size();
-        }
-        auto publication = detail::prepareExactPublication<Limits>(
-            session.opened,
-            root,
-            highWaterBytes,
-            *session.providers);
-
-        bool publicationStarted = false;
-        try {
-            if (leaf) {
-                session.file->writeExactAt(
-                    root.blockIndex * Limits::allocationQuantumBytes,
-                    leaf->bytes);
-            }
-            session.file->stableStorageBarrier();
-            publicationStarted = true;
-            session.file->writeExactAt(
-                detail::bootstrapBytes +
-                    publication.slotIndex * detail::publicationSlotBytes,
-                publication.slot);
-            session.file->stableStorageBarrier();
-        } catch (const DatabaseError& error) {
-            session.state.store(
-                DatabaseState::RecoveryRequired, std::memory_order_release);
-            throw DatabaseError{
-                publicationStarted
-                    ? Errc::CommitOutcomeUnknown
-                    : Errc::CommitFailed,
-                publicationStarted
-                    ? "commit publication outcome is unknown"
-                    : "commit failed before publication",
-                error.nativeCode()};
-        } catch (...) {
-            session.state.store(
-                DatabaseState::RecoveryRequired, std::memory_order_release);
-            throw;
-        }
-
-        session.opened.publication = std::move(publication.plaintext);
-        session.opened.format.generation = generation;
-        session.opened.format.highWaterBytes = highWaterBytes;
-        session.opened.format.orderedRoot = detail::encodeExtentReference(root);
-        session.values = std::move(committedValues);
     }
 
     static void validateTargetDoesNotExist(const std::filesystem::path& path) {
@@ -610,7 +570,8 @@ private:
     [[nodiscard]] static Result<ValidatedFile, AuthenticationFailed> openValidated(
         const std::filesystem::path& path,
         EncryptionKeyView key,
-        ProviderSet& providers) {
+        ProviderSet& providers,
+        const Allocator& allocator) {
         std::unique_ptr<detail::DurableFile> file =
             detail::NativeDurableFile::openExisting(path);
         auto opened = detail::openFormat<Limits>(*file, key, providers);
@@ -620,7 +581,7 @@ private:
         }
         auto openedDatabase = std::move(opened).value();
         auto values = detail::loadExactValues<Limits>(
-            *file, openedDatabase, providers);
+            *file, openedDatabase, providers, allocator);
         return Result<ValidatedFile, AuthenticationFailed>::success(ValidatedFile{
             std::move(file),
             std::move(openedDatabase),

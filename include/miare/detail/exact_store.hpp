@@ -4,22 +4,30 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <condition_variable>
 #include <limits>
 #include <map>
+#include <memory>
+#include <mutex>
+#include <optional>
 #include <span>
 #include <utility>
 #include <vector>
 
 namespace miare::detail {
 
-using ExactBytes = std::vector<std::byte>;
+using ByteBuffer = std::vector<std::byte>;
 
 struct UnsignedBytesLess {
+    using is_transparent = void;
+
+    template<class Left, class Right>
     [[nodiscard]] bool operator()(
-        const ExactBytes& left,
-        const ExactBytes& right) const noexcept {
+        const Left& left,
+        const Right& right) const noexcept {
         return std::lexicographical_compare(
             left.begin(), left.end(), right.begin(), right.end(),
             [](std::byte lhs, std::byte rhs) {
@@ -29,7 +37,64 @@ struct UnsignedBytesLess {
     }
 };
 
-using ExactValues = std::map<ExactBytes, ExactBytes, UnsignedBytesLess>;
+template<class Allocator>
+using StoredBytes = std::vector<
+    std::byte,
+    typename std::allocator_traits<Allocator>::template rebind_alloc<std::byte>>;
+
+template<class Allocator>
+using StoredKeyValue = std::pair<
+    const StoredBytes<Allocator>,
+    StoredBytes<Allocator>>;
+
+template<class Allocator>
+using OrderedKeyValues = std::map<
+    StoredBytes<Allocator>,
+    StoredBytes<Allocator>,
+    UnsignedBytesLess,
+    typename std::allocator_traits<Allocator>::template rebind_alloc<
+        StoredKeyValue<Allocator>>>;
+
+template<class Allocator>
+[[nodiscard]] inline OrderedKeyValues<Allocator> makeOrderedKeyValues(
+    const Allocator& allocator) {
+    using MapAllocator = typename std::allocator_traits<Allocator>::
+        template rebind_alloc<StoredKeyValue<Allocator>>;
+    return OrderedKeyValues<Allocator>{UnsignedBytesLess{}, MapAllocator{allocator}};
+}
+
+template<class Allocator, class Limits>
+struct DatabaseSession {
+    DatabaseSession(
+        std::unique_ptr<DurableFile> openedFile,
+        ProviderSet openedProviders,
+        Allocator openedAllocator,
+        OpenedDatabase openedDatabase,
+        OrderedKeyValues<Allocator> openedValues,
+        std::uint32_t configuredMaxReaders)
+        : file(std::move(openedFile)),
+          providers(std::move(openedProviders)),
+          allocator(std::move(openedAllocator)),
+          opened(std::move(openedDatabase)),
+          values(std::move(openedValues)),
+          maxReaders(configuredMaxReaders) {}
+
+    std::unique_ptr<DurableFile> file;
+    std::optional<ProviderSet> providers;
+    Allocator allocator;
+    OpenedDatabase opened;
+    OrderedKeyValues<Allocator> values;
+    std::mutex mutex;
+    std::condition_variable writerAvailable;
+    std::uint64_t nextWriterTicket = 0;
+    std::uint64_t servingWriterTicket = 0;
+    std::size_t waitingWriters = 0;
+    std::size_t activeReaders = 0;
+    bool writerActive = false;
+    std::size_t liveTransactions = 0;
+    std::uint32_t maxReaders;
+    std::atomic<DatabaseState> state{DatabaseState::Open};
+};
 
 struct ExtentReference {
     std::uint64_t blockIndex = 0;
@@ -130,7 +195,8 @@ inline void validateExtentReference(
     }
 }
 
-[[nodiscard]] inline std::size_t commonPrefixLength(const ExactValues& values) {
+template<class Values>
+[[nodiscard]] inline std::size_t commonPrefixLength(const Values& values) {
     if (values.empty()) {
         return 0;
     }
@@ -144,12 +210,12 @@ inline void validateExtentReference(
     return length;
 }
 
-template<class Limits>
-[[nodiscard]] inline ExactBytes encodeLeafPage(const ExactValues& values) {
+template<class Limits, class Values>
+[[nodiscard]] inline ByteBuffer encodeLeafPage(const Values& values) {
     constexpr auto ceiling = std::max<std::uint64_t>(
         16U * 1024U, Limits::allocationQuantumBytes);
     constexpr auto payloadBytes = ceiling - ExtentLayout::bytes - authenticationTagBytes;
-    ExactBytes payload(static_cast<std::size_t>(payloadBytes));
+    ByteBuffer payload(static_cast<std::size_t>(payloadBytes));
     const auto prefixLength = commonPrefixLength(values);
     std::uint64_t used = PageLayout::bytes + prefixLength + values.size() * 8ULL;
     for (const auto& [key, value] : values) {
@@ -240,24 +306,24 @@ template<class Limits>
 
 struct PreparedExactExtent {
     ExtentReference reference;
-    ExactBytes bytes;
+    ByteBuffer bytes;
 };
 
-template<class Limits>
+template<class Limits, class Values>
 [[nodiscard]] inline PreparedExactExtent prepareLeafExtent(
-    const ExactValues& values,
+    const Values& values,
     std::uint64_t generation,
     std::uint64_t blockIndex,
     OpenedDatabase& opened,
     ProviderSet& providers) {
     auto decoded = encodeLeafPage<Limits>(values);
     auto& crypto = ProviderAccess::crypto(providers);
-    ExactBytes stored = decoded;
+    ByteBuffer stored = decoded;
     std::uint32_t flags = 0;
     std::uint32_t codec = 0;
     if (opened.format.compression == Compression::ZStd) {
         auto& compression = ProviderAccess::compression(providers);
-        ExactBytes candidate(compression.compressBound(decoded.size()));
+        ByteBuffer candidate(compression.compressBound(decoded.size()));
         const auto compressedBytes = compression.compress(decoded, candidate);
         candidate.resize(compressedBytes);
         const auto compressedBlocks =
@@ -285,7 +351,7 @@ template<class Limits>
         blockCount,
         encodedLength,
         generation};
-    ExactBytes extent(blockCount * Limits::allocationQuantumBytes);
+    ByteBuffer extent(blockCount * Limits::allocationQuantumBytes);
     MutableByteView output{extent};
     writeBytes(output, ExtentLayout::magic, "MIAREXT\0");
     writeLittleEndian<std::uint16_t>(1, output, ExtentLayout::version);
@@ -318,8 +384,10 @@ template<class Limits>
     return PreparedExactExtent{reference, std::move(extent)};
 }
 
-template<class Limits>
-[[nodiscard]] inline ExactValues decodeLeafPage(ByteView payload) {
+template<class Limits, class Allocator>
+[[nodiscard]] inline OrderedKeyValues<Allocator> decodeLeafPage(
+    ByteView payload,
+    const Allocator& allocator) {
     if (payload.size() !=
             std::max<std::uint64_t>(16U * 1024U, Limits::allocationQuantumBytes) -
                 ExtentLayout::bytes - authenticationTagBytes ||
@@ -350,7 +418,9 @@ template<class Limits>
         throwCorrupt("ordered leaf bounds are invalid");
     }
     const auto prefix = payload.subspan(PageLayout::bytes, prefixLength);
-    ExactValues values;
+    auto values = makeOrderedKeyValues(allocator);
+    using ByteAllocator = typename std::allocator_traits<Allocator>::
+        template rebind_alloc<std::byte>;
     std::size_t expectedEntry = entriesOffset;
     for (std::uint32_t index = 0; index != count; ++index) {
         const auto slot = slotsOffset + index * 8U;
@@ -376,7 +446,8 @@ template<class Limits>
             entryLength != 20ULL + suffixLength + valueLength) {
             throwCorrupt("ordered leaf value length is invalid");
         }
-        ExactBytes key(prefix.begin(), prefix.end());
+        StoredBytes<Allocator> key{ByteAllocator{allocator}};
+        key.assign(prefix.begin(), prefix.end());
         key.insert(
             key.end(),
             payload.begin() + entryOffset + 4,
@@ -385,7 +456,8 @@ template<class Limits>
             (index != 0 && !UnsignedBytesLess{}(values.rbegin()->first, key))) {
             throwCorrupt("ordered leaf keys are not canonical");
         }
-        ExactBytes value(
+        StoredBytes<Allocator> value{ByteAllocator{allocator}};
+        value.assign(
             payload.begin() + representation + 16,
             payload.begin() + representation + 16 + valueLength);
         values.emplace(std::move(key), std::move(value));
@@ -398,18 +470,19 @@ template<class Limits>
     return values;
 }
 
-template<class Limits>
-[[nodiscard]] inline ExactValues loadExactValues(
+template<class Limits, class Allocator>
+[[nodiscard]] inline OrderedKeyValues<Allocator> loadExactValues(
     DurableFile& file,
     OpenedDatabase& opened,
-    ProviderSet& providers) {
+    ProviderSet& providers,
+    const Allocator& allocator) {
     const auto reference = decodeExtentReference(opened.format.orderedRoot);
     if (reference.null()) {
-        return {};
+        return makeOrderedKeyValues(allocator);
     }
     validateExtentReference<Limits>(
         reference, opened.format.generation, opened.format.highWaterBytes);
-    ExactBytes extent(reference.blockCount * Limits::allocationQuantumBytes);
+    ByteBuffer extent(reference.blockCount * Limits::allocationQuantumBytes);
     const auto offset = reference.blockIndex * Limits::allocationQuantumBytes;
     file.readExactAt(offset, extent);
     const ByteView input{extent};
@@ -450,7 +523,7 @@ template<class Limits>
         (flags == 0 && storedLength != decodedLength)) {
         throwCorrupt("ordered leaf extent representation is invalid");
     }
-    ExactBytes stored(storedLength);
+    ByteBuffer stored(storedLength);
     const auto associatedData = extentAssociatedData(
         opened, input.first(ExtentLayout::bytes));
     auto& crypto = ProviderAccess::crypto(providers);
@@ -463,13 +536,13 @@ template<class Limits>
             stored)) {
         throwCorrupt("ordered leaf authentication failed");
     }
-    ExactBytes decoded(decodedLength);
+    ByteBuffer decoded(decodedLength);
     if (flags == 1) {
         ProviderAccess::compression(providers).decompress(stored, decoded);
     } else {
         decoded = std::move(stored);
     }
-    return decodeLeafPage<Limits>(decoded);
+    return decodeLeafPage<Limits>(decoded, allocator);
 }
 
 struct PreparedPublication {
@@ -528,6 +601,79 @@ template<class Limits>
         MutableByteView{slot}.subspan(
             SlotEnvelopeLayout::tag, authenticationTagBytes));
     return PreparedPublication{std::move(slot), std::move(plaintext), slotIndex};
+}
+
+template<class Limits, class Allocator>
+inline void commitExact(
+    DatabaseSession<Allocator, Limits>& session,
+    const OrderedKeyValues<Allocator>& values) {
+    const auto generation = session.opened.format.generation + 1;
+    if (generation == 0) {
+        throw DatabaseError{Errc::ResourceLimit, "database generation is exhausted"};
+    }
+    const auto startBlock =
+        session.opened.format.highWaterBytes / Limits::allocationQuantumBytes;
+    auto committedValues = values;
+    std::optional<PreparedExactExtent> leaf;
+    ExtentReference root;
+    std::uint64_t highWaterBytes = session.opened.format.highWaterBytes;
+    if (!values.empty()) {
+        leaf = prepareLeafExtent<Limits>(
+            values,
+            generation,
+            startBlock,
+            session.opened,
+            *session.providers);
+        if (leaf->bytes.size() > Limits::maxFileGrowthPerTransaction ||
+            leaf->bytes.size() > Limits::maxDatabaseBytes ||
+            session.opened.format.highWaterBytes >
+                Limits::maxDatabaseBytes - leaf->bytes.size()) {
+            throw DatabaseError{
+                Errc::ResourceLimit,
+                "commit would exceed the capacity profile"};
+        }
+        root = leaf->reference;
+        highWaterBytes += leaf->bytes.size();
+    }
+    auto publication = prepareExactPublication<Limits>(
+        session.opened,
+        root,
+        highWaterBytes,
+        *session.providers);
+
+    bool publicationStarted = false;
+    try {
+        if (leaf) {
+            session.file->writeExactAt(
+                root.blockIndex * Limits::allocationQuantumBytes,
+                leaf->bytes);
+        }
+        session.file->stableStorageBarrier();
+        publicationStarted = true;
+        session.file->writeExactAt(
+            bootstrapBytes + publication.slotIndex * publicationSlotBytes,
+            publication.slot);
+        session.file->stableStorageBarrier();
+    } catch (const DatabaseError& error) {
+        session.state.store(
+            DatabaseState::RecoveryRequired, std::memory_order_release);
+        throw DatabaseError{
+            publicationStarted ? Errc::CommitOutcomeUnknown : Errc::CommitFailed,
+            publicationStarted
+                ? "commit publication outcome is unknown"
+                : "commit failed before publication",
+            error.nativeCode()};
+    } catch (...) {
+        session.state.store(
+            DatabaseState::RecoveryRequired, std::memory_order_release);
+        throw;
+    }
+
+    session.opened.publication = std::move(publication.plaintext);
+    session.opened.format.generation = generation;
+    session.opened.format.highWaterBytes = highWaterBytes;
+    session.opened.format.orderedRoot = encodeExtentReference(root);
+    session.values = std::move(committedValues);
 }
 
 } // namespace miare::detail

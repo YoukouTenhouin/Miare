@@ -375,6 +375,13 @@ private:
 
 class DatabaseAccess {
 public:
+    template<class Allocator, class Limits>
+    [[nodiscard]] static std::size_t waitingWriters(
+        Database<Allocator, Limits>& database) {
+        std::lock_guard lock{database.session_->mutex};
+        return database.session_->waitingWriters;
+    }
+
     template<class Allocator = std::allocator<std::byte>, class Limits = DefaultLimits>
     [[nodiscard]] static Database<Allocator, Limits> create(
         std::unique_ptr<MemoryDurableFile> file,
@@ -397,14 +404,15 @@ public:
         }
         auto openedDatabase = std::move(opened).value();
         auto values = detail::loadExactValues<Limits>(
-            *file, openedDatabase, providers);
+            *file, openedDatabase, providers, allocator);
         std::unique_ptr<detail::DurableFile> durableFile = std::move(file);
         return Database<Allocator, Limits>{
             std::move(durableFile),
             std::move(providers),
             std::move(allocator),
             std::move(openedDatabase),
-            std::move(values)};
+            std::move(values),
+            256};
     }
 
     template<class Allocator = std::allocator<std::byte>, class Limits = DefaultLimits>
@@ -420,7 +428,7 @@ public:
         }
         auto openedDatabase = std::move(opened).value();
         auto values = detail::loadExactValues<Limits>(
-            *file, openedDatabase, providers);
+            *file, openedDatabase, providers, allocator);
         std::unique_ptr<detail::DurableFile> durableFile = std::move(file);
         return Result<Database<Allocator, Limits>, AuthenticationFailed>::success(
             Database<Allocator, Limits>{
@@ -428,7 +436,8 @@ public:
                 std::move(providers),
                 std::move(allocator),
                 std::move(openedDatabase),
-                std::move(values)});
+                std::move(values),
+                256});
     }
 };
 

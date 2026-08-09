@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <system_error>
@@ -16,6 +17,46 @@
 #include <vector>
 
 namespace {
+
+struct AllocationCounts {
+    std::atomic<std::size_t> allocatedBytes{0};
+};
+
+template<class T>
+class CountingAllocator {
+public:
+    using value_type = T;
+
+    CountingAllocator() : counts(std::make_shared<AllocationCounts>()) {}
+    explicit CountingAllocator(std::shared_ptr<AllocationCounts> sharedCounts)
+        : counts(std::move(sharedCounts)) {}
+
+    template<class U>
+    CountingAllocator(const CountingAllocator<U>& other) noexcept
+        : counts(other.counts) {}
+
+    [[nodiscard]] T* allocate(std::size_t count) {
+        counts->allocatedBytes.fetch_add(
+            count * sizeof(T), std::memory_order_relaxed);
+        return std::allocator<T>{}.allocate(count);
+    }
+
+    void deallocate(T* allocation, std::size_t count) noexcept {
+        std::allocator<T>{}.deallocate(allocation, count);
+    }
+
+    template<class U>
+    friend class CountingAllocator;
+
+    template<class U>
+    friend bool operator==(
+        const CountingAllocator& left,
+        const CountingAllocator<U>& right) noexcept {
+        return left.counts == right.counts;
+    }
+
+    std::shared_ptr<AllocationCounts> counts;
+};
 
 class TemporaryDirectory {
 public:
@@ -119,6 +160,7 @@ void exactMutationsAreAtomicAndDurable(const TemporaryDirectory& temporary) {
     assert(!write.erase(bytes("\x7f")));
     assert(!write.get(bytes("\x7f")));
     assert(write.stats().keyMutations == 5);
+    assert(write.stats().estimatedFileGrowthBytes == 16U * 1024U);
     write.commit();
 
     assert(!empty.contains(bytes("alpha")));
@@ -280,6 +322,19 @@ void commitUsesTwoDurabilityBarriersAndFailsStop() {
     return found;
 }
 
+void expectImageDatabaseError(
+    const std::vector<std::byte>& image,
+    miare::Errc expected) {
+    auto file = std::make_unique<miare::testing::MemoryDurableFile>();
+    file->replaceStableBytes(image);
+    expectDatabaseError(expected, [&] {
+        (void)miare::testing::DatabaseAccess::open(
+            std::move(file),
+            miare::EncryptionKeyView{keyBytes},
+            deterministicProviders(16));
+    });
+}
+
 void interruptionsSelectOnlyCompleteGenerations() {
     auto file = std::make_unique<miare::testing::MemoryDurableFile>();
     auto* fileView = file.get();
@@ -297,14 +352,46 @@ void interruptionsSelectOnlyCompleteGenerations() {
     std::copy(oldImage.begin(), oldImage.end(), dataOnly.begin());
     assert(!imageContains(dataOnly, "atomic", "new"));
 
-    auto tornPublication = dataOnly;
-    constexpr std::size_t tornBytes = 100;
-    std::copy_n(
-        newImage.begin() + miare::detail::bootstrapBytes,
-        tornBytes,
-        tornPublication.begin() + miare::detail::bootstrapBytes);
-    assert(!imageContains(tornPublication, "atomic", "new"));
+    constexpr std::array<std::size_t, 5> tornLengths{0, 1, 512, 4095, 4096};
+    for (const auto length : tornLengths) {
+        auto interrupted = dataOnly;
+        std::copy_n(
+            newImage.begin() + miare::detail::bootstrapBytes,
+            length,
+            interrupted.begin() + miare::detail::bootstrapBytes);
+        if (length == miare::detail::publicationSlotBytes) {
+            assert(imageContains(interrupted, "atomic", "new"));
+        } else {
+            assert(!imageContains(interrupted, "atomic", "new"));
+        }
+    }
     assert(imageContains(newImage, "atomic", "new"));
+
+    auto secondWrite = database.beginWrite();
+    secondWrite.put(bytes("atomic"), bytes("newest"));
+    secondWrite.commit();
+    const auto newestImage = fileView->bytes();
+    auto secondDataOnly = newestImage;
+    std::copy(newImage.begin(), newImage.begin() + miare::detail::commonRegionBytes,
+              secondDataOnly.begin());
+    assert(imageContains(secondDataOnly, "atomic", "new"));
+    for (const auto length : tornLengths) {
+        auto interrupted = secondDataOnly;
+        std::copy_n(
+            newestImage.begin() + miare::detail::bootstrapBytes +
+                miare::detail::publicationSlotBytes,
+            length,
+            interrupted.begin() + miare::detail::bootstrapBytes +
+                miare::detail::publicationSlotBytes);
+        assert(imageContains(
+            interrupted,
+            "atomic",
+            length == 4096 ? "newest" : "new"));
+    }
+
+    auto damagedCandidate = newestImage;
+    damagedCandidate[newImage.size() + 160] ^= std::byte{1};
+    expectImageDatabaseError(damagedCandidate, miare::Errc::Corrupt);
     database.close();
 }
 
@@ -363,6 +450,109 @@ void handlesEnforceAdmissionAffinityAndPreflightGuarantees() {
     database.close();
 }
 
+void writerAdmissionIsFifo() {
+    auto file = std::make_unique<miare::testing::MemoryDurableFile>();
+    auto database = miare::testing::DatabaseAccess::create(
+        std::move(file),
+        miare::EncryptionKeyView{keyBytes},
+        deterministicProviders(10));
+    auto admitted = database.beginWrite();
+    std::mutex orderMutex;
+    std::vector<int> order;
+    const auto enqueue = [&](int identity) {
+        auto queued = database.beginWrite();
+        {
+            std::lock_guard lock{orderMutex};
+            order.push_back(identity);
+        }
+        queued.rollback();
+    };
+    const auto waitForQueuedWriters = [&](std::size_t expected) {
+        for (std::size_t attempt = 0; attempt != 1'000'000; ++attempt) {
+            if (miare::testing::DatabaseAccess::waitingWriters(database) == expected) {
+                return;
+            }
+            std::this_thread::yield();
+        }
+        assert(false);
+    };
+    std::thread first(enqueue, 1);
+    waitForQueuedWriters(1);
+    std::thread second(enqueue, 2);
+    waitForQueuedWriters(2);
+    admitted.rollback();
+    first.join();
+    second.join();
+    assert((order == std::vector<int>{1, 2}));
+    database.close();
+}
+
+void openOptionsBoundReaderAdmission(const TemporaryDirectory& temporary) {
+    const auto path = temporary.path() / "reader-budget.miare";
+    auto created = miare::Database<>::create(
+        path,
+        miare::EncryptionKeyView{keyBytes},
+        deterministicProviders(11));
+    created.close();
+
+    miare::OpenOptions oneReader;
+    oneReader.maxReaders = 1;
+    auto opened = miare::Database<>::open(
+        path,
+        miare::EncryptionKeyView{keyBytes},
+        deterministicProviders(12),
+        oneReader);
+    assert(opened);
+    auto reader = opened.value().beginRead();
+    expectDatabaseError(miare::Errc::ResourceLimit, [&] {
+        (void)opened.value().beginRead();
+    });
+    reader.end();
+    opened.value().close();
+
+    miare::OpenOptions tooManyReaders;
+    tooManyReaders.maxReaders = 65'536;
+    expectContractError(miare::Errc::InvalidConfiguration, [&] {
+        (void)miare::Database<>::open(
+            path,
+            miare::EncryptionKeyView{keyBytes},
+            deterministicProviders(13),
+            tooManyReaders);
+    });
+    miare::OpenOptions tooLittleCache;
+    tooLittleCache.cacheCapacityBytes = 4U * 1024U * 1024U - 1;
+    expectContractError(miare::Errc::InvalidConfiguration, [&] {
+        (void)miare::Database<>::open(
+            path,
+            miare::EncryptionKeyView{keyBytes},
+            deterministicProviders(14),
+            tooLittleCache);
+    });
+}
+
+void transactionStateUsesTheDatabaseAllocator() {
+    auto counts = std::make_shared<AllocationCounts>();
+    CountingAllocator<std::byte> allocator{counts};
+    auto file = std::make_unique<miare::testing::MemoryDurableFile>();
+    auto database = miare::testing::DatabaseAccess::create(
+        std::move(file),
+        miare::EncryptionKeyView{keyBytes},
+        deterministicProviders(15),
+        miare::CreateOptions{},
+        allocator);
+    const auto beforeMutation = counts->allocatedBytes.load(std::memory_order_relaxed);
+    auto write = database.beginWrite();
+    write.put(bytes("allocated-key"), bytes("allocated-value"));
+    assert(counts->allocatedBytes.load(std::memory_order_relaxed) > beforeMutation);
+    write.commit();
+    auto read = database.beginRead();
+    auto value = read.get(bytes("allocated-key"));
+    assert(value);
+    assert(value->get_allocator().counts == counts);
+    read.end();
+    database.close();
+}
+
 } // namespace
 
 int main() {
@@ -372,4 +562,7 @@ int main() {
     commitUsesTwoDurabilityBarriersAndFailsStop();
     interruptionsSelectOnlyCompleteGenerations();
     handlesEnforceAdmissionAffinityAndPreflightGuarantees();
+    writerAdmissionIsFifo();
+    openOptionsBoundReaderAdmission(temporary);
+    transactionStateUsesTheDatabaseAllocator();
 }
