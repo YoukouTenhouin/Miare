@@ -421,11 +421,14 @@ struct OpenedFormat {
     std::uint64_t generation;
     std::uint64_t highWaterBytes;
     std::uint64_t optionalFeatures;
+    std::array<std::byte, 32> orderedRoot;
 };
 
 struct OpenedDatabase {
     OpenedFormat format;
     SessionKeys keys;
+    Bootstrap bootstrap;
+    PublicationPlaintext publication;
 };
 
 [[noreturn]] inline void throwCorrupt(const char* message) {
@@ -586,23 +589,37 @@ template<class Limits>
     if (!std::equal(expectedProfile.begin(), expectedProfile.end(), storedProfile.begin())) {
         throw DatabaseError{Errc::IncompatibleProfile, "incompatible capacity profile"};
     }
-    if (!allZero(input, PublicationLayout::orderedRoot, PublicationLayout::highWaterBlocks)) {
-        throwCorrupt("initial database contains an invalid root reference");
-    }
     const auto highWaterBlocks = readLittleEndian<std::uint64_t>(
         input, PublicationLayout::highWaterBlocks);
-    if (highWaterBlocks != commonRegionBytes / Limits::allocationQuantumBytes) {
-        throwCorrupt("initial database has an invalid committed boundary");
+    const auto commonRegionBlocks =
+        commonRegionBytes / Limits::allocationQuantumBytes;
+    if ((generation == 1 &&
+         (!allZero(
+              input,
+              PublicationLayout::orderedRoot,
+              PublicationLayout::highWaterBlocks) ||
+          highWaterBlocks != commonRegionBlocks)) ||
+        (generation > 1 &&
+         (highWaterBlocks < commonRegionBlocks ||
+          highWaterBlocks > Limits::maxDatabaseBytes /
+              Limits::allocationQuantumBytes))) {
+        throwCorrupt("database has an invalid committed boundary");
     }
     if (readLittleEndian<std::uint64_t>(input, PublicationLayout::flags) != 0) {
         throwCorrupt("publication flags are noncanonical");
     }
+    std::array<std::byte, 32> orderedRoot{};
+    std::copy_n(
+        input.begin() + PublicationLayout::orderedRoot,
+        orderedRoot.size(),
+        orderedRoot.begin());
     return OpenedFormat{
         compressionId == 0 ? Compression::None : Compression::ZStd,
         generation,
         highWaterBlocks * Limits::allocationQuantumBytes,
         readLittleEndian<std::uint64_t>(
-            input, PublicationLayout::optionalFeatures)};
+            input, PublicationLayout::optionalFeatures),
+        orderedRoot};
 }
 
 inline void validateCanonicalBootstrap(const Bootstrap& bootstrap) {
@@ -699,7 +716,11 @@ template<class Limits>
         throwCorrupt("database file ends before its committed boundary");
     }
     return Result<OpenedDatabase, AuthenticationFailed>::success(
-        OpenedDatabase{*formats[selected], std::move(keys)});
+        OpenedDatabase{
+            *formats[selected],
+            std::move(keys),
+            bootstrap,
+            *plaintexts[selected]});
 }
 
 } // namespace miare::detail

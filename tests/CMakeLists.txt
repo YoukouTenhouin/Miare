@@ -25,6 +25,20 @@ target_link_libraries(
     miare_database_lifecycle_test PRIVATE miare::miare Threads::Threads)
 add_test(NAME miare.database_lifecycle COMMAND miare_database_lifecycle_test)
 
+add_executable(miare_exact_transaction_test exact_transaction_test.cpp)
+target_link_libraries(
+    miare_exact_transaction_test PRIVATE miare::miare Threads::Threads)
+add_test(NAME miare.exact_transaction COMMAND miare_exact_transaction_test)
+set_tests_properties(miare.exact_transaction PROPERTIES TIMEOUT 10)
+add_test(
+    NAME miare.exact_transaction_live_child_assertion
+    COMMAND
+        ${CMAKE_COMMAND}
+        -DTEST_EXECUTABLE=$<TARGET_FILE:miare_exact_transaction_test>
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/live_child_assertion_test.cmake)
+set_tests_properties(
+    miare.exact_transaction_live_child_assertion PROPERTIES TIMEOUT 10)
+
 add_test(
     NAME miare.zstd_header_compat
     COMMAND

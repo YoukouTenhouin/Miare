@@ -49,6 +49,14 @@ struct OpenOptions {
     std::uint32_t maxReaders = 256;
 };
 
+struct WriteTransactionStats {
+    std::uint64_t keyMutations = 0;
+    std::uint64_t blobMutations = 0;
+    std::uint64_t blobBytesWritten = 0;
+    std::uint64_t estimatedFileGrowthBytes = 0;
+    std::uint32_t openBlobWriters = 0;
+};
+
 class EncryptionKeyView {
 public:
     EncryptionKeyView() = delete;
