@@ -1,0 +1,3 @@
+# Split B+ tree pages by canonical plaintext size
+
+Page overflow and split placement are determined solely from canonical uncompressed plaintext images, never from provider compression output. Every boundary leaving at least one leaf entry or internal child on each side is evaluated after recomputing both pages' exact longest-common-prefix encoding; invalid oversized candidates are discarded, the candidate with the smallest absolute encoded-size difference wins, and a tie selects the smaller left count. The complete minimum key of the right subtree is propagated upward and the rule recurses on parent overflow, producing deterministic byte-balanced topology across compatible implementations and provider versions.

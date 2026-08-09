@@ -1,0 +1,3 @@
+# Compress each complete fixed B+ tree page image
+
+A B+ tree page decodes to a fixed image equal to its framed-page ceiling minus the 160-byte extent preamble and 16-byte tag; used canonical bytes begin the image and all free space is zero. If compressed, the entire image is one Zstandard unit rather than separate key, Value, or slot streams. Copy-on-write already rebuilds and reauthenticates the complete page after mutation, so whole-page compression gains redundancy across entries and zero space with one frame and one decode bound, while accepting that navigation must decode the roughly 16 KiB default page even when only keys are needed.

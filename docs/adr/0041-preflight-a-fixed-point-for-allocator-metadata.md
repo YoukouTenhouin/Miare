@@ -1,0 +1,3 @@
+# Reach an allocator-metadata fixed point before persistence
+
+Commit preflight assigns every non-allocator extent, retires superseded metadata, and monotonically reserves enough full-ceiling pages to encode the resulting free and retired indexes; it repeats only when the constructed metadata exceeds that reservation, then returns unused suffixes and performs one final encoding. All roots, counters, locations, nonces, buffers, and bytes are fixed before persistence begins. This accepts a bounded in-memory planning loop to avoid recursive allocator writes, provider-dependent reservation sizes, or a special untracked metadata arena.

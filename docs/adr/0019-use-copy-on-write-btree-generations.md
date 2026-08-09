@@ -1,0 +1,3 @@
+# Publish immutable copy-on-write B+ tree generations
+
+The v1 B+ tree backend represents each committed generation with an immutable root set covering the ordered keyspace, Blob catalog, and allocation state. A write transaction creates replacement pages and Blob structures without modifying units reachable from a committed generation, then atomically publishes the new root set; superseded units remain available to retained snapshots and become reusable only after no live generation can observe them. This accepts copy-on-write amplification in exchange for naturally stable snapshots, atomic key-and-Blob publication, and an update model aligned with possible future immutable-run backends rather than adopting in-place updates and a page-redo WAL.

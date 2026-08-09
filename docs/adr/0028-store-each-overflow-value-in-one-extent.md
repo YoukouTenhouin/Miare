@@ -1,0 +1,3 @@
+# Store each overflow Value in one authenticated extent
+
+A Value larger than the capacity profile's inline cutoff is stored in one self-framing authenticated extent containing its complete logical bytes, optionally compressed as one unit, and its leaf entry carries the logical length and one direct extent reference. Reads authenticate and decode the complete extent before returning the already-promised owned in-memory Value. This may require a contiguous allocation up to `maxValueBytes`, but avoids a manifest and multi-unit read path for ordinary Values; applications needing incremental or substantially larger content use Blobs instead.

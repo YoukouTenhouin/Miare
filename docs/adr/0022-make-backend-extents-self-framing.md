@@ -1,0 +1,3 @@
+# Make every backend extent self-framing
+
+Every B+ tree page, overflow value, Blob manifest, Blob chunk, and allocation structure begins with a canonical bounded preamble and contains its own nonce, ciphertext, and authentication tag. Its authenticated parent separately supplies the expected physical extent, role, generation, and encoded bounds, all of which must agree before plaintext is released. The duplicated metadata and allocation rounding are accepted so independent implementations can use one fail-closed unit parser and offline tooling can bound, inventory, verify, and potentially salvage extents without first trusting a complete parent graph.

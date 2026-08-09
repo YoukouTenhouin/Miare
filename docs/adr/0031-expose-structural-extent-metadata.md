@@ -1,0 +1,3 @@
+# Expose authenticated structural metadata outside extent ciphertext
+
+Authenticated-extent preambles visibly identify unit role and key domain, physical bounds, encoded and decoded sizes, compression representation, generation and sequence, Blob ownership, and nonce. Application keys, Values, Blob bytes, and allocation content remain encrypted, but v1 does not promise structural hiding or deniability. Accepting this leakage makes extents independently classifiable and bounded for offline inventory, orphan analysis, verification, and potential salvage rather than requiring a trusted parent graph merely to understand the file's physical contents.

@@ -1,0 +1,3 @@
+# Reuse one slotted-page format for every persistent index
+
+The ordered keyspace, Blob catalog, per-Blob chunk indexes, free extents, and retired extents share one page header, prefix and slot encoding, internal-entry schema, copy-on-write split algorithm, and lazy-deletion behavior. Tree roles provide distinct comparators and fixed leaf payload schemas, and the public inline-Value cutoff applies only to ordered-keyspace leaves. This forgoes specialized fixed-width metadata pages that could be denser, but concentrates traversal, mutation, authentication, and structural verification in one format mechanism while keeping semantic roles explicit and cross-checked.

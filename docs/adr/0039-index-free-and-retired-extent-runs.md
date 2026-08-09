@@ -1,0 +1,3 @@
+# Index free runs separately from generation-retired runs
+
+The allocator root references a free-extent B+ tree keyed by starting block and a retired-extent B+ tree keyed by retirement generation then starting block. Entries are maximal coalesced runs, and a run retired in generation `r` cannot become free while any live snapshot predates `r`; after process loss no snapshots remain and all holds through the selected generation are eligible. This avoids a file-sized bitmap and persists the reason storage is unavailable, at the cost of two copy-on-write metadata indexes whose own pages participate in allocation and retirement.

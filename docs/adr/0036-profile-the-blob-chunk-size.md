@@ -1,0 +1,3 @@
+# Make Blob chunk size part of the capacity profile
+
+Blob content is partitioned using the compile-time `blobChunkBytes`, persisted numerically in the authenticated capacity profile and matched exactly on open. `DefaultLimits` uses 1 MiB; custom profiles may select a power of two from 64 KiB through 16 MiB inclusive and no smaller than the Allocation quantum. Every permitted size must interoperate correctly, but only the 1 MiB default is performance-qualified; this lets applications trade seek granularity, metadata scale, compression scope, and streaming memory without making chunk size a mutable property of an existing database.

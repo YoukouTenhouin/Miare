@@ -1,0 +1,3 @@
+# Prefix-compress keys independently within each B+ tree page
+
+Every non-empty leaf page stores the exact longest common prefix of its full keys once, and every internal page stores the exact longest common prefix of its full separators once; indexed entries store only independent suffixes. Empty pages or internal pages without separators use an empty prefix, and a single entry may therefore have an empty suffix. Recomputing the exact page-local prefix whenever a copy-on-write page is encoded gives a canonical compact representation while preserving direct slot lookup and binary search, unlike chained front-coding whose entries depend on earlier decoder state.

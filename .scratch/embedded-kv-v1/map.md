@@ -28,6 +28,8 @@ Produce an implementation-ready v1 product and architecture specification for a 
 
 - [Freeze the public and transactional contract](../embedded-kv-v1-implementation/issues/01-freeze-public-and-transactional-contract.md) — Fixes the C++20 surface, semantic outcomes and exceptions, handle lifecycles, concurrency and snapshots, Blob streams, maintenance, diagnostics, shutdown, capacity profiles, and representative desktop workload.
 
+- [Freeze the portable B+ tree and Blob formats](../embedded-kv-v1-implementation/issues/02-freeze-portable-btree-and-blob-formats.md) — Fixes copy-on-write generations, the common region and publication slots, authenticated extents, page and allocator formats, Blob manifests and chunks, compression, key derivation, and compatibility behavior.
+
 - [Use XChaCha20-Poly1305-IETF](../../docs/adr/0015-use-xchacha20-poly1305-ietf.md) — Replaces the earlier agent-assumed AES suite with the explicit product choice of libsodium-compatible XChaCha20-Poly1305-IETF using fresh random 24-byte nonces and full tags.
 
 - [Derive database keys with BLAKE2b](../../docs/adr/0018-derive-database-keys-with-blake2b.md) — Replaces the inherited HKDF-SHA-256 assumption with a salted database-root derivation and libsodium BLAKE2b KDF domain keys.
@@ -38,9 +40,8 @@ Produce an implementation-ready v1 product and architecture specification for a 
 
 ## Not yet specified
 
-- Exact page, extent, free-space, and overflow layouts; these become sharp after the B+ tree update/recovery strategy and Blob model are chosen.
-- Format upgrade and backward-compatibility mechanics beyond the already-required cross-platform byte representation; these depend on the physical format and encryption envelope.
 - Concrete salvage and repair behavior for partially corrupt databases; this depends on what integrity metadata and failure boundaries the selected formats provide.
+- Exact interruption, maintenance, backup, and full-verification workflows over the frozen publication and extent formats.
 - Measurable latency, throughput, memory, and amplification targets within the frozen representative workload; correctness limits and public cache-pressure behavior are fixed by ticket 01.
 - Detailed fuzzing, fault-injection, crash-matrix, interoperability, and long-duration tests; these become precise after the observable contracts and file states are settled.
 - Distribution and provider-discovery details across build systems; these depend on the final provider interfaces and supported configurations.

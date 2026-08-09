@@ -12,6 +12,10 @@ _Avoid_: Table, collection, custom-ordered keyspace
 An arbitrary byte string associated with a key. Interpretation and serialization belong to the embedding application.
 _Avoid_: Record, document, object
 
+**Inline value**:
+A Value whose complete bytes reside in its B+ tree leaf entry according to the database's capacity profile. Larger Values use an overflow representation without changing their public meaning.
+_Avoid_: Small value, embedded object
+
 **Blob**:
 A potentially large byte sequence held inside the portable database file and accessed incrementally within a transaction. A blob is distinct from an in-memory value and can be referenced by an identifier stored in a value.
 _Avoid_: Large value, external asset, media file
@@ -20,9 +24,33 @@ _Avoid_: Large value, external asset, media file
 The stable database-local identity of a Blob. Blob content may be transactionally replaced without changing this identity, while relationships between values and Blob identifiers belong entirely to the embedding application.
 _Avoid_: File path, external URL
 
+**Blob chunk**:
+One independently authenticated and optionally compressed contiguous portion of a Blob. Its logical size is fixed by the database's capacity profile except for the final chunk.
+_Avoid_: Blob page, stream buffer, file block
+
 **Storage backend**:
 The persistence strategy chosen when a database is created. It owns backend-specific storage behavior, including the physical compression unit, and cannot be changed for an existing database.
 _Avoid_: Engine, runtime backend switch
+
+**B+ tree backend**:
+The v1 Storage backend, organized as immutable committed generations of an ordered B+ tree and its associated Blob and allocation state. A new generation replaces affected paths through copy-on-write publication while retained snapshots continue to observe earlier generations.
+_Avoid_: B-Tree, in-place tree
+
+**Extent reference**:
+The authenticated physical address and bounds of one immutable unit in the portable database file. References are embedded directly in parent structures rather than resolved through a separate object-location map.
+_Avoid_: Page ID, object pointer, file pointer
+
+**Allocation quantum**:
+The smallest addressable span of backend-owned file space. It is fixed by the database's capacity profile, and extent positions and allocation spans are expressed in whole quanta.
+_Avoid_: Filesystem block size, page size, sector size
+
+**Authenticated extent**:
+A self-framing immutable unit whose physical bounds, role, generation, representation, and content are validated together before its plaintext is exposed. Parent structures also carry the expected Extent reference and role.
+_Avoid_: Raw page, trusted record, allocation block
+
+**Framed-page ceiling**:
+The maximum physical span of one B+ tree page including its authenticated framing. It is derived from the Allocation quantum and may bound compressed pages to a smaller whole-quantum span.
+_Avoid_: Plaintext page size, cache page size
 
 **Compression policy**:
 The database-creation choice that permits transparent compression by the selected storage backend. The backend determines the physical compression unit.
@@ -35,6 +63,10 @@ _Avoid_: Runtime cipher, provider algorithm
 **Encryption key material**:
 The high-entropy secret supplied by the embedding application as the root of a database's encryption.
 _Avoid_: Password, stored database key
+
+**Structural metadata**:
+The visible physical facts needed to classify and bound the portable file's authenticated units, including their roles, sizes, generations, compression representation, and Blob ownership. It excludes application keys, Values, and Blob content.
+_Avoid_: Plaintext content, deniable metadata
 
 **Portable database file**:
 The single file that contains a database's complete committed state after a clean close and can be moved without auxiliary files. Recovery after an unclean shutdown may additionally require encrypted journal or write-ahead-log files.

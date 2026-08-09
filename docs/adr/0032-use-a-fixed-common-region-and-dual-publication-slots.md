@@ -1,0 +1,3 @@
+# Reserve a fixed common region with dual publication slots
+
+Every file reserves its first 64 KiB for a 4 KiB immutable visible bootstrap, two separately aligned 4 KiB encrypted publication slots, and zeroed future common-format space; backend data begins at 64 KiB, aligned to every permitted Allocation quantum. Commits alternate slots and never overwrite the newest committed slot, allowing copy-on-write data to become durable before one bounded publication write and leaving the prior generation intact if that write tears. The fixed reserved region costs 64 KiB per database but stabilizes backend offsets and leaves room for compatible common-header evolution without relocating data.

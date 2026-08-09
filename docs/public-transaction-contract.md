@@ -222,7 +222,7 @@ The XChaCha20-Poly1305-IETF suite accepts exactly 32 bytes of caller-supplied hi
 
 Key derivation has two fixed stages:
 
-1. Generate and persist a random 16-byte KDF salt when creating the database. Derive a 32-byte database root with keyed BLAKE2b-256 over the canonical database identity, encryption-suite identifier, and derivation version. Use the caller's 32-byte key as the BLAKE2b key, the stored salt as the BLAKE2b salt parameter, and the 16-byte personalization `MiareDbRootV1` followed by three zero bytes.
+1. Generate and persist a random 16-byte KDF salt when creating the database. Derive a 32-byte database root with keyed BLAKE2b-256 over exactly 24 bytes: the 16-byte database identity, encryption-suite identifier as little-endian `u32`, and derivation version as little-endian `u32`. Use the caller's 32-byte key as the BLAKE2b key, the stored salt as the BLAKE2b salt parameter, and the 16-byte personalization `MiareDbRootV1` followed by three zero bytes. No length prefix or other bootstrap or profile field enters this message.
 2. Use libsodium-compatible `crypto_kdf_derive_from_key()` with the database root, the exact 8-byte context `MiareV1K`, 32-byte outputs, and stable subkey identifiers `1` for header, `2` for main data, `3` for recovery data, and `4` for Blob data.
 
 The bounded visible bootstrap persists the database identity, KDF identifier, derivation version, and salt needed to reproduce this derivation; header authentication binds all of them before they are trusted. The canonical root input encoding and all derived outputs have cross-provider fixtures. Changing any personalization, context, subkey identifier, or input encoding is a format change. The caller-key copy and intermediate database root receive best-effort erasure after derivation.
@@ -395,6 +395,9 @@ Hard limits belong to the compile-time `Limits` policy and its persisted exact-m
 
 ```cpp
 struct DefaultLimits {
+    static constexpr std::uint64_t allocationQuantumBytes = 4ULL * 1024ULL;
+    static constexpr std::uint64_t maxInlineValueBytes = 1ULL * 1024ULL;
+    static constexpr std::uint64_t blobChunkBytes = 1ULL << 20;
     static constexpr std::uint64_t maxKeyBytes = 4ULL * 1024ULL;
     static constexpr std::uint64_t maxValueBytes =
         16ULL * 1024ULL * 1024ULL;
@@ -413,6 +416,10 @@ struct DefaultLimits {
 ```
 
 `LimitPolicy` validates internal consistency at compile time. The file records a canonical identity for every profile value. `open` requires an exact profile match even if current contents would fit a different policy. Portability is guaranteed only among implementations with identical profiles.
+
+`allocationQuantumBytes` must be a power of two from 512 bytes through 64 KiB inclusive. Every permitted value is a correctness and interoperability requirement, while only the 4 KiB default is performance-qualified. `maxInlineValueBytes` may be zero, must not exceed `maxValueBytes`, and must leave room for one maximum-key leaf entry and all fixed metadata in the derived plaintext page capacity.
+
+`blobChunkBytes` must be a power of two from 64 KiB through 16 MiB inclusive and at least `allocationQuantumBytes`. Every permitted value is a correctness and interoperability requirement, while only the 1 MiB default is performance-qualified.
 
 Successful mutating calls count toward transaction limits, not merely distinct final objects: every `put` counts; `erase` and `eraseBlob` count only when true; Blob creation or replacement counts when the writer is created and releases its count on abort. Replacing then erasing one Blob counts twice. `WriteTransactionStats` exposes `keyMutations`, `blobMutations`, `blobBytesWritten`, `estimatedFileGrowthBytes`, and `openBlobWriters`.
 

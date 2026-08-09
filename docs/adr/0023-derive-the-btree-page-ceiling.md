@@ -1,0 +1,3 @@
+# Derive the B+ tree framed-page ceiling from the allocation profile
+
+The maximum complete framed extent for a B+ tree page is `max(16 KiB, allocationQuantumBytes)`. Uncompressed pages occupy that full span, including preamble, nonce, encoded payload, tag, and deterministic zero padding; compressed pages may use fewer whole allocation quanta. Treating this ceiling as a canonical derivation rather than another independent profile setting keeps the default page envelope at 16 KiB, accommodates custom 32 or 64 KiB allocation quanta correctly, and limits the format-configuration matrix while accepting that non-default large quanta change page fanout and are not performance-qualified.
