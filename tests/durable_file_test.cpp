@@ -67,6 +67,23 @@ int main() {
     } catch (const miare::DatabaseError& error) {
         assert(error.code() == Errc::Durability);
     }
+    assert(memory.operations().size() == 9);
+    assert(memory.operations()[6].kind ==
+           miare::testing::DurableFileOperationKind::Write);
+    assert(memory.operations()[6].transferredBytes == 2);
+    assert(!memory.operations()[6].succeeded);
+    assert(memory.operations()[8].kind ==
+           miare::testing::DurableFileOperationKind::Barrier);
+    assert(!memory.operations()[8].succeeded);
+
+    memory.simulateCrash();
+    assert(memory.bytes()[0] == std::byte{0});
+    assert(memory.bytes()[1] == std::byte{0});
+    memory.writeExactAt(0, input);
+    const std::array<miare::testing::RetainedFileRange, 1> retained{{{0, 1}}};
+    memory.simulateCrash(retained);
+    assert(memory.bytes()[0] == input[0]);
+    assert(memory.bytes()[1] == std::byte{0});
 
     const auto suffix = std::to_string(
         std::chrono::steady_clock::now().time_since_epoch().count());

@@ -6,7 +6,9 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 
 namespace {
@@ -59,6 +61,12 @@ int main() {
     std::array<std::byte, cryptoKeyBytes> headerKey{};
     crypto.deriveSubkey(root, 1, headerKey);
     assert(headerKey == hex<32>("5569edef52f90dd89b36cac097b1377b9424c4f3c78c171046c06ced7f3c4d87"));
+    try {
+        crypto.deriveSubkey(root, 5, headerKey);
+        assert(false);
+    } catch (const ContractError& error) {
+        assert(error.code() == Errc::InvalidArgument);
+    }
 
     const auto aeadKey = sequence<32>(0x80);
     const auto nonce = hex<24>("07000000404142434445464748494a4b4c4d4e4f50515253");
@@ -175,4 +183,12 @@ int main() {
     auto providers = ProviderSet::system();
     (void)ProviderAccess::crypto(providers);
     (void)ProviderAccess::compression(providers);
+    static_assert(!std::is_constructible_v<
+                  ProviderSet,
+                  std::unique_ptr<CryptoProvider>,
+                  std::unique_ptr<CompressionProvider>>);
+    auto testProviders = ProviderAccess::make(
+        std::make_unique<testing::DeterministicCryptoProvider>(11),
+        std::make_unique<testing::FaultInjectingCompressionProvider>());
+    (void)ProviderAccess::crypto(testProviders);
 }

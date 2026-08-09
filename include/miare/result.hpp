@@ -17,11 +17,16 @@ struct WriterBusy {
 };
 
 template<class T, class E>
+requires(!std::is_same_v<E, Errc>)
 class Result {
     static_assert(!std::is_void_v<T>, "Result<void, E> is not part of the v1 contract");
-    static_assert(!std::is_same_v<T, E>, "Result alternatives must have distinct types");
 
 public:
+    Result(const Result&) = default;
+    Result(Result&&) = default;
+    Result& operator=(const Result&) = delete;
+    Result& operator=(Result&&) = delete;
+
     [[nodiscard]] static Result success(T value) {
         return Result{std::in_place_index<0>, std::move(value)};
     }

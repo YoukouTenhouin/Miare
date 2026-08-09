@@ -9,12 +9,18 @@
 #include <type_traits>
 #include <vector>
 
+template<class T, class E>
+concept ResultTypeExists = requires { typename miare::Result<T, E>; };
+
 int main() {
     using namespace miare;
 
     static_assert(std::same_as<ByteView, std::span<const std::byte>>);
     static_assert(std::same_as<MutableByteView, std::span<std::byte>>);
     static_assert(!std::is_default_constructible_v<EncryptionKeyView>);
+    static_assert(!std::is_constructible_v<
+                  EncryptionKeyView,
+                  std::array<std::byte, 32>&&>);
 
     std::array<std::byte, 3> bytes{};
     EncryptionKeyView key{bytes};
@@ -34,6 +40,11 @@ int main() {
     auto failure = Result<std::unique_ptr<int>, WriterBusy>::failure(WriterBusy{});
     assert(!failure.hasValue());
     assert(failure.error() == WriterBusy{});
+
+    auto sameTypes = Result<int, int>::failure(9);
+    assert(sameTypes.error() == 9);
+    static_assert(!ResultTypeExists<int, Errc>);
+    static_assert(!std::is_move_assignable_v<Result<std::string, WriterBusy>>);
 
     const std::error_code native{5, std::system_category()};
     DatabaseError databaseError{Errc::Io, "read failed", native};

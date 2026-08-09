@@ -9,6 +9,7 @@
 #define MIARE_UNDEFINE_ZSTD_STATIC_LINKING_ONLY
 #endif
 #include <zstd.h>
+#include <zstd_errors.h>
 #ifdef MIARE_UNDEFINE_ZSTD_STATIC_LINKING_ONLY
 #undef ZSTD_STATIC_LINKING_ONLY
 #undef MIARE_UNDEFINE_ZSTD_STATIC_LINKING_ONLY
@@ -153,6 +154,9 @@ public:
         MutableByteView output) override {
         requireSize(databaseRoot, cryptoKeyBytes, "database root");
         requireSize(output, cryptoKeyBytes, "derived subkey output");
+        if (subkeyId < 1 || subkeyId > 4) {
+            throw ContractError{Errc::InvalidArgument, "KDF subkey domain is invalid"};
+        }
         constexpr char context[crypto_kdf_CONTEXTBYTES] = {
             'M', 'i', 'a', 'r', 'e', 'V', '1', 'K'};
         if (crypto_kdf_derive_from_key(
@@ -327,9 +331,16 @@ public:
             "Zstandard decode-window setup failed");
         const auto decoded = ZSTD_decompressDCtx(
             context.get(), output.data(), output.size(), frame.data(), frame.size());
-        if (ZSTD_isError(decoded) || decoded != output.size()) {
+        if (ZSTD_isError(decoded)) {
             std::fill(output.begin(), output.end(), std::byte{0});
+            if (ZSTD_getErrorCode(decoded) == ZSTD_error_memory_allocation) {
+                throwProviderFailure("Zstandard decompression allocation failed");
+            }
             throwCorrupt("Zstandard frame decode failed");
+        }
+        if (decoded != output.size()) {
+            std::fill(output.begin(), output.end(), std::byte{0});
+            throwCorrupt("Zstandard frame decoded to an invalid size");
         }
     }
 
@@ -367,15 +378,6 @@ namespace miare {
 
 class ProviderSet {
 public:
-    ProviderSet(
-        std::unique_ptr<detail::CryptoProvider> crypto,
-        std::unique_ptr<detail::CompressionProvider> compression)
-        : crypto_(std::move(crypto)), compression_(std::move(compression)) {
-        if (!crypto_) {
-            throw ContractError{Errc::InvalidArgument, "crypto provider is missing"};
-        }
-    }
-
     [[nodiscard]] static ProviderSet system() {
         return ProviderSet{
             std::make_unique<detail::SodiumCryptoProvider>(),
@@ -389,6 +391,16 @@ public:
 
 private:
     friend class detail::ProviderAccess;
+
+    ProviderSet(
+        std::unique_ptr<detail::CryptoProvider> crypto,
+        std::unique_ptr<detail::CompressionProvider> compression)
+        : crypto_(std::move(crypto)), compression_(std::move(compression)) {
+        if (!crypto_) {
+            throw ContractError{Errc::InvalidArgument, "crypto provider is missing"};
+        }
+    }
+
     std::unique_ptr<detail::CryptoProvider> crypto_;
     std::unique_ptr<detail::CompressionProvider> compression_;
 };
@@ -397,6 +409,12 @@ namespace detail {
 
 class ProviderAccess {
 public:
+    [[nodiscard]] static ProviderSet make(
+        std::unique_ptr<CryptoProvider> crypto,
+        std::unique_ptr<CompressionProvider> compression) {
+        return ProviderSet{std::move(crypto), std::move(compression)};
+    }
+
     static CryptoProvider& crypto(ProviderSet& providers) {
         if (!providers.crypto_) {
             throw ContractError{Errc::InvalidState, "provider set is inert"};

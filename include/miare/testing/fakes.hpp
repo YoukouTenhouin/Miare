@@ -12,7 +12,44 @@
 
 namespace miare::testing {
 
-class DeterministicCryptoProvider final : public detail::CryptoProvider {
+enum class DurableFileOperationKind {
+    Read,
+    Write,
+    Resize,
+    Barrier,
+};
+
+struct DurableFileOperation {
+    DurableFileOperationKind kind;
+    std::uint64_t offset;
+    std::size_t requestedBytes;
+    std::size_t transferredBytes;
+    bool succeeded;
+};
+
+struct RetainedFileRange {
+    std::size_t offset;
+    std::size_t length;
+};
+
+class ProviderFailureInjection {
+protected:
+    void failNextProviderOperation() noexcept { failProvider_ = true; }
+
+    void failProviderIfRequested() {
+        if (failProvider_) {
+            failProvider_ = false;
+            throw DatabaseError{Errc::ProviderUnavailable, "injected provider failure"};
+        }
+    }
+
+private:
+    bool failProvider_ = false;
+};
+
+class DeterministicCryptoProvider final
+    : public detail::CryptoProvider,
+      private ProviderFailureInjection {
 public:
     explicit DeterministicCryptoProvider(std::uint64_t seed) : state_(seed) {}
 
@@ -86,25 +123,21 @@ public:
     }
 
     void failNextRandom() noexcept { failRandom_ = true; }
-    void failNextProviderOperation() noexcept { failProvider_ = true; }
+    void failNextProviderOperation() noexcept {
+        ProviderFailureInjection::failNextProviderOperation();
+    }
     void corruptNextCiphertext() noexcept { corruptCiphertext_ = true; }
 
 private:
-    void failProviderIfRequested() {
-        if (failProvider_) {
-            failProvider_ = false;
-            throw DatabaseError{Errc::ProviderUnavailable, "injected provider failure"};
-        }
-    }
-
     detail::SodiumCryptoProvider delegate_;
     std::uint64_t state_;
     bool failRandom_ = false;
-    bool failProvider_ = false;
     bool corruptCiphertext_ = false;
 };
 
-class FaultInjectingCompressionProvider final : public detail::CompressionProvider {
+class FaultInjectingCompressionProvider final
+    : public detail::CompressionProvider,
+      private ProviderFailureInjection {
 public:
     [[nodiscard]] std::size_t compressBound(std::size_t inputBytes) const override {
         return delegate_.compressBound(inputBytes);
@@ -127,25 +160,21 @@ public:
         delegate_.decompress(frame, output);
     }
 
-    void failNextProviderOperation() noexcept { failProvider_ = true; }
+    void failNextProviderOperation() noexcept {
+        ProviderFailureInjection::failNextProviderOperation();
+    }
     void corruptNextFrame() noexcept { corruptFrame_ = true; }
 
 private:
-    void failProviderIfRequested() {
-        if (failProvider_) {
-            failProvider_ = false;
-            throw DatabaseError{Errc::ProviderUnavailable, "injected provider failure"};
-        }
-    }
-
     detail::ZstdCompressionProvider delegate_;
-    bool failProvider_ = false;
     bool corruptFrame_ = false;
 };
 
 class MemoryDurableFile final : public detail::DurableFile {
 public:
     void readExactAt(std::uint64_t offset, MutableByteView destination) override {
+        auto& operation = beginOperation(
+            DurableFileOperationKind::Read, offset, destination.size());
         if (offset > bytes_.size() || destination.size() > bytes_.size() - offset) {
             throw DatabaseError{Errc::Io, "injected short read"};
         }
@@ -153,26 +182,34 @@ public:
             std::copy_n(bytes_.begin() + static_cast<std::ptrdiff_t>(offset + position),
                         count,
                         destination.begin() + static_cast<std::ptrdiff_t>(position));
+            operation.transferredBytes += count;
         });
+        operation.succeeded = true;
     }
 
     void writeExactAt(std::uint64_t offset, ByteView source) override {
+        auto& operation = beginOperation(
+            DurableFileOperationKind::Write, offset, source.size());
         if (offset > std::numeric_limits<std::size_t>::max() ||
             source.size() > std::numeric_limits<std::size_t>::max() - offset) {
             throw ContractError{Errc::InvalidArgument, "file range is not representable"};
         }
-        const auto end = static_cast<std::size_t>(offset) + source.size();
-        if (end > bytes_.size()) {
-            bytes_.resize(end);
-        }
         transfer(source.size(), [&](std::size_t position, std::size_t count) {
+            const auto chunkEnd = static_cast<std::size_t>(offset) + position + count;
+            if (chunkEnd > bytes_.size()) {
+                bytes_.resize(chunkEnd);
+            }
             std::copy_n(source.begin() + static_cast<std::ptrdiff_t>(position),
                         count,
                         bytes_.begin() + static_cast<std::ptrdiff_t>(offset + position));
+            operation.transferredBytes += count;
         });
+        operation.succeeded = true;
     }
 
     void resize(std::uint64_t length) override {
+        auto& operation = beginOperation(
+            DurableFileOperationKind::Resize, length, 0);
         if (failResize_) {
             failResize_ = false;
             throw DatabaseError{Errc::Io, "injected resize failure"};
@@ -181,14 +218,18 @@ public:
             throw ContractError{Errc::InvalidArgument, "file length is not representable"};
         }
         bytes_.resize(static_cast<std::size_t>(length));
+        operation.succeeded = true;
     }
 
     void stableStorageBarrier() override {
+        auto& operation = beginOperation(DurableFileOperationKind::Barrier, 0, 0);
         if (failBarrier_) {
             failBarrier_ = false;
             throw DatabaseError{Errc::Durability, "injected barrier failure"};
         }
+        stableBytes_ = bytes_;
         ++barrierCount_;
+        operation.succeeded = true;
     }
 
     void setMaxTransferBytes(std::size_t bytes) {
@@ -207,6 +248,36 @@ public:
             throw ContractError{Errc::InvalidArgument, "corruption offset is out of range"};
         }
         bytes_[offset] ^= mask;
+        if (offset < stableBytes_.size()) {
+            stableBytes_[offset] ^= mask;
+        }
+    }
+
+    void simulateCrash(std::span<const RetainedFileRange> retainedRanges = {}) {
+        auto unbarrieredBytes = bytes_;
+        bytes_ = stableBytes_;
+        for (const auto range : retainedRanges) {
+            if (range.offset > unbarrieredBytes.size() ||
+                range.length > unbarrieredBytes.size() - range.offset) {
+                throw ContractError{
+                    Errc::InvalidArgument,
+                    "retained crash range is out of bounds"};
+            }
+            if (range.length > std::numeric_limits<std::size_t>::max() - range.offset) {
+                throw ContractError{
+                    Errc::InvalidArgument,
+                    "retained crash range is not representable"};
+            }
+            const auto end = range.offset + range.length;
+            if (end > bytes_.size()) {
+                bytes_.resize(end);
+            }
+            std::copy_n(
+                unbarrieredBytes.begin() + static_cast<std::ptrdiff_t>(range.offset),
+                range.length,
+                bytes_.begin() + static_cast<std::ptrdiff_t>(range.offset));
+        }
+        stableBytes_ = bytes_;
     }
 
     void clearFaults() noexcept {
@@ -217,8 +288,19 @@ public:
 
     [[nodiscard]] const std::vector<std::byte>& bytes() const noexcept { return bytes_; }
     [[nodiscard]] std::size_t barrierCount() const noexcept { return barrierCount_; }
+    [[nodiscard]] const std::vector<DurableFileOperation>& operations() const noexcept {
+        return operations_;
+    }
 
 private:
+    DurableFileOperation& beginOperation(
+        DurableFileOperationKind kind,
+        std::uint64_t offset,
+        std::size_t requestedBytes) {
+        return operations_.emplace_back(
+            DurableFileOperation{kind, offset, requestedBytes, 0, false});
+    }
+
     template<class Transfer>
     void transfer(std::size_t size, Transfer&& transferChunk) {
         std::size_t transferred = 0;
@@ -242,6 +324,8 @@ private:
     }
 
     std::vector<std::byte> bytes_;
+    std::vector<std::byte> stableBytes_;
+    std::vector<DurableFileOperation> operations_;
     std::size_t maxTransferBytes_ = std::numeric_limits<std::size_t>::max();
     std::optional<std::size_t> failAfterBytes_;
     std::size_t barrierCount_ = 0;
