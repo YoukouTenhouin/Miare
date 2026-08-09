@@ -1,5 +1,6 @@
 #pragma once
 
+#include <miare/database.hpp>
 #include <miare/detail/durable_file.hpp>
 #include <miare/detail/providers.hpp>
 
@@ -237,9 +238,13 @@ public:
 
     void stableStorageBarrier() override {
         auto& operation = beginOperation(DurableFileOperationKind::Barrier, 0, 0);
-        if (failBarrier_) {
+        if (failBarrier_ || (failBarrierAfter_ && *failBarrierAfter_ == 0)) {
             failBarrier_ = false;
+            failBarrierAfter_.reset();
             throw DatabaseError{Errc::Durability, "injected barrier failure"};
+        }
+        if (failBarrierAfter_) {
+            --*failBarrierAfter_;
         }
         stableBytes_ = bytes_;
         unbarrieredMutations_.clear();
@@ -256,6 +261,9 @@ public:
 
     void failAfterTransferredBytes(std::size_t bytes) { failAfterBytes_ = bytes; }
     void failNextBarrier() noexcept { failBarrier_ = true; }
+    void failBarrierAfter(std::size_t successfulBarriers) noexcept {
+        failBarrierAfter_ = successfulBarriers;
+    }
     void failNextResize() noexcept { failResize_ = true; }
 
     void corruptByte(std::size_t offset, std::byte mask = std::byte{1}) {
@@ -295,14 +303,21 @@ public:
     void clearFaults() noexcept {
         failAfterBytes_.reset();
         failBarrier_ = false;
+        failBarrierAfter_.reset();
         failResize_ = false;
     }
 
     [[nodiscard]] const std::vector<std::byte>& bytes() const noexcept { return bytes_; }
+    void replaceStableBytes(ByteView bytes) {
+        bytes_.assign(bytes.begin(), bytes.end());
+        stableBytes_ = bytes_;
+        unbarrieredMutations_.clear();
+    }
     [[nodiscard]] std::size_t barrierCount() const noexcept { return barrierCount_; }
     [[nodiscard]] const std::vector<DurableFileOperation>& operations() const noexcept {
         return operations_;
     }
+    void clearOperations() noexcept { operations_.clear(); }
     [[nodiscard]] std::size_t unbarrieredMutationCount() const noexcept {
         return unbarrieredMutations_.size();
     }
@@ -354,7 +369,67 @@ private:
     std::optional<std::size_t> failAfterBytes_;
     std::size_t barrierCount_ = 0;
     bool failBarrier_ = false;
+    std::optional<std::size_t> failBarrierAfter_;
     bool failResize_ = false;
+};
+
+class DatabaseAccess {
+public:
+    template<class Allocator = std::allocator<std::byte>, class Limits = DefaultLimits>
+    [[nodiscard]] static Database<Allocator, Limits> create(
+        std::unique_ptr<MemoryDurableFile> file,
+        EncryptionKeyView key,
+        ProviderSet providers,
+        CreateOptions options = {},
+        Allocator allocator = {}) {
+        detail::validateCreateOptions(options);
+        auto& crypto = detail::ProviderAccess::crypto(providers);
+        const auto commonRegion = detail::makeInitialCommonRegion<Limits>(
+            key, crypto, options.compression);
+        file->writeExactAt(0, commonRegion);
+        file->resize(detail::commonRegionBytes);
+        file->stableStorageBarrier();
+        auto opened = detail::openFormat<Limits>(*file, key, providers);
+        if (!opened) {
+            throw DatabaseError{
+                Errc::ProviderUnavailable,
+                "in-memory database failed authentication"};
+        }
+        auto openedDatabase = std::move(opened).value();
+        auto values = detail::loadExactValues<Limits>(
+            *file, openedDatabase, providers);
+        std::unique_ptr<detail::DurableFile> durableFile = std::move(file);
+        return Database<Allocator, Limits>{
+            std::move(durableFile),
+            std::move(providers),
+            std::move(allocator),
+            std::move(openedDatabase),
+            std::move(values)};
+    }
+
+    template<class Allocator = std::allocator<std::byte>, class Limits = DefaultLimits>
+    [[nodiscard]] static Result<Database<Allocator, Limits>, AuthenticationFailed> open(
+        std::unique_ptr<MemoryDurableFile> file,
+        EncryptionKeyView key,
+        ProviderSet providers,
+        Allocator allocator = {}) {
+        auto opened = detail::openFormat<Limits>(*file, key, providers);
+        if (!opened) {
+            return Result<Database<Allocator, Limits>, AuthenticationFailed>::failure(
+                AuthenticationFailed{});
+        }
+        auto openedDatabase = std::move(opened).value();
+        auto values = detail::loadExactValues<Limits>(
+            *file, openedDatabase, providers);
+        std::unique_ptr<detail::DurableFile> durableFile = std::move(file);
+        return Result<Database<Allocator, Limits>, AuthenticationFailed>::success(
+            Database<Allocator, Limits>{
+                std::move(durableFile),
+                std::move(providers),
+                std::move(allocator),
+                std::move(openedDatabase),
+                std::move(values)});
+    }
 };
 
 } // namespace miare::testing
