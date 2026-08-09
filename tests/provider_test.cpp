@@ -61,12 +61,25 @@ int main() {
     std::array<std::byte, cryptoKeyBytes> headerKey{};
     crypto.deriveSubkey(root, 1, headerKey);
     assert(headerKey == hex<32>("5569edef52f90dd89b36cac097b1377b9424c4f3c78c171046c06ced7f3c4d87"));
+    std::array<std::byte, cryptoKeyBytes> mainDataKey{};
+    crypto.deriveSubkey(root, 2, mainDataKey);
+    assert(mainDataKey == hex<32>("e05c92c953746229b7e801e7efa6ee0ddee0d6638bd4df84a410d6f3617ef68b"));
+    std::array<std::byte, cryptoKeyBytes> recoveryKey{};
+    crypto.deriveSubkey(root, 3, recoveryKey);
+    assert(recoveryKey == hex<32>("b4a82f82bea434934c17e7a4a555097e0c89a8ae0793f893f1ce00ffa6a4079a"));
+    std::array<std::byte, cryptoKeyBytes> blobKey{};
+    crypto.deriveSubkey(root, 4, blobKey);
+    assert(blobKey == hex<32>("89db752a462879c0a1953e1ce558f41b35506d3923c70384b307da056076b97a"));
     try {
         crypto.deriveSubkey(root, 5, headerKey);
         assert(false);
     } catch (const ContractError& error) {
         assert(error.code() == Errc::InvalidArgument);
     }
+
+    std::array<std::byte, cryptoKeyBytes> hashOutput{};
+    crypto.hashBlake2b256(bytes("abc"), hashOutput);
+    assert(hashOutput == hex<32>("bddd813c634239723171ef3fee98579b94964e3bb1cb3e427262c8c068d52319"));
 
     const auto aeadKey = sequence<32>(0x80);
     const auto nonce = hex<24>("07000000404142434445464748494a4b4c4d4e4f50515253");

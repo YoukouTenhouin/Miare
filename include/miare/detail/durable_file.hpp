@@ -5,10 +5,14 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <compare>
 #include <cstdint>
 #include <filesystem>
 #include <limits>
 #include <memory>
+#include <mutex>
+#include <optional>
+#include <set>
 #include <string>
 #include <system_error>
 
@@ -27,6 +31,44 @@
 
 namespace miare::detail {
 
+struct NativeFileIdentity {
+    std::uint64_t filesystem;
+    std::uint64_t file;
+
+    friend auto operator<=>(
+        const NativeFileIdentity&,
+        const NativeFileIdentity&) noexcept = default;
+};
+
+class OpenSessionRegistry {
+public:
+    static void acquire(NativeFileIdentity identity) {
+        std::lock_guard lock{mutex()};
+        if (!identities().insert(identity).second) {
+            throw DatabaseError{Errc::InUse, "database file is already in use"};
+        }
+    }
+
+    static void release(NativeFileIdentity identity) noexcept {
+        try {
+            std::lock_guard lock{mutex()};
+            identities().erase(identity);
+        } catch (...) {
+        }
+    }
+
+private:
+    [[nodiscard]] static std::mutex& mutex() {
+        static std::mutex instance;
+        return instance;
+    }
+
+    [[nodiscard]] static std::set<NativeFileIdentity>& identities() {
+        static std::set<NativeFileIdentity> instance;
+        return instance;
+    }
+};
+
 class DurableFile {
 public:
     DurableFile() = default;
@@ -34,6 +76,7 @@ public:
     DurableFile& operator=(const DurableFile&) = delete;
     virtual ~DurableFile() = default;
 
+    [[nodiscard]] virtual std::uint64_t size() const = 0;
     virtual void readExactAt(std::uint64_t offset, MutableByteView destination) = 0;
     virtual void writeExactAt(std::uint64_t offset, ByteView source) = 0;
     virtual void resize(std::uint64_t length) = 0;
@@ -55,6 +98,43 @@ public:
     NativeDurableFile(const NativeDurableFile&) = delete;
     NativeDurableFile& operator=(const NativeDurableFile&) = delete;
 
+    [[nodiscard]] std::uint64_t size() const override {
+#ifdef _WIN32
+        LARGE_INTEGER length{};
+        if (!GetFileSizeEx(handle_, &length)) {
+            throwWindows(Errc::Io, "database file inspection failed");
+        }
+        return static_cast<std::uint64_t>(length.QuadPart);
+#else
+        struct stat status {};
+        if (::fstat(descriptor_, &status) != 0) {
+            throwPosix(Errc::Io, "database file inspection failed");
+        }
+        return static_cast<std::uint64_t>(status.st_size);
+#endif
+    }
+
+    static void installExclusive(
+        const std::filesystem::path& temporary,
+        const std::filesystem::path& target) {
+#ifdef _WIN32
+        if (!MoveFileExW(
+                temporary.c_str(),
+                target.c_str(),
+                MOVEFILE_WRITE_THROUGH)) {
+            throwWindows(Errc::Io, "database file installation failed");
+        }
+#else
+        if (::link(temporary.c_str(), target.c_str()) != 0) {
+            throwPosix(Errc::Io, "database file installation failed");
+        }
+        if (::unlink(temporary.c_str()) != 0) {
+            throwPosix(Errc::Io, "database temporary-file removal failed");
+        }
+        stabilizeParent(target);
+#endif
+    }
+
     ~NativeDurableFile() override {
 #ifdef _WIN32
         if (handle_ != INVALID_HANDLE_VALUE) {
@@ -65,6 +145,9 @@ public:
             ::close(descriptor_);
         }
 #endif
+        if (identity_) {
+            OpenSessionRegistry::release(*identity_);
+        }
     }
 
     void readExactAt(std::uint64_t offset, MutableByteView destination) override {
@@ -216,6 +299,29 @@ private:
     explicit NativeDurableFile(int descriptor) noexcept : descriptor_(descriptor) {}
 #endif
 
+    void registerOpenSession() {
+#ifdef _WIN32
+        BY_HANDLE_FILE_INFORMATION information{};
+        if (!GetFileInformationByHandle(handle_, &information)) {
+            throwWindows(Errc::Io, "database file identity inspection failed");
+        }
+        const NativeFileIdentity identity{
+            information.dwVolumeSerialNumber,
+            (static_cast<std::uint64_t>(information.nFileIndexHigh) << 32U) |
+                information.nFileIndexLow};
+#else
+        struct stat status {};
+        if (::fstat(descriptor_, &status) != 0) {
+            throwPosix(Errc::Io, "database file identity inspection failed");
+        }
+        const NativeFileIdentity identity{
+            static_cast<std::uint64_t>(status.st_dev),
+            static_cast<std::uint64_t>(status.st_ino)};
+#endif
+        OpenSessionRegistry::acquire(identity);
+        identity_ = identity;
+    }
+
     static void validateRange(std::uint64_t offset, std::size_t length) {
         constexpr auto maxOffset = static_cast<std::uint64_t>(
 #ifdef _WIN32
@@ -259,7 +365,9 @@ private:
             CloseHandle(handle);
             throw DatabaseError{Errc::Io, "database path is not a local regular file"};
         }
-        return std::unique_ptr<NativeDurableFile>{new NativeDurableFile{handle}};
+        auto file = std::unique_ptr<NativeDurableFile>{new NativeDurableFile{handle}};
+        file->registerOpenSession();
+        return file;
 #else
         const int flags = O_RDWR | O_CLOEXEC | (create ? O_CREAT | O_EXCL : 0);
         const int descriptor = ::open(path.c_str(), flags, S_IRUSR | S_IWUSR);
@@ -291,9 +399,38 @@ private:
             errno = saved;
             throwPosix(Errc::Io, "database file lock failed");
         }
-        return std::unique_ptr<NativeDurableFile>{new NativeDurableFile{descriptor}};
+        auto file = std::unique_ptr<NativeDurableFile>{new NativeDurableFile{descriptor}};
+        file->registerOpenSession();
+        return file;
 #endif
     }
+
+#ifndef _WIN32
+    static void stabilizeParent(const std::filesystem::path& path) {
+        auto parent = path.parent_path();
+        if (parent.empty()) {
+            parent = ".";
+        }
+        const int descriptor = ::open(
+            parent.c_str(), O_RDONLY | O_CLOEXEC
+#ifdef O_DIRECTORY
+            | O_DIRECTORY
+#endif
+        );
+        if (descriptor < 0) {
+            throwPosix(Errc::Durability, "database directory open failed");
+        }
+        if (::fsync(descriptor) != 0) {
+            const int saved = errno;
+            ::close(descriptor);
+            errno = saved;
+            throwPosix(Errc::Durability, "database directory barrier failed");
+        }
+        if (::close(descriptor) != 0) {
+            throwPosix(Errc::Io, "database directory close failed");
+        }
+    }
+#endif
 
 #ifdef _WIN32
     [[noreturn]] static void throwWindows(Errc code, const char* message) {
@@ -313,6 +450,7 @@ private:
     }
     int descriptor_ = -1;
 #endif
+    std::optional<NativeFileIdentity> identity_;
 };
 
 } // namespace miare::detail
