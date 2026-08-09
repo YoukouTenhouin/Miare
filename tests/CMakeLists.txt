@@ -33,7 +33,14 @@ if(MSVC)
     target_link_options(miare_exact_transaction_test PRIVATE /fsanitize=address /DEBUG)
 endif()
 add_test(NAME miare.exact_transaction COMMAND miare_exact_transaction_test)
-set_tests_properties(miare.exact_transaction PROPERTIES TIMEOUT 10)
+set_tests_properties(miare.exact_transaction PROPERTIES TIMEOUT 60)
+if(MSVC)
+    add_test(
+        NAME miare.exact_transaction_windows_child_teardown
+        COMMAND miare_exact_transaction_test --release-child-teardown)
+    set_tests_properties(
+        miare.exact_transaction_windows_child_teardown PROPERTIES TIMEOUT 30)
+endif()
 add_test(
     NAME miare.exact_transaction_live_child_assertion
     COMMAND

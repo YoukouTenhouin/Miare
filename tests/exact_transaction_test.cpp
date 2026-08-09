@@ -1111,6 +1111,10 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string_view{argv[1]} == "--assert-live-child") {
         return liveChildDestructionProbe();
     }
+    if (argc == 2 && std::string_view{argv[1]} == "--release-child-teardown") {
+        closedDatabaseInvalidatesWriteHandle();
+        return 0;
+    }
     TemporaryDirectory temporary;
     runTestCase("atomic durability", [&] {
         exactMutationsAreAtomicAndDurable(temporary);
