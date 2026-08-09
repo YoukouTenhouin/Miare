@@ -1,0 +1,3 @@
+# Make recovery-required close cause-dependent
+
+Close after commit or maintenance uncertainty re-runs byte-preserving publication selection and shallow validation, then may checkpoint and finish cleanly if one complete generation is established. Close after already-confirmed corruption instead performs resource-only shutdown without traversal, publication, truncation, repair, or a claim of restored validity; this lets callers deterministically release a corrupt session while preserving fail-closed data behavior, whereas a new I/O, provider, or corruption failure during uncertainty resolution leaves explicit close retryable in recovery-required state.

@@ -1,0 +1,3 @@
+# Require bounded fuzz and sanitizer release gates
+
+Dedicated parsers, recovery, cursor, allocator, Blob, codec, and stateful public-history targets use permanent corpora covering every specified field, role, finding, and error branch, with explicit resource bounds. Release requires 24 CPU-hours per parser/recovery target, 72 CPU-hours for stateful histories, clean ASan/UBSan and TSan suites, MSan and Windows address-sanitizer runs where supported, replay on all portability targets, and zero unresolved crash, hang, assertion, sanitizer, or unbounded-resource findings; every discovery is minimized into a permanent regression.

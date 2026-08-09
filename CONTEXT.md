@@ -95,3 +95,31 @@ _Avoid_: Mutable transaction, write lock
 **Recovery-required state**:
 The state of an open database session that cannot safely accept new database access until explicit recovery.
 _Avoid_: Poisoned database, degraded mode
+
+**Crash recovery**:
+Deterministic selection and validation of one complete Committed state after an interrupted persistence operation. It never reconstructs, repairs, or partially exposes database content.
+_Avoid_: Repair, salvage, best-effort recovery
+
+**Salvage**:
+Best-effort extraction of partial content when no complete Committed state can be validated. Salvage is not a v1 database operation.
+_Avoid_: Crash recovery, repair, degraded read
+
+**Abandoned tail**:
+Physical bytes at or beyond the selected Committed state's high-water boundary. They are not part of any committed generation and may be ignored, overwritten, or removed without salvage.
+_Avoid_: Corrupt data, recovery log, free extent
+
+**Checkpoint**:
+Maintenance that makes currently safe reclamation durable and removes an Abandoned tail without relocating live content. It may consolidate recovery state for a Storage backend that uses data-bearing sidecars.
+_Avoid_: Compaction, verification, backup
+
+**Compaction**:
+Snapshot-safe maintenance that relocates the latest Committed state toward lower physical addresses so the committed high-water boundary can shrink. Its immediate result is bounded by content retained for live snapshots.
+_Avoid_: Checkpoint, vacuum, logical rewrite
+
+**Portable backup**:
+A verified physical snapshot ending at one selected Committed state's high-water boundary and requiring no sidecars. It preserves database identity and physical representation rather than logically rebuilding or compacting content.
+_Avoid_: Export, replica, compacted copy
+
+**Integrity verification**:
+Validation of every authenticated structure reachable from authoritative Committed state, plus the allocation partition that bounds it. It does not assign meaning to bytes in free space, obsolete retirement state, or an Abandoned tail.
+_Avoid_: Raw byte scan, repair, salvage

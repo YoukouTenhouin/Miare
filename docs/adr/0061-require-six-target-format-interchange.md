@@ -1,0 +1,3 @@
+# Require six-target format and provider interchange
+
+Windows, Linux, and macOS on x86-64 and ARM64 each produce the canonical fixture corpus and must consume, verify, mutate, close, back up, and reopen every other target's files across all permitted format-profile boundary values. Vendored/system Zstandard and independent cryptographic fixtures cross-read without requiring identical compressed output, while canonical KDF, AEAD, associated-data, and structural bytes remain exact; no platform or provider update ships if it loses prior readability, changes canonical representation, or silently substitutes a missing capability.

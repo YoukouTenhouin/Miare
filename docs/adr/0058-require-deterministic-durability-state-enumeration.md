@@ -1,0 +1,3 @@
+# Require deterministic durability-state enumeration
+
+V1 qualification instruments every durable-file write, resize, and barrier, enumerates minimal-fixture interruptions and publication tears, permits arbitrary loss or reordering before acknowledged barriers, and reopens every resulting state through the public contract. Passing requires exactly predecessor or complete candidate according to the publication phase, corruption beneath an authenticated candidate to fail closed, successful operations to survive, and no mixed state or unauthenticated plaintext; fixed exhaustive campaigns run on every supported platform and larger seeded campaigns extend coverage continuously.

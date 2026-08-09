@@ -1,0 +1,3 @@
+# Set default-profile performance release floors
+
+V1 release qualification uses a fixed representative corpus and published six-target desktop machines to enforce absolute default-profile floors for open, point reads, durable commits, scans, Blobs, verification, backup, compaction, and 256-reader throughput, plus cache-overhead and file-amplification ceilings. Five-run median and p99 results must meet the frozen contract and remain within 15 percent of the recorded baseline; these are default-profile representative-workload promises rather than performance claims at absolute capacity limits, so future tuning cannot silently redefine format identity.

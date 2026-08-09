@@ -454,6 +454,8 @@ These operations are synchronous and intended for an application worker thread. 
 
 `backupTo` creates a clean, portable, consistent single-file snapshot and never overwrites its destination. Destination failure preserves the source session and uses best-effort temporary cleanup. Source corruption follows the normal corruption rule. Checkpoint or compaction preflight failure leaves the session open; persistence-stage source failure enters `RecoveryRequired`. Detailed algorithms, interruption points, and workspace requirements are fixed by the dedicated maintenance contract.
 
+The canonical report fields, recovery selection algorithm, publication interruption table, checkpoint and compaction behavior, physical-backup installation rules, authoritative verification scope, close recovery, insufficient-space outcomes, and release gates are frozen by the [Recovery, maintenance, and verification contract](./recovery-maintenance-verification-contract.md).
+
 `DatabaseState` is `Open`, `Closing`, `RecoveryRequired`, or `Closed`; a moved-from database reports `Closed`. `state()` is always non-throwing. `diagnostics()` is allowed while open or recovery-required and throws `InvalidState` after close. Its internally consistent point-in-time snapshot includes:
 
 - format and capacity profile, backend, compression, and encryption identities;
@@ -463,7 +465,8 @@ These operations are synchronous and intended for an application worker thread. 
 - cache capacity, use, pinned bytes, and eviction count;
 - active reader count, oldest reader generation and age;
 - writer or maintenance activity and FIFO queue depth;
-- recovery-required status and stable cause.
+- recovery-required status and stable cause;
+- whether open rejected an incomplete inactive publication and the number of Abandoned-tail bytes outside the selected committed boundary.
 
 Diagnostics never include keys, values, Blob identifiers, key material, paths, or native error messages.
 

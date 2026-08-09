@@ -1,0 +1,3 @@
+# Leave an installed backup after namespace-durability failure
+
+Backup writes and stabilizes a unique sibling temporary file, installs it exclusively at the requested name, reopens and validates that name, and applies the strongest available parent-directory stabilization. Failure before installation leaves the destination absent, while failure afterward throws `Durability` but leaves the complete destination in place for explicit verification or removal; this prevents rollback from deleting the only visible valid result and limits interruption outcomes at the requested path to absent or complete, despite platforms that cannot promise uniform directory-entry survival after power loss.

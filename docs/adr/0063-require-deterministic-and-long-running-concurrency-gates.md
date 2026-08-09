@@ -1,0 +1,3 @@
+# Require deterministic and long-running concurrency gates
+
+Concurrency qualification combines exhaustive bounded scheduling of publication, handles, maintenance, corruption, and close with 256-reader stress, long snapshots, reclamation and cache pressure, and serialized writers. Every release target runs two hours and Linux x86-64/ARM64 run 24 hours under TSan; zero races, deadlocks, use-after-free, model violations, FIFO inversions, lost wakeups, or unexplained starvation are allowed, and every reader must observe exactly one complete modeled generation while admitted work finishes unless a documented retained handle or injected fault blocks it.

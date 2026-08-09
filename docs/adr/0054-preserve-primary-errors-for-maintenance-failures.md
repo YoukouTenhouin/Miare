@@ -1,0 +1,3 @@
+# Preserve primary errors for maintenance failures
+
+`CommitFailed` and `CommitOutcomeUnknown` remain specific to application transaction commits; checkpoint, compaction, and close-time maintenance retain their primary `Io`, `Durability`, `ProviderUnavailable`, or `ResourceLimit` category. Preflight failures leave the session unchanged, source mutation failure after the first write or resize enters recovery-required state, and slot authentication later resolves the physical old-or-new outcome; backup destination failures and non-corruption verification failures never poison the source because they do not make its committed application state uncertain.

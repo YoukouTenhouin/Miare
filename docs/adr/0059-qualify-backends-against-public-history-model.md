@@ -1,0 +1,3 @@
+# Qualify backends against a public-history reference model
+
+Every conforming backend runs against one in-memory model through public operations only: exhaustive small histories to depth eight and 1,000 fixed seeds of 10,000 operations cover ordered keys, Blobs, snapshots, handle states, limits, maintenance, and reopen outcomes. Zero semantic or error mismatches are permitted across claimed profile/provider combinations, and minimized failing histories become permanent seeds; private page layout, allocation order, cache behavior, and provider call sequences are deliberately excluded so the gate constrains product behavior without freezing implementations.

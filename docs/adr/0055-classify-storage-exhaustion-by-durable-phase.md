@@ -1,0 +1,3 @@
+# Classify storage exhaustion by durable phase
+
+Provable profile, allocator, workspace, or preallocation insufficiency is a preflight `ResourceLimit` with no mutation, while unsupported preallocation merely falls back to ordinary writes and storage estimates remain advisory. A later native out-of-space failure retains its native code and follows the operation's durable phase: transaction failures become `CommitFailed` or `CommitOutcomeUnknown`, source-mutating maintenance becomes recovery-required `ResourceLimit`, and destination-only backup or creation failure leaves the source unchanged; no workflow implicitly compacts, deletes, overwrites, or discards committed state to obtain space.
