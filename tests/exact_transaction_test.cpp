@@ -6,11 +6,13 @@
 #include <cassert>
 #include <chrono>
 #include <cstddef>
+#include <cstdlib>
 #include <filesystem>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <thread>
 #include <type_traits>
@@ -18,8 +20,15 @@
 
 namespace {
 
+void requireTest(bool condition) {
+    if (!condition) {
+        std::abort();
+    }
+}
+
 struct AllocationCounts {
     std::atomic<std::size_t> allocatedBytes{0};
+    std::atomic<std::size_t> deallocatedBytes{0};
     std::atomic<std::size_t> largestAllocationBytes{0};
 };
 
@@ -48,6 +57,8 @@ public:
     }
 
     void deallocate(T* allocation, std::size_t count) noexcept {
+        counts->deallocatedBytes.fetch_add(
+            count * sizeof(T), std::memory_order_relaxed);
         std::allocator<T>{}.deallocate(allocation, count);
     }
 
@@ -720,20 +731,53 @@ void handlesEnforceAdmissionAffinityAndPreflightGuarantees() {
 }
 
 void closedDatabaseInvalidatesWriteHandle() {
+#ifdef NDEBUG
+    auto counts = std::make_shared<AllocationCounts>();
+    CountingAllocator<std::byte> allocator{counts};
+    using AllocatedDatabase = miare::Database<CountingAllocator<std::byte>>;
+    std::optional<typename AllocatedDatabase::WriteTransaction> write;
+    std::size_t beforeDestruction = 0;
+    {
+        auto file = std::make_unique<miare::testing::MemoryDurableFile>();
+        auto database = miare::testing::DatabaseAccess::create(
+            std::move(file),
+            miare::EncryptionKeyView{keyBytes},
+            deterministicProviders(17),
+            miare::CreateOptions{},
+            allocator);
+        write.emplace(database.beginWrite());
+        beforeDestruction = counts->deallocatedBytes.load(
+            std::memory_order_relaxed);
+    }
+    requireTest(counts->deallocatedBytes.load(std::memory_order_relaxed) >
+                beforeDestruction);
+    requireTest(!write->active());
+    bool invalidState = false;
+    try {
+        (void)write->get(bytes("key"));
+    } catch (const miare::ContractError& error) {
+        invalidState = error.code() == miare::Errc::InvalidState;
+    }
+    requireTest(invalidState);
+    write->rollback();
+#endif
+}
+
+int liveChildDestructionProbe() {
+#ifdef NDEBUG
+    return 77;
+#else
     std::optional<DefaultWrite> write;
     {
         auto file = std::make_unique<miare::testing::MemoryDurableFile>();
         auto database = miare::testing::DatabaseAccess::create(
             std::move(file),
             miare::EncryptionKeyView{keyBytes},
-            deterministicProviders(17));
+            deterministicProviders(28));
         write.emplace(database.beginWrite());
     }
-    assert(!write->active());
-    expectContractError(miare::Errc::InvalidState, [&] {
-        (void)write->get(bytes("key"));
-    });
-    write->rollback();
+    return 0;
+#endif
 }
 
 void closeErasesDerivedKeys() {
@@ -874,9 +918,11 @@ void readersObserveCompleteGenerationsDuringCommit() {
         auto write = database.beginWrite();
         write.put(bytes("generation"), bytes(next.c_str()));
         std::atomic<bool> stop{false};
+        std::atomic<unsigned> observingReaders{0};
         std::vector<std::thread> readers;
         for (unsigned index = 0; index != 4; ++index) {
             readers.emplace_back([&] {
+                bool observed = false;
                 while (!stop.load(std::memory_order_acquire)) {
                     auto read = database.beginRead();
                     const auto value = read.get(bytes("generation"));
@@ -886,9 +932,21 @@ void readersObserveCompleteGenerationsDuringCommit() {
                     const bool successor = equals(value, next.c_str());
                     assert(predecessor || successor);
                     read.end();
+                    if (!observed) {
+                        observed = true;
+                        observingReaders.fetch_add(1, std::memory_order_release);
+                    }
                 }
             });
         }
+        for (std::size_t attempt = 0; attempt != 1'000'000; ++attempt) {
+            if (observingReaders.load(std::memory_order_acquire) == readers.size()) {
+                break;
+            }
+            std::this_thread::yield();
+        }
+        requireTest(
+            observingReaders.load(std::memory_order_acquire) == readers.size());
         write.commit();
         stop.store(true, std::memory_order_release);
         for (auto& reader : readers) {
@@ -961,12 +1019,15 @@ void transactionStateUsesTheDatabaseAllocator() {
     CountingAllocator<std::byte> allocator{counts};
     auto file = std::make_unique<miare::testing::MemoryDurableFile>();
     auto* fileView = file.get();
+    const auto beforeSession = counts->allocatedBytes.load(std::memory_order_relaxed);
     auto database = miare::testing::DatabaseAccess::create(
         std::move(file),
         miare::EncryptionKeyView{keyBytes},
         deterministicProviders(15),
         miare::CreateOptions{},
         allocator);
+    requireTest(
+        counts->allocatedBytes.load(std::memory_order_relaxed) > beforeSession);
     const auto beforeMutation = counts->allocatedBytes.load(std::memory_order_relaxed);
     auto write = database.beginWrite();
     write.put(bytes("allocated-key"), bytes("allocated-value"));
@@ -1003,7 +1064,10 @@ void transactionStateUsesTheDatabaseAllocator() {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string_view{argv[1]} == "--assert-live-child") {
+        return liveChildDestructionProbe();
+    }
     TemporaryDirectory temporary;
     exactMutationsAreAtomicAndDurable(temporary);
     rollbackAndValidationPreserveCommittedState(temporary);

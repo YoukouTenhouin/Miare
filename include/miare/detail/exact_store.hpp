@@ -91,7 +91,6 @@ struct DatabaseSession {
     bool writerActive = false;
     std::size_t liveTransactions = 0;
     std::uint32_t maxReaders;
-    std::atomic<bool> childrenInvalidated{false};
     std::atomic<DatabaseState> state{DatabaseState::Open};
 };
 

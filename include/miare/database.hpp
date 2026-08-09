@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <condition_variable>
 #include <cstddef>
 #include <filesystem>
@@ -37,6 +38,34 @@ private:
     using Session = detail::DatabaseSession<Allocator, Limits>;
     using OrderedKeyValues = detail::OrderedKeyValues<Allocator>;
     using StoredBytes = detail::StoredBytes<Allocator>;
+    using SessionAllocator = typename std::allocator_traits<Allocator>::
+        template rebind_alloc<Session>;
+
+    struct ChildLifetime {
+        explicit ChildLifetime(const Allocator& allocator)
+            : sessionAllocator(allocator) {}
+
+        std::atomic<bool> invalidated{false};
+        SessionAllocator sessionAllocator;
+    };
+
+    struct SessionDeleter {
+        using Traits = std::allocator_traits<SessionAllocator>;
+        using pointer = typename Traits::pointer;
+
+        std::shared_ptr<ChildLifetime> lifetime;
+
+        void operator()(pointer session) noexcept {
+            if (session == nullptr) {
+                return;
+            }
+            Traits::destroy(
+                lifetime->sessionAllocator, std::to_address(session));
+            Traits::deallocate(lifetime->sessionAllocator, session, 1);
+        }
+    };
+
+    using SessionPtr = std::unique_ptr<Session, SessionDeleter>;
 
 public:
     using OwnedBytes = std::vector<
@@ -49,12 +78,11 @@ public:
         ReadTransaction& operator=(const ReadTransaction&) = delete;
 
         ReadTransaction(ReadTransaction&& other) noexcept
-            : session_(std::move(other.session_)),
+            : session_(std::exchange(other.session_, nullptr)),
+              lifetime_(std::move(other.lifetime_)),
               values_(std::move(other.values_)),
               thread_(other.thread_),
-              active_(std::exchange(other.active_, false)) {
-            other.session_.reset();
-        }
+              active_(std::exchange(other.active_, false)) {}
 
         ReadTransaction& operator=(ReadTransaction&&) = delete;
 
@@ -77,21 +105,28 @@ public:
                 return;
             }
             active_ = false;
-            releaseTransaction(*session_, false);
+            if (lifetime_ &&
+                !lifetime_->invalidated.load(std::memory_order_acquire)) {
+                releaseTransaction(*session_, *lifetime_, false);
+            }
+            session_ = nullptr;
+            lifetime_.reset();
         }
 
         [[nodiscard]] bool active() const noexcept {
-            return active_ && session_ &&
-                !session_->childrenInvalidated.load(std::memory_order_acquire);
+            return active_ && lifetime_ &&
+                !lifetime_->invalidated.load(std::memory_order_acquire);
         }
 
     private:
         friend class Database;
 
         ReadTransaction(
-            std::shared_ptr<Session> session,
+            Session& session,
+            std::shared_ptr<ChildLifetime> lifetime,
             OrderedKeyValues values)
-            : session_(std::move(session)),
+            : session_(&session),
+              lifetime_(std::move(lifetime)),
               values_(std::move(values)),
               thread_(std::this_thread::get_id()),
               active_(true) {}
@@ -109,7 +144,8 @@ public:
             }
         }
 
-        std::shared_ptr<Session> session_;
+        Session* session_;
+        std::shared_ptr<ChildLifetime> lifetime_;
         OrderedKeyValues values_;
         std::thread::id thread_;
         bool active_;
@@ -121,14 +157,13 @@ public:
         WriteTransaction& operator=(const WriteTransaction&) = delete;
 
         WriteTransaction(WriteTransaction&& other) noexcept
-            : session_(std::move(other.session_)),
+            : session_(std::exchange(other.session_, nullptr)),
+              lifetime_(std::move(other.lifetime_)),
               values_(std::move(other.values_)),
               thread_(other.thread_),
               keyMutations_(other.keyMutations_),
               changed_(other.changed_),
-              active_(std::exchange(other.active_, false)) {
-            other.session_.reset();
-        }
+              active_(std::exchange(other.active_, false)) {}
 
         WriteTransaction& operator=(WriteTransaction&&) = delete;
 
@@ -197,7 +232,7 @@ public:
             requireFunctional();
             if (!changed_) {
                 active_ = false;
-                releaseTransaction(*session_, true);
+                releaseTransaction(*session_, *lifetime_, true);
                 return;
             }
             try {
@@ -206,12 +241,12 @@ public:
                 if (session_->state.load(std::memory_order_acquire) ==
                     DatabaseState::RecoveryRequired) {
                     active_ = false;
-                    releaseTransaction(*session_, true);
+                    releaseTransaction(*session_, *lifetime_, true);
                 }
                 throw;
             }
             active_ = false;
-            releaseTransaction(*session_, true);
+            releaseTransaction(*session_, *lifetime_, true);
         }
 
         void rollback() noexcept {
@@ -219,21 +254,28 @@ public:
                 return;
             }
             active_ = false;
-            releaseTransaction(*session_, true);
+            if (lifetime_ &&
+                !lifetime_->invalidated.load(std::memory_order_acquire)) {
+                releaseTransaction(*session_, *lifetime_, true);
+            }
+            session_ = nullptr;
+            lifetime_.reset();
         }
 
         [[nodiscard]] bool active() const noexcept {
-            return active_ && session_ &&
-                !session_->childrenInvalidated.load(std::memory_order_acquire);
+            return active_ && lifetime_ &&
+                !lifetime_->invalidated.load(std::memory_order_acquire);
         }
 
     private:
         friend class Database;
 
         WriteTransaction(
-            std::shared_ptr<Session> session,
+            Session& session,
+            std::shared_ptr<ChildLifetime> lifetime,
             OrderedKeyValues values)
-            : session_(std::move(session)),
+            : session_(&session),
+              lifetime_(std::move(lifetime)),
               values_(std::move(values)),
               thread_(std::this_thread::get_id()),
               keyMutations_(0),
@@ -264,7 +306,8 @@ public:
             }
         }
 
-        std::shared_ptr<Session> session_;
+        Session* session_;
+        std::shared_ptr<ChildLifetime> lifetime_;
         OrderedKeyValues values_;
         std::thread::id thread_;
         std::uint64_t keyMutations_;
@@ -355,13 +398,22 @@ public:
     Database(const Database&) = delete;
     Database& operator=(const Database&) = delete;
 
-    Database(Database&& other) noexcept : session_(std::move(other.session_)) {}
+    Database(Database&& other) noexcept
+        : lifetime_(std::move(other.lifetime_)),
+          session_(std::move(other.session_)) {}
 
     Database& operator=(Database&&) = delete;
 
     ~Database() {
         if (session_) {
-            shutdownSession(*session_);
+#ifndef NDEBUG
+            {
+                std::lock_guard lock{session_->mutex};
+                assert(session_->liveTransactions == 0 &&
+                       "destroying Database with live subordinate handles");
+            }
+#endif
+            shutdownSession(*session_, *lifetime_);
         }
     }
 
@@ -382,7 +434,7 @@ public:
         snapshot = session.values;
         ++session.activeReaders;
         ++session.liveTransactions;
-        return ReadTransaction{session_, std::move(snapshot)};
+        return ReadTransaction{session, lifetime_, std::move(snapshot)};
     }
 
     [[nodiscard]] WriteTransaction beginWrite() {
@@ -419,7 +471,7 @@ public:
         --session.waitingWriters;
         session.writerActive = true;
         ++session.liveTransactions;
-        return WriteTransaction{session_, std::move(snapshot)};
+        return WriteTransaction{session, lifetime_, std::move(snapshot)};
     }
 
     [[nodiscard]] Result<WriteTransaction, WriterBusy> tryBeginWrite() {
@@ -438,7 +490,7 @@ public:
         session.writerActive = true;
         ++session.liveTransactions;
         return Result<WriteTransaction, WriterBusy>::success(
-            WriteTransaction{session_, std::move(snapshot)});
+            WriteTransaction{session, lifetime_, std::move(snapshot)});
     }
 
     void close() {
@@ -477,7 +529,7 @@ public:
                     "database has live transactions"};
             }
         }
-        shutdownSession(session);
+        shutdownSession(session, *lifetime_);
     }
 
 private:
@@ -487,6 +539,41 @@ private:
         OrderedKeyValues values;
     };
 
+    [[nodiscard]] static std::shared_ptr<ChildLifetime> makeChildLifetime(
+        const Allocator& allocator) {
+        using LifetimeAllocator = typename std::allocator_traits<Allocator>::
+            template rebind_alloc<ChildLifetime>;
+        return std::allocate_shared<ChildLifetime>(
+            LifetimeAllocator{allocator}, allocator);
+    }
+
+    [[nodiscard]] static SessionPtr makeSession(
+        const std::shared_ptr<ChildLifetime>& lifetime,
+        std::unique_ptr<detail::DurableFile> file,
+        ProviderSet providers,
+        Allocator allocator,
+        detail::OpenedDatabase opened,
+        OrderedKeyValues values,
+        std::uint32_t maxReaders) {
+        using Traits = std::allocator_traits<SessionAllocator>;
+        auto session = Traits::allocate(lifetime->sessionAllocator, 1);
+        try {
+            Traits::construct(
+                lifetime->sessionAllocator,
+                std::to_address(session),
+                std::move(file),
+                std::move(providers),
+                std::move(allocator),
+                std::move(opened),
+                std::move(values),
+                maxReaders);
+        } catch (...) {
+            Traits::deallocate(lifetime->sessionAllocator, session, 1);
+            throw;
+        }
+        return SessionPtr{session, SessionDeleter{lifetime}};
+    }
+
     Database(
         std::unique_ptr<detail::DurableFile> file,
         ProviderSet providers,
@@ -494,7 +581,9 @@ private:
         detail::OpenedDatabase opened,
         OrderedKeyValues values,
         std::uint32_t maxReaders)
-        : session_(std::make_shared<Session>(
+        : lifetime_(makeChildLifetime(allocator)),
+          session_(makeSession(
+              lifetime_,
               std::move(file),
               std::move(providers),
               std::move(allocator),
@@ -540,10 +629,13 @@ private:
         return result;
     }
 
-    static void releaseTransaction(Session& session, bool writer) noexcept {
+    static void releaseTransaction(
+        Session& session,
+        const ChildLifetime& lifetime,
+        bool writer) noexcept {
         try {
             std::lock_guard lock{session.mutex};
-            if (session.childrenInvalidated.load(std::memory_order_relaxed)) {
+            if (lifetime.invalidated.load(std::memory_order_relaxed)) {
                 return;
             }
             --session.liveTransactions;
@@ -565,10 +657,12 @@ private:
         session.opened.keys.blob.erase();
     }
 
-    static void shutdownSession(Session& session) noexcept {
+    static void shutdownSession(
+        Session& session,
+        ChildLifetime& lifetime) noexcept {
         try {
             std::lock_guard lock{session.mutex};
-            session.childrenInvalidated.store(true, std::memory_order_release);
+            lifetime.invalidated.store(true, std::memory_order_release);
             session.liveTransactions = 0;
             session.activeReaders = 0;
             session.waitingWriters = 0;
@@ -579,6 +673,7 @@ private:
             session.state.store(DatabaseState::Closed, std::memory_order_release);
             session.writerAvailable.notify_all();
         } catch (...) {
+            lifetime.invalidated.store(true, std::memory_order_release);
             eraseSessionKeys(session);
             session.file.reset();
             session.providers.reset();
@@ -652,7 +747,8 @@ private:
         return std::move(validation).value();
     }
 
-    std::shared_ptr<Session> session_;
+    std::shared_ptr<ChildLifetime> lifetime_;
+    SessionPtr session_;
 };
 
 } // namespace miare
