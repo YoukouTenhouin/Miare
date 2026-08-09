@@ -80,7 +80,10 @@ public:
             releaseTransaction(*session_, false);
         }
 
-        [[nodiscard]] bool active() const noexcept { return active_; }
+        [[nodiscard]] bool active() const noexcept {
+            return active_ && session_ &&
+                !session_->childrenInvalidated.load(std::memory_order_acquire);
+        }
 
     private:
         friend class Database;
@@ -94,7 +97,7 @@ public:
               active_(true) {}
 
         void requireFunctional() const {
-            if (!active_) {
+            if (!active()) {
                 throw ContractError{Errc::InvalidState, "read transaction is inactive"};
             }
             if (thread_ != std::this_thread::get_id()) {
@@ -219,7 +222,10 @@ public:
             releaseTransaction(*session_, true);
         }
 
-        [[nodiscard]] bool active() const noexcept { return active_; }
+        [[nodiscard]] bool active() const noexcept {
+            return active_ && session_ &&
+                !session_->childrenInvalidated.load(std::memory_order_acquire);
+        }
 
     private:
         friend class Database;
@@ -235,7 +241,7 @@ public:
               active_(true) {}
 
         void requireFunctional() const {
-            if (!active_) {
+            if (!active()) {
                 throw ContractError{Errc::InvalidState, "write transaction is inactive"};
             }
             if (thread_ != std::this_thread::get_id()) {
@@ -355,9 +361,7 @@ public:
 
     ~Database() {
         if (session_) {
-            session_->file.reset();
-            session_->providers.reset();
-            session_->state.store(DatabaseState::Closed, std::memory_order_relaxed);
+            shutdownSession(*session_);
         }
     }
 
@@ -462,9 +466,7 @@ public:
                     "database has live transactions"};
             }
         }
-        session.file.reset();
-        session.providers.reset();
-        session.state.store(DatabaseState::Closed, std::memory_order_release);
+        shutdownSession(session);
     }
 
 private:
@@ -530,6 +532,9 @@ private:
     static void releaseTransaction(Session& session, bool writer) noexcept {
         try {
             std::lock_guard lock{session.mutex};
+            if (session.childrenInvalidated.load(std::memory_order_relaxed)) {
+                return;
+            }
             --session.liveTransactions;
             if (writer) {
                 session.writerActive = false;
@@ -539,6 +544,34 @@ private:
                 --session.activeReaders;
             }
         } catch (...) {
+        }
+    }
+
+    static void eraseSessionKeys(Session& session) noexcept {
+        session.opened.keys.header.erase();
+        session.opened.keys.mainData.erase();
+        session.opened.keys.recovery.erase();
+        session.opened.keys.blob.erase();
+    }
+
+    static void shutdownSession(Session& session) noexcept {
+        try {
+            std::lock_guard lock{session.mutex};
+            session.childrenInvalidated.store(true, std::memory_order_release);
+            session.liveTransactions = 0;
+            session.activeReaders = 0;
+            session.waitingWriters = 0;
+            session.writerActive = false;
+            eraseSessionKeys(session);
+            session.file.reset();
+            session.providers.reset();
+            session.state.store(DatabaseState::Closed, std::memory_order_release);
+            session.writerAvailable.notify_all();
+        } catch (...) {
+            eraseSessionKeys(session);
+            session.file.reset();
+            session.providers.reset();
+            session.state.store(DatabaseState::Closed, std::memory_order_release);
         }
     }
 

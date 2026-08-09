@@ -390,6 +390,20 @@ public:
         return database.session_->waitingWriters;
     }
 
+    template<class Allocator, class Limits>
+    [[nodiscard]] static bool sessionKeysErased(
+        Database<Allocator, Limits>& database) {
+        const auto erased = [](const detail::Secret32& secret) {
+            return std::all_of(
+                secret.view().begin(),
+                secret.view().end(),
+                [](std::byte byte) { return byte == std::byte{0}; });
+        };
+        const auto& keys = database.session_->opened.keys;
+        return erased(keys.header) && erased(keys.mainData) &&
+            erased(keys.recovery) && erased(keys.blob);
+    }
+
     template<class Allocator = std::allocator<std::byte>, class Limits = DefaultLimits>
     [[nodiscard]] static Database<Allocator, Limits> create(
         std::unique_ptr<MemoryDurableFile> file,

@@ -20,6 +20,7 @@ namespace {
 
 struct AllocationCounts {
     std::atomic<std::size_t> allocatedBytes{0};
+    std::atomic<std::size_t> largestAllocationBytes{0};
 };
 
 template<class T>
@@ -36,8 +37,13 @@ public:
         : counts(other.counts) {}
 
     [[nodiscard]] T* allocate(std::size_t count) {
-        counts->allocatedBytes.fetch_add(
-            count * sizeof(T), std::memory_order_relaxed);
+        const auto bytes = count * sizeof(T);
+        counts->allocatedBytes.fetch_add(bytes, std::memory_order_relaxed);
+        auto largest = counts->largestAllocationBytes.load(std::memory_order_relaxed);
+        while (largest < bytes &&
+               !counts->largestAllocationBytes.compare_exchange_weak(
+                   largest, bytes, std::memory_order_relaxed)) {
+        }
         return std::allocator<T>{}.allocate(count);
     }
 
@@ -355,14 +361,14 @@ void expectImageDatabaseError(
     auto opened = std::move(openedResult).value();
     auto reference = miare::detail::decodeExtentReference(
         opened.format.orderedRoot);
-    miare::detail::ByteBuffer source(reference.blockCount * quantum);
+    std::vector<std::byte> source(reference.blockCount * quantum);
     file.readExactAt(reference.blockIndex * quantum, source);
     const miare::ByteView sourceView{source};
     const auto sourceStoredLength = miare::detail::readLittleEndian<std::uint64_t>(
         sourceView, miare::detail::ExtentLayout::storedLength);
     const auto decodedLength = miare::detail::readLittleEndian<std::uint64_t>(
         sourceView, miare::detail::ExtentLayout::decodedLength);
-    miare::detail::ByteBuffer stored(sourceStoredLength);
+    std::vector<std::byte> stored(sourceStoredLength);
     const auto sourceAssociatedData = miare::detail::extentAssociatedData(
         opened,
         sourceView.first(miare::detail::ExtentLayout::bytes));
@@ -387,7 +393,7 @@ void expectImageDatabaseError(
             "test fixture leaf authentication failed"};
     }
 
-    miare::detail::ByteBuffer decoded(decodedLength);
+    std::vector<std::byte> decoded(decodedLength);
     if (miare::detail::readLittleEndian<std::uint32_t>(
             sourceView, miare::detail::ExtentLayout::flags) == 1) {
         miare::detail::ProviderAccess::compression(providers).decompress(
@@ -396,7 +402,7 @@ void expectImageDatabaseError(
         decoded = std::move(stored);
     }
     auto& compression = miare::detail::ProviderAccess::compression(providers);
-    miare::detail::ByteBuffer compressed(compression.compressBound(decoded.size()));
+    std::vector<std::byte> compressed(compression.compressBound(decoded.size()));
     compressed.resize(compression.compress(decoded, compressed));
     const auto encodedLength = miare::detail::ExtentLayout::bytes +
         compressed.size() + miare::detail::authenticationTagBytes;
@@ -407,7 +413,7 @@ void expectImageDatabaseError(
         : minimalBlocks;
     reference.encodedLength = encodedLength;
 
-    miare::detail::ByteBuffer extent(reference.blockCount * quantum);
+    std::vector<std::byte> extent(reference.blockCount * quantum);
     std::copy_n(
         source.begin(),
         miare::detail::ExtentLayout::bytes,
@@ -682,10 +688,22 @@ void closedDatabaseInvalidatesWriteHandle() {
             deterministicProviders(17));
         write.emplace(database.beginWrite());
     }
+    assert(!write->active());
     expectContractError(miare::Errc::InvalidState, [&] {
         (void)write->get(bytes("key"));
     });
     write->rollback();
+}
+
+void closeErasesDerivedKeys() {
+    auto file = std::make_unique<miare::testing::MemoryDurableFile>();
+    auto database = miare::testing::DatabaseAccess::create(
+        std::move(file),
+        miare::EncryptionKeyView{keyBytes},
+        deterministicProviders(23));
+    assert(!miare::testing::DatabaseAccess::sessionKeysErased(database));
+    database.close();
+    assert(miare::testing::DatabaseAccess::sessionKeysErased(database));
 }
 
 void writerAdmissionIsFifo() {
@@ -722,6 +740,43 @@ void writerAdmissionIsFifo() {
     first.join();
     second.join();
     assert((order == std::vector<int>{1, 2}));
+    database.close();
+}
+
+void readersObserveCompleteGenerationsDuringCommit() {
+    auto file = std::make_unique<miare::testing::MemoryDurableFile>();
+    auto database = miare::testing::DatabaseAccess::create(
+        std::move(file),
+        miare::EncryptionKeyView{keyBytes},
+        deterministicProviders(24));
+    std::string previous;
+    for (unsigned generation = 1; generation != 21; ++generation) {
+        const auto next = std::to_string(generation);
+        auto write = database.beginWrite();
+        write.put(bytes("generation"), bytes(next.c_str()));
+        std::atomic<bool> stop{false};
+        std::vector<std::thread> readers;
+        for (unsigned index = 0; index != 4; ++index) {
+            readers.emplace_back([&] {
+                while (!stop.load(std::memory_order_acquire)) {
+                    auto read = database.beginRead();
+                    const auto value = read.get(bytes("generation"));
+                    const bool predecessor = previous.empty()
+                        ? !value
+                        : equals(value, previous.c_str());
+                    const bool successor = equals(value, next.c_str());
+                    assert(predecessor || successor);
+                    read.end();
+                }
+            });
+        }
+        write.commit();
+        stop.store(true, std::memory_order_release);
+        for (auto& reader : readers) {
+            reader.join();
+        }
+        previous = next;
+    }
     database.close();
 }
 
@@ -786,6 +841,7 @@ void transactionStateUsesTheDatabaseAllocator() {
     auto counts = std::make_shared<AllocationCounts>();
     CountingAllocator<std::byte> allocator{counts};
     auto file = std::make_unique<miare::testing::MemoryDurableFile>();
+    auto* fileView = file.get();
     auto database = miare::testing::DatabaseAccess::create(
         std::move(file),
         miare::EncryptionKeyView{keyBytes},
@@ -796,7 +852,10 @@ void transactionStateUsesTheDatabaseAllocator() {
     auto write = database.beginWrite();
     write.put(bytes("allocated-key"), bytes("allocated-value"));
     assert(counts->allocatedBytes.load(std::memory_order_relaxed) > beforeMutation);
+    counts->largestAllocationBytes.store(0, std::memory_order_relaxed);
     write.commit();
+    assert(counts->largestAllocationBytes.load(std::memory_order_relaxed) >=
+           15U * 1024U);
     const auto beforeRead = counts->allocatedBytes.load(std::memory_order_relaxed);
     auto read = database.beginRead();
     assert(counts->allocatedBytes.load(std::memory_order_relaxed) > beforeRead);
@@ -804,7 +863,23 @@ void transactionStateUsesTheDatabaseAllocator() {
     assert(value);
     assert(value->get_allocator().counts == counts);
     read.end();
+    const auto durableImage = fileView->bytes();
     database.close();
+
+    auto reopenedFile = std::make_unique<miare::testing::MemoryDurableFile>();
+    reopenedFile->writeExactAt(0, durableImage);
+    reopenedFile->stableStorageBarrier();
+    counts->largestAllocationBytes.store(0, std::memory_order_relaxed);
+    auto reopenedResult = miare::testing::DatabaseAccess::open(
+        std::move(reopenedFile),
+        miare::EncryptionKeyView{keyBytes},
+        deterministicProviders(16),
+        allocator);
+    assert(reopenedResult);
+    auto reopened = std::move(reopenedResult).value();
+    assert(counts->largestAllocationBytes.load(std::memory_order_relaxed) >=
+           15U * 1024U);
+    reopened.close();
 }
 
 } // namespace
@@ -818,8 +893,10 @@ int main() {
     interruptionsSelectOnlyCompleteGenerations();
     handlesEnforceAdmissionAffinityAndPreflightGuarantees();
     closedDatabaseInvalidatesWriteHandle();
+    closeErasesDerivedKeys();
     tryWriterPreservesBlockingAdmissionSequence();
     writerAdmissionIsFifo();
+    readersObserveCompleteGenerationsDuringCommit();
     openOptionsBoundReaderAdmission(temporary);
     transactionStateUsesTheDatabaseAllocator();
 }

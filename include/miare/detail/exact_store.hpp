@@ -19,8 +19,6 @@
 
 namespace miare::detail {
 
-using ByteBuffer = std::vector<std::byte>;
-
 struct UnsignedBytesLess {
     using is_transparent = void;
 
@@ -93,6 +91,7 @@ struct DatabaseSession {
     bool writerActive = false;
     std::size_t liveTransactions = 0;
     std::uint32_t maxReaders;
+    std::atomic<bool> childrenInvalidated{false};
     std::atomic<DatabaseState> state{DatabaseState::Open};
 };
 
@@ -210,12 +209,17 @@ template<class Values>
     return length;
 }
 
-template<class Limits, class Values>
-[[nodiscard]] inline ByteBuffer encodeLeafPage(const Values& values) {
+template<class Limits, class Allocator, class Values>
+[[nodiscard]] inline StoredBytes<Allocator> encodeLeafPage(
+    const Values& values,
+    const Allocator& allocator) {
     constexpr auto ceiling = std::max<std::uint64_t>(
         16U * 1024U, Limits::allocationQuantumBytes);
     constexpr auto payloadBytes = ceiling - ExtentLayout::bytes - authenticationTagBytes;
-    ByteBuffer payload(static_cast<std::size_t>(payloadBytes));
+    using ByteAllocator = typename std::allocator_traits<Allocator>::
+        template rebind_alloc<std::byte>;
+    StoredBytes<Allocator> payload{ByteAllocator{allocator}};
+    payload.resize(static_cast<std::size_t>(payloadBytes));
     const auto prefixLength = commonPrefixLength(values);
     std::uint64_t used = PageLayout::bytes + prefixLength + values.size() * 8ULL;
     for (const auto& [key, value] : values) {
@@ -304,26 +308,32 @@ template<class Limits, class Values>
     return data;
 }
 
+template<class Allocator>
 struct PreparedExactExtent {
     ExtentReference reference;
-    ByteBuffer bytes;
+    StoredBytes<Allocator> bytes;
 };
 
-template<class Limits, class Values>
-[[nodiscard]] inline PreparedExactExtent prepareLeafExtent(
+template<class Limits, class Allocator, class Values>
+[[nodiscard]] inline PreparedExactExtent<Allocator> prepareLeafExtent(
     const Values& values,
     std::uint64_t generation,
     std::uint64_t blockIndex,
     OpenedDatabase& opened,
-    ProviderSet& providers) {
-    auto decoded = encodeLeafPage<Limits>(values);
+    ProviderSet& providers,
+    const Allocator& allocator) {
+    using ByteAllocator = typename std::allocator_traits<Allocator>::
+        template rebind_alloc<std::byte>;
+    auto decoded = encodeLeafPage<Limits>(values, allocator);
     auto& crypto = ProviderAccess::crypto(providers);
-    ByteBuffer stored = decoded;
+    StoredBytes<Allocator> stored{ByteAllocator{allocator}};
+    stored = decoded;
     std::uint32_t flags = 0;
     std::uint32_t codec = 0;
     if (opened.format.compression == Compression::ZStd) {
         auto& compression = ProviderAccess::compression(providers);
-        ByteBuffer candidate(compression.compressBound(decoded.size()));
+        StoredBytes<Allocator> candidate{ByteAllocator{allocator}};
+        candidate.resize(compression.compressBound(decoded.size()));
         const auto compressedBytes = compression.compress(decoded, candidate);
         candidate.resize(compressedBytes);
         const auto compressedBlocks =
@@ -351,7 +361,8 @@ template<class Limits, class Values>
         blockCount,
         encodedLength,
         generation};
-    ByteBuffer extent(blockCount * Limits::allocationQuantumBytes);
+    StoredBytes<Allocator> extent{ByteAllocator{allocator}};
+    extent.resize(blockCount * Limits::allocationQuantumBytes);
     MutableByteView output{extent};
     writeBytes(output, ExtentLayout::magic, "MIAREXT\0");
     writeLittleEndian<std::uint16_t>(1, output, ExtentLayout::version);
@@ -381,7 +392,7 @@ template<class Limits, class Values>
         MutableByteView{extent}.subspan(ExtentLayout::bytes, stored.size()),
         MutableByteView{extent}.subspan(
             ExtentLayout::bytes + stored.size(), authenticationTagBytes));
-    return PreparedExactExtent{reference, std::move(extent)};
+    return PreparedExactExtent<Allocator>{reference, std::move(extent)};
 }
 
 template<class Limits, class Allocator>
@@ -493,7 +504,10 @@ template<class Limits, class Allocator>
         reference.blockCount != minimalBlockCount) {
         throwCorrupt("ordered leaf extent span is noncanonical");
     }
-    ByteBuffer extent(reference.blockCount * Limits::allocationQuantumBytes);
+    using ByteAllocator = typename std::allocator_traits<Allocator>::
+        template rebind_alloc<std::byte>;
+    StoredBytes<Allocator> extent{ByteAllocator{allocator}};
+    extent.resize(reference.blockCount * Limits::allocationQuantumBytes);
     const auto offset = reference.blockIndex * Limits::allocationQuantumBytes;
     file.readExactAt(offset, extent);
     const ByteView input{extent};
@@ -538,7 +552,8 @@ template<class Limits, class Allocator>
           reference.blockCount >= uncompressedBlockCount))) {
         throwCorrupt("ordered leaf extent representation is invalid");
     }
-    ByteBuffer stored(storedLength);
+    StoredBytes<Allocator> stored{ByteAllocator{allocator}};
+    stored.resize(storedLength);
     const auto associatedData = extentAssociatedData(
         opened, input.first(ExtentLayout::bytes));
     auto& crypto = ProviderAccess::crypto(providers);
@@ -551,7 +566,8 @@ template<class Limits, class Allocator>
             stored)) {
         throwCorrupt("ordered leaf authentication failed");
     }
-    ByteBuffer decoded(decodedLength);
+    StoredBytes<Allocator> decoded{ByteAllocator{allocator}};
+    decoded.resize(decodedLength);
     if (flags == 1) {
         ProviderAccess::compression(providers).decompress(stored, decoded);
     } else {
@@ -639,7 +655,7 @@ inline void commitExact(
         session.opened.format.highWaterBytes / Limits::allocationQuantumBytes;
     auto committedValues = makeOrderedKeyValues(session.allocator);
     committedValues = values;
-    std::optional<PreparedExactExtent> leaf;
+    std::optional<PreparedExactExtent<Allocator>> leaf;
     ExtentReference root;
     std::uint64_t highWaterBytes = session.opened.format.highWaterBytes;
     if (!values.empty()) {
@@ -648,7 +664,8 @@ inline void commitExact(
             generation,
             startBlock,
             session.opened,
-            *session.providers);
+            *session.providers,
+            session.allocator);
         if (leaf->bytes.size() > Limits::maxFileGrowthPerTransaction ||
             leaf->bytes.size() > Limits::maxDatabaseBytes ||
             session.opened.format.highWaterBytes >
@@ -694,11 +711,14 @@ inline void commitExact(
         throw;
     }
 
-    session.opened.publication = std::move(publication.plaintext);
-    session.opened.format.generation = generation;
-    session.opened.format.highWaterBytes = highWaterBytes;
-    session.opened.format.orderedRoot = encodeExtentReference(root);
-    session.values = std::move(committedValues);
+    {
+        std::lock_guard lock{session.mutex};
+        session.opened.publication = std::move(publication.plaintext);
+        session.opened.format.generation = generation;
+        session.opened.format.highWaterBytes = highWaterBytes;
+        session.opened.format.orderedRoot = encodeExtentReference(root);
+        session.values = std::move(committedValues);
+    }
 }
 
 } // namespace miare::detail
