@@ -1,6 +1,7 @@
 #include <miare/detail/durable_file.hpp>
 #include <miare/testing/fakes.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <chrono>
@@ -80,10 +81,25 @@ int main() {
     assert(memory.bytes()[0] == std::byte{0});
     assert(memory.bytes()[1] == std::byte{0});
     memory.writeExactAt(0, input);
-    const std::array<miare::testing::RetainedFileRange, 1> retained{{{0, 1}}};
+    assert(memory.unbarrieredMutationCount() == 4);
+    const std::array<std::size_t, 1> retained{{0}};
     memory.simulateCrash(retained);
     assert(memory.bytes()[0] == input[0]);
     assert(memory.bytes()[1] == std::byte{0});
+
+    memory.setMaxTransferBytes(4);
+    const auto earlier = bytes(9, 8, 7, 6);
+    const auto later = bytes(5, 4, 3, 2);
+    memory.writeExactAt(0, earlier);
+    memory.writeExactAt(0, later);
+    const std::array<std::size_t, 2> reordered{{1, 0}};
+    memory.simulateCrash(reordered);
+    assert(std::equal(earlier.begin(), earlier.end(), memory.bytes().begin()));
+
+    memory.resize(4);
+    const std::array<std::size_t, 1> retainResize{{0}};
+    memory.simulateCrash(retainResize);
+    assert(memory.bytes().size() == 4);
 
     const auto suffix = std::to_string(
         std::chrono::steady_clock::now().time_since_epoch().count());

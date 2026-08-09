@@ -27,11 +27,6 @@ struct DurableFileOperation {
     bool succeeded;
 };
 
-struct RetainedFileRange {
-    std::size_t offset;
-    std::size_t length;
-};
-
 class ProviderFailureInjection {
 protected:
     void failNextProviderOperation() noexcept { failProvider_ = true; }
@@ -202,6 +197,12 @@ public:
             std::copy_n(source.begin() + static_cast<std::ptrdiff_t>(position),
                         count,
                         bytes_.begin() + static_cast<std::ptrdiff_t>(offset + position));
+            unbarrieredMutations_.push_back(UnbarrieredMutation{
+                MutationKind::Write,
+                static_cast<std::size_t>(offset) + position,
+                std::vector<std::byte>(
+                    source.begin() + static_cast<std::ptrdiff_t>(position),
+                    source.begin() + static_cast<std::ptrdiff_t>(position + count))});
             operation.transferredBytes += count;
         });
         operation.succeeded = true;
@@ -218,6 +219,10 @@ public:
             throw ContractError{Errc::InvalidArgument, "file length is not representable"};
         }
         bytes_.resize(static_cast<std::size_t>(length));
+        unbarrieredMutations_.push_back(UnbarrieredMutation{
+            MutationKind::Resize,
+            static_cast<std::size_t>(length),
+            {}});
         operation.succeeded = true;
     }
 
@@ -228,6 +233,7 @@ public:
             throw DatabaseError{Errc::Durability, "injected barrier failure"};
         }
         stableBytes_ = bytes_;
+        unbarrieredMutations_.clear();
         ++barrierCount_;
         operation.succeeded = true;
     }
@@ -253,31 +259,28 @@ public:
         }
     }
 
-    void simulateCrash(std::span<const RetainedFileRange> retainedRanges = {}) {
-        auto unbarrieredBytes = bytes_;
+    void simulateCrash(std::span<const std::size_t> retainedMutationOrder = {}) {
         bytes_ = stableBytes_;
-        for (const auto range : retainedRanges) {
-            if (range.offset > unbarrieredBytes.size() ||
-                range.length > unbarrieredBytes.size() - range.offset) {
+        for (const auto mutationIndex : retainedMutationOrder) {
+            if (mutationIndex >= unbarrieredMutations_.size()) {
                 throw ContractError{
                     Errc::InvalidArgument,
-                    "retained crash range is out of bounds"};
+                    "retained crash mutation is out of bounds"};
             }
-            if (range.length > std::numeric_limits<std::size_t>::max() - range.offset) {
-                throw ContractError{
-                    Errc::InvalidArgument,
-                    "retained crash range is not representable"};
+            const auto& mutation = unbarrieredMutations_[mutationIndex];
+            if (mutation.kind == MutationKind::Resize) {
+                bytes_.resize(mutation.offsetOrLength);
+                continue;
             }
-            const auto end = range.offset + range.length;
-            if (end > bytes_.size()) {
-                bytes_.resize(end);
-            }
+            const auto end = mutation.offsetOrLength + mutation.bytes.size();
+            if (end > bytes_.size()) bytes_.resize(end);
             std::copy_n(
-                unbarrieredBytes.begin() + static_cast<std::ptrdiff_t>(range.offset),
-                range.length,
-                bytes_.begin() + static_cast<std::ptrdiff_t>(range.offset));
+                mutation.bytes.begin(),
+                mutation.bytes.size(),
+                bytes_.begin() + static_cast<std::ptrdiff_t>(mutation.offsetOrLength));
         }
         stableBytes_ = bytes_;
+        unbarrieredMutations_.clear();
     }
 
     void clearFaults() noexcept {
@@ -291,8 +294,19 @@ public:
     [[nodiscard]] const std::vector<DurableFileOperation>& operations() const noexcept {
         return operations_;
     }
+    [[nodiscard]] std::size_t unbarrieredMutationCount() const noexcept {
+        return unbarrieredMutations_.size();
+    }
 
 private:
+    enum class MutationKind { Write, Resize };
+
+    struct UnbarrieredMutation {
+        MutationKind kind;
+        std::size_t offsetOrLength;
+        std::vector<std::byte> bytes;
+    };
+
     DurableFileOperation& beginOperation(
         DurableFileOperationKind kind,
         std::uint64_t offset,
@@ -326,6 +340,7 @@ private:
     std::vector<std::byte> bytes_;
     std::vector<std::byte> stableBytes_;
     std::vector<DurableFileOperation> operations_;
+    std::vector<UnbarrieredMutation> unbarrieredMutations_;
     std::size_t maxTransferBytes_ = std::numeric_limits<std::size_t>::max();
     std::optional<std::size_t> failAfterBytes_;
     std::size_t barrierCount_ = 0;
