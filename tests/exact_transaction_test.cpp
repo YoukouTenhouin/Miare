@@ -8,9 +8,11 @@
 #include <cstddef>
 #include <cstdlib>
 #include <filesystem>
+#include <iostream>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <source_location>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -20,10 +22,22 @@
 
 namespace {
 
-void requireTest(bool condition) {
+void requireTest(
+    bool condition,
+    const std::source_location location = std::source_location::current()) {
     if (!condition) {
+        std::cerr << "test requirement failed at " << location.file_name() << ':'
+                  << location.line() << '\n';
+        std::cerr.flush();
         std::abort();
     }
+}
+
+template<class Operation>
+void runTestCase(const char* name, Operation&& operation) {
+    std::cerr << "running exact-transaction case: " << name << '\n';
+    std::cerr.flush();
+    operation();
 }
 
 template<class Predicate>
@@ -1082,20 +1096,48 @@ int main(int argc, char** argv) {
         return liveChildDestructionProbe();
     }
     TemporaryDirectory temporary;
-    exactMutationsAreAtomicAndDurable(temporary);
-    rollbackAndValidationPreserveCommittedState(temporary);
-    commitUsesTwoDurabilityBarriersAndFailsStop();
-    contradictoryAndNoncanonicalCompressionIsCorrupt();
-    generationOneMustBeTheCanonicalEmptyDatabase();
-    interruptionsSelectOnlyCompleteGenerations();
-    handlesEnforceAdmissionAffinityAndPreflightGuarantees();
-    closedDatabaseInvalidatesWriteHandle();
-    closeErasesDerivedKeys();
-    tryWriterPreservesBlockingAdmissionSequence();
-    writerAdmissionIsFifo();
-    closeCancelsQueuedWriterAdmission();
-    closePreservesConcurrentRecoveryTransition();
-    readersObserveCompleteGenerationsDuringCommit();
-    openOptionsBoundReaderAdmission(temporary);
-    transactionStateUsesTheDatabaseAllocator();
+    runTestCase("atomic durability", [&] {
+        exactMutationsAreAtomicAndDurable(temporary);
+    });
+    runTestCase("rollback and validation", [&] {
+        rollbackAndValidationPreserveCommittedState(temporary);
+    });
+    runTestCase("durability barriers and fail-stop", [&] {
+        commitUsesTwoDurabilityBarriersAndFailsStop();
+    });
+    runTestCase("compression canonicality", [&] {
+        contradictoryAndNoncanonicalCompressionIsCorrupt();
+    });
+    runTestCase("generation-one canonicality", [&] {
+        generationOneMustBeTheCanonicalEmptyDatabase();
+    });
+    runTestCase("interruption selection", [&] {
+        interruptionsSelectOnlyCompleteGenerations();
+    });
+    runTestCase("handle contracts", [&] {
+        handlesEnforceAdmissionAffinityAndPreflightGuarantees();
+    });
+    runTestCase("database destruction", [&] {
+        closedDatabaseInvalidatesWriteHandle();
+    });
+    runTestCase("key erasure", [&] { closeErasesDerivedKeys(); });
+    runTestCase("immediate writer admission", [&] {
+        tryWriterPreservesBlockingAdmissionSequence();
+    });
+    runTestCase("FIFO writer admission", [&] { writerAdmissionIsFifo(); });
+    runTestCase("close cancellation", [&] {
+        closeCancelsQueuedWriterAdmission();
+    });
+    runTestCase("concurrent recovery transition", [&] {
+        closePreservesConcurrentRecoveryTransition();
+    });
+    runTestCase("reader publication observations", [&] {
+        readersObserveCompleteGenerationsDuringCommit();
+    });
+    runTestCase("reader admission budget", [&] {
+        openOptionsBoundReaderAdmission(temporary);
+    });
+    runTestCase("allocator routing", [&] {
+        transactionStateUsesTheDatabaseAllocator();
+    });
 }
