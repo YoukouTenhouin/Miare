@@ -26,6 +26,19 @@ void requireTest(bool condition) {
     }
 }
 
+template<class Predicate>
+[[nodiscard]] bool waitUntil(Predicate&& predicate) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds{2};
+    while (!predicate()) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return false;
+        }
+        std::this_thread::yield();
+    }
+    return true;
+}
+
 struct AllocationCounts {
     std::atomic<std::size_t> allocatedBytes{0};
     std::atomic<std::size_t> deallocatedBytes{0};
@@ -809,22 +822,28 @@ void writerAdmissionIsFifo() {
         queued.rollback();
     };
     const auto waitForQueuedWriters = [&](std::size_t expected) {
-        for (std::size_t attempt = 0; attempt != 1'000'000; ++attempt) {
-            if (miare::testing::DatabaseAccess::waitingWriters(database) == expected) {
-                return;
-            }
-            std::this_thread::yield();
-        }
-        assert(false);
+        return waitUntil([&] {
+            return miare::testing::DatabaseAccess::waitingWriters(database) ==
+                expected;
+        });
     };
     std::thread first(enqueue, 1);
-    waitForQueuedWriters(1);
+    if (!waitForQueuedWriters(1)) {
+        admitted.rollback();
+        first.join();
+        requireTest(false);
+    }
     std::thread second(enqueue, 2);
-    waitForQueuedWriters(2);
+    if (!waitForQueuedWriters(2)) {
+        admitted.rollback();
+        first.join();
+        second.join();
+        requireTest(false);
+    }
     admitted.rollback();
     first.join();
     second.join();
-    assert((order == std::vector<int>{1, 2}));
+    requireTest((order == std::vector<int>{1, 2}));
     database.close();
 }
 
@@ -848,30 +867,28 @@ void closeCancelsQueuedWriterAdmission() {
         }
         finished.store(true, std::memory_order_release);
     });
-    for (std::size_t attempt = 0; attempt != 1'000'000; ++attempt) {
-        if (miare::testing::DatabaseAccess::waitingWriters(database) == 1) {
-            break;
-        }
-        std::this_thread::yield();
-    }
-    assert(miare::testing::DatabaseAccess::waitingWriters(database) == 1);
-    expectContractError(miare::Errc::LiveChildren, [&] { database.close(); });
-
-    bool settled = false;
-    for (std::size_t attempt = 0; attempt != 1'000'000; ++attempt) {
-        if (finished.load(std::memory_order_acquire)) {
-            settled = true;
-            break;
-        }
-        std::this_thread::yield();
-    }
-    if (!settled) {
+    if (!waitUntil([&] {
+            return miare::testing::DatabaseAccess::waitingWriters(database) == 1;
+        })) {
         admitted.rollback();
         queued.join();
-        assert(false);
+        requireTest(false);
+    }
+    bool liveChildren = false;
+    try {
+        database.close();
+    } catch (const miare::ContractError& error) {
+        liveChildren = error.code() == miare::Errc::LiveChildren;
+    }
+    requireTest(liveChildren);
+
+    if (!waitUntil([&] { return finished.load(std::memory_order_acquire); })) {
+        admitted.rollback();
+        queued.join();
+        requireTest(false);
     }
     queued.join();
-    assert(cancelled.load(std::memory_order_acquire));
+    requireTest(cancelled.load(std::memory_order_acquire));
     admitted.rollback();
     database.close();
 }
@@ -939,14 +956,10 @@ void readersObserveCompleteGenerationsDuringCommit() {
                 }
             });
         }
-        for (std::size_t attempt = 0; attempt != 1'000'000; ++attempt) {
-            if (observingReaders.load(std::memory_order_acquire) == readers.size()) {
-                break;
-            }
-            std::this_thread::yield();
-        }
-        requireTest(
-            observingReaders.load(std::memory_order_acquire) == readers.size());
+        requireTest(waitUntil([&] {
+            return observingReaders.load(std::memory_order_acquire) ==
+                readers.size();
+        }));
         write.commit();
         stop.store(true, std::memory_order_release);
         for (auto& reader : readers) {
