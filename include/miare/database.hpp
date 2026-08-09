@@ -11,6 +11,7 @@
 #include <cassert>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdio>
 #include <filesystem>
 #include <limits>
 #include <memory>
@@ -61,7 +62,10 @@ private:
 
         SessionOwner(SessionOwner&& other) noexcept
             : lifetime_(std::move(other.lifetime_)),
-              session_(std::exchange(other.session_, Pointer{})) {}
+              session_(std::exchange(other.session_, Pointer{})) {
+            std::fputs("[DEBUG-owner] owner moved\n", stderr);
+            std::fflush(stderr);
+        }
 
         SessionOwner& operator=(SessionOwner&&) = delete;
 
@@ -85,7 +89,10 @@ private:
         SessionOwner(
             Pointer session,
             std::shared_ptr<ChildLifetime> lifetime) noexcept
-            : lifetime_(std::move(lifetime)), session_(session) {}
+            : lifetime_(std::move(lifetime)), session_(session) {
+            std::fputs("[DEBUG-owner] owner constructed\n", stderr);
+            std::fflush(stderr);
+        }
 
         void reset() noexcept {
             if (session_ == Pointer{}) {
@@ -439,7 +446,10 @@ public:
 
     Database(Database&& other) noexcept
         : lifetime_(std::move(other.lifetime_)),
-          session_(std::move(other.session_)) {}
+          session_(std::move(other.session_)) {
+        std::fputs("[DEBUG-owner] database moved\n", stderr);
+        std::fflush(stderr);
+    }
 
     Database& operator=(Database&&) = delete;
 
@@ -596,7 +606,11 @@ private:
         OrderedKeyValues values,
         std::uint32_t maxReaders) {
         using Traits = std::allocator_traits<SessionAllocator>;
+        std::fputs("[DEBUG-owner] allocate session\n", stderr);
+        std::fflush(stderr);
         auto session = Traits::allocate(lifetime->sessionAllocator, 1);
+        std::fputs("[DEBUG-owner] session memory allocated\n", stderr);
+        std::fflush(stderr);
         try {
             Traits::construct(
                 lifetime->sessionAllocator,
@@ -607,11 +621,16 @@ private:
                 std::move(opened),
                 std::move(values),
                 maxReaders);
+            std::fputs("[DEBUG-owner] session constructed\n", stderr);
+            std::fflush(stderr);
         } catch (...) {
             Traits::deallocate(lifetime->sessionAllocator, session, 1);
             throw;
         }
-        return SessionOwner{session, lifetime};
+        auto owner = SessionOwner{session, lifetime};
+        std::fputs("[DEBUG-owner] return session owner\n", stderr);
+        std::fflush(stderr);
+        return owner;
     }
 
     Database(
@@ -629,7 +648,10 @@ private:
               std::move(allocator),
               std::move(opened),
               std::move(values),
-              maxReaders)) {}
+              maxReaders)) {
+        std::fputs("[DEBUG-owner] database constructed\n", stderr);
+        std::fflush(stderr);
+    }
 
     [[nodiscard]] Session& requireSession() {
         if (!session_) {

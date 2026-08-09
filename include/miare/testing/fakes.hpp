@@ -459,6 +459,8 @@ public:
         auto values = detail::loadExactValues<Limits>(
             *file, openedDatabase, providers, allocator);
         std::unique_ptr<detail::DurableFile> durableFile = std::move(file);
+        std::fputs("[DEBUG-owner] build database result\n", stderr);
+        std::fflush(stderr);
         return Result<Database<Allocator, Limits>, AuthenticationFailed>::success(
             Database<Allocator, Limits>{
                 std::move(durableFile),
