@@ -424,8 +424,6 @@ public:
         ProviderSet providers,
         CreateOptions options = {},
         Allocator allocator = {}) {
-        std::fputs("[DEBUG-win-child] fake create format\n", stderr);
-        std::fflush(stderr);
         detail::validateCreateOptions(options);
         auto& crypto = detail::ProviderAccess::crypto(providers);
         const auto commonRegion = detail::makeInitialCommonRegion<Limits>(
@@ -433,8 +431,6 @@ public:
         file->writeExactAt(0, commonRegion);
         file->resize(detail::commonRegionBytes);
         file->stableStorageBarrier();
-        std::fputs("[DEBUG-win-child] fake open\n", stderr);
-        std::fflush(stderr);
         auto opened = open<Allocator, Limits>(
             std::move(file),
             key,
@@ -445,8 +441,6 @@ public:
                 Errc::ProviderUnavailable,
                 "in-memory database failed authentication"};
         }
-        std::fputs("[DEBUG-win-child] fake opened\n", stderr);
-        std::fflush(stderr);
         return std::move(opened).value();
     }
 
@@ -456,20 +450,14 @@ public:
         EncryptionKeyView key,
         ProviderSet providers,
         Allocator allocator = {}) {
-        std::fputs("[DEBUG-win-child] open format\n", stderr);
-        std::fflush(stderr);
         auto opened = detail::openFormat<Limits>(*file, key, providers);
         if (!opened) {
             return Result<Database<Allocator, Limits>, AuthenticationFailed>::failure(
                 AuthenticationFailed{});
         }
-        std::fputs("[DEBUG-win-child] load values\n", stderr);
-        std::fflush(stderr);
         auto openedDatabase = std::move(opened).value();
         auto values = detail::loadExactValues<Limits>(
             *file, openedDatabase, providers, allocator);
-        std::fputs("[DEBUG-win-child] construct database result\n", stderr);
-        std::fflush(stderr);
         std::unique_ptr<detail::DurableFile> durableFile = std::move(file);
         return Result<Database<Allocator, Limits>, AuthenticationFailed>::success(
             Database<Allocator, Limits>{
