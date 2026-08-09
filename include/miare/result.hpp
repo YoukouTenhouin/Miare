@@ -17,7 +17,8 @@ struct WriterBusy {
 };
 
 template<class T, class E>
-requires(!std::is_same_v<E, Errc>)
+requires(!std::is_same_v<std::remove_cv_t<T>, Errc> &&
+         !std::is_same_v<std::remove_cv_t<E>, Errc>)
 class Result {
     static_assert(!std::is_void_v<T>, "Result<void, E> is not part of the v1 contract");
 

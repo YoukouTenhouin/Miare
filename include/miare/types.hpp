@@ -63,6 +63,9 @@ public:
     template<std::size_t Size>
     EncryptionKeyView(std::array<std::byte, Size>&&) = delete;
 
+    template<std::size_t Size>
+    EncryptionKeyView(const std::array<std::byte, Size>&&) = delete;
+
     [[nodiscard]] ByteView bytes() const noexcept { return bytes_; }
 
 private:

@@ -21,6 +21,9 @@ int main() {
     static_assert(!std::is_constructible_v<
                   EncryptionKeyView,
                   std::array<std::byte, 32>&&>);
+    static_assert(!std::is_constructible_v<
+                  EncryptionKeyView,
+                  const std::array<std::byte, 32>&&>);
 
     std::array<std::byte, 3> bytes{};
     EncryptionKeyView key{bytes};
@@ -44,6 +47,8 @@ int main() {
     auto sameTypes = Result<int, int>::failure(9);
     assert(sameTypes.error() == 9);
     static_assert(!ResultTypeExists<int, Errc>);
+    static_assert(!ResultTypeExists<Errc, WriterBusy>);
+    static_assert(!ResultTypeExists<int, const Errc>);
     static_assert(!std::is_move_assignable_v<Result<std::string, WriterBusy>>);
 
     const std::error_code native{5, std::system_category()};
