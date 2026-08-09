@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <condition_variable>
+#include <cstdio>
 #include <limits>
 #include <map>
 #include <memory>
@@ -74,8 +75,14 @@ struct DatabaseSession {
           providers(std::move(openedProviders)),
           allocator(std::move(openedAllocator)),
           opened(std::move(openedDatabase)),
-          values(std::move(openedValues)),
-          maxReaders(configuredMaxReaders) {}
+          values(makeOrderedKeyValues(allocator)),
+          maxReaders(configuredMaxReaders) {
+        std::fputs("[DEBUG-owner] assign session values\n", stderr);
+        std::fflush(stderr);
+        values = std::move(openedValues);
+        std::fputs("[DEBUG-owner] session values assigned\n", stderr);
+        std::fflush(stderr);
+    }
 
     std::unique_ptr<DurableFile> file;
     std::optional<ProviderSet> providers;
