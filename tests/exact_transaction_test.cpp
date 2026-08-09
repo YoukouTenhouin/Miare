@@ -69,6 +69,7 @@ public:
         : counts(std::move(sharedCounts)) {}
 
     CountingAllocator(const CountingAllocator&) noexcept = default;
+    // A moved-from allocator must remain usable by moved-from containers.
     CountingAllocator(CountingAllocator&& other) noexcept
         : counts(other.counts) {}
 
@@ -763,16 +764,12 @@ void handlesEnforceAdmissionAffinityAndPreflightGuarantees() {
 
 void closedDatabaseInvalidatesWriteHandle() {
 #ifdef NDEBUG
-    std::cerr << "[DEBUG-win-child] construct allocator\n";
-    std::cerr.flush();
     auto counts = std::make_shared<AllocationCounts>();
     CountingAllocator<std::byte> allocator{counts};
     using AllocatedDatabase = miare::Database<CountingAllocator<std::byte>>;
     std::optional<typename AllocatedDatabase::WriteTransaction> write;
     std::size_t beforeDestruction = 0;
     {
-        std::cerr << "[DEBUG-win-child] construct database\n";
-        std::cerr.flush();
         auto file = std::make_unique<miare::testing::MemoryDurableFile>();
         auto database = miare::testing::DatabaseAccess::create(
             std::move(file),
@@ -780,21 +777,13 @@ void closedDatabaseInvalidatesWriteHandle() {
             deterministicProviders(17),
             miare::CreateOptions{},
             allocator);
-        std::cerr << "[DEBUG-win-child] begin write\n";
-        std::cerr.flush();
         write.emplace(database.beginWrite());
         beforeDestruction = counts->deallocatedBytes.load(
             std::memory_order_relaxed);
-        std::cerr << "[DEBUG-win-child] destroy database\n";
-        std::cerr.flush();
     }
-    std::cerr << "[DEBUG-win-child] database destroyed\n";
-    std::cerr.flush();
     requireTest(counts->deallocatedBytes.load(std::memory_order_relaxed) >
                 beforeDestruction);
     requireTest(!write->active());
-    std::cerr << "[DEBUG-win-child] child inactive\n";
-    std::cerr.flush();
     bool invalidState = false;
     try {
         (void)write->get(bytes("key"));
@@ -802,11 +791,7 @@ void closedDatabaseInvalidatesWriteHandle() {
         invalidState = error.code() == miare::Errc::InvalidState;
     }
     requireTest(invalidState);
-    std::cerr << "[DEBUG-win-child] child rejected use\n";
-    std::cerr.flush();
     write->rollback();
-    std::cerr << "[DEBUG-win-child] child rolled back\n";
-    std::cerr.flush();
 #endif
 }
 
@@ -1114,10 +1099,6 @@ void transactionStateUsesTheDatabaseAllocator() {
 int main(int argc, char** argv) {
     if (argc == 2 && std::string_view{argv[1]} == "--assert-live-child") {
         return liveChildDestructionProbe();
-    }
-    if (argc == 2 && std::string_view{argv[1]} == "--release-child-teardown") {
-        closedDatabaseInvalidatesWriteHandle();
-        return 0;
     }
     TemporaryDirectory temporary;
     runTestCase("atomic durability", [&] {

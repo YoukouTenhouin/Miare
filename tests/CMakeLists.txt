@@ -30,13 +30,6 @@ target_link_libraries(
     miare_exact_transaction_test PRIVATE miare::miare Threads::Threads)
 add_test(NAME miare.exact_transaction COMMAND miare_exact_transaction_test)
 set_tests_properties(miare.exact_transaction PROPERTIES TIMEOUT 10)
-if(MSVC)
-    add_test(
-        NAME miare.exact_transaction_windows_child_teardown
-        COMMAND miare_exact_transaction_test --release-child-teardown)
-    set_tests_properties(
-        miare.exact_transaction_windows_child_teardown PROPERTIES TIMEOUT 10)
-endif()
 add_test(
     NAME miare.exact_transaction_live_child_assertion
     COMMAND
