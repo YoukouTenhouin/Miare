@@ -11,6 +11,7 @@
 #include <cassert>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdio>
 #include <filesystem>
 #include <limits>
 #include <memory>
@@ -525,7 +526,13 @@ private:
         const Allocator& allocator) {
         using LifetimeAllocator = typename std::allocator_traits<Allocator>::
             template rebind_alloc<ChildLifetime>;
-        return std::allocate_shared<ChildLifetime>(LifetimeAllocator{allocator});
+        std::fputs("[DEBUG-win-child] allocate lifetime\n", stderr);
+        std::fflush(stderr);
+        auto lifetime =
+            std::allocate_shared<ChildLifetime>(LifetimeAllocator{allocator});
+        std::fputs("[DEBUG-win-child] lifetime allocated\n", stderr);
+        std::fflush(stderr);
+        return lifetime;
     }
 
     [[nodiscard]] static SessionPtr makeSession(
@@ -536,7 +543,9 @@ private:
         OrderedKeyValues values,
         std::uint32_t maxReaders) {
         SessionAllocator sessionAllocator{allocator};
-        return std::allocate_shared<Session>(
+        std::fputs("[DEBUG-win-child] allocate session\n", stderr);
+        std::fflush(stderr);
+        auto session = std::allocate_shared<Session>(
             sessionAllocator,
             std::move(file),
             std::move(providers),
@@ -544,6 +553,9 @@ private:
             std::move(opened),
             std::move(values),
             maxReaders);
+        std::fputs("[DEBUG-win-child] session allocated\n", stderr);
+        std::fflush(stderr);
+        return session;
     }
 
     Database(
