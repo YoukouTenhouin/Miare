@@ -339,6 +339,224 @@ void expectImageDatabaseError(
     });
 }
 
+[[nodiscard]] std::vector<std::byte> rewriteLeafAsCompressed(
+    const std::vector<std::byte>& image,
+    bool retainUncompressedSpan) {
+    constexpr auto quantum = miare::DefaultLimits::allocationQuantumBytes;
+    constexpr auto pageCeiling = 16U * 1024U;
+    auto providers = deterministicProviders(19);
+    miare::testing::MemoryDurableFile file;
+    file.replaceStableBytes(image);
+    auto openedResult = miare::detail::openFormat<miare::DefaultLimits>(
+        file,
+        miare::EncryptionKeyView{keyBytes},
+        providers);
+    assert(openedResult);
+    auto opened = std::move(openedResult).value();
+    auto reference = miare::detail::decodeExtentReference(
+        opened.format.orderedRoot);
+    miare::detail::ByteBuffer source(reference.blockCount * quantum);
+    file.readExactAt(reference.blockIndex * quantum, source);
+    const miare::ByteView sourceView{source};
+    const auto sourceStoredLength = miare::detail::readLittleEndian<std::uint64_t>(
+        sourceView, miare::detail::ExtentLayout::storedLength);
+    const auto decodedLength = miare::detail::readLittleEndian<std::uint64_t>(
+        sourceView, miare::detail::ExtentLayout::decodedLength);
+    miare::detail::ByteBuffer stored(sourceStoredLength);
+    const auto sourceAssociatedData = miare::detail::extentAssociatedData(
+        opened,
+        sourceView.first(miare::detail::ExtentLayout::bytes));
+    auto& crypto = miare::detail::ProviderAccess::crypto(providers);
+    const bool decrypted = crypto.decryptDetached(
+        opened.keys.mainData.view(),
+        sourceView.subspan(
+            miare::detail::ExtentLayout::nonce,
+            miare::detail::aeadNonceBytes),
+        sourceView.subspan(
+            miare::detail::ExtentLayout::bytes,
+            sourceStoredLength),
+        sourceView.subspan(
+            miare::detail::ExtentLayout::bytes + sourceStoredLength,
+            miare::detail::authenticationTagBytes),
+        sourceAssociatedData,
+        stored);
+    assert(decrypted);
+    if (!decrypted) {
+        throw miare::DatabaseError{
+            miare::Errc::Corrupt,
+            "test fixture leaf authentication failed"};
+    }
+
+    miare::detail::ByteBuffer decoded(decodedLength);
+    if (miare::detail::readLittleEndian<std::uint32_t>(
+            sourceView, miare::detail::ExtentLayout::flags) == 1) {
+        miare::detail::ProviderAccess::compression(providers).decompress(
+            stored, decoded);
+    } else {
+        decoded = std::move(stored);
+    }
+    auto& compression = miare::detail::ProviderAccess::compression(providers);
+    miare::detail::ByteBuffer compressed(compression.compressBound(decoded.size()));
+    compressed.resize(compression.compress(decoded, compressed));
+    const auto encodedLength = miare::detail::ExtentLayout::bytes +
+        compressed.size() + miare::detail::authenticationTagBytes;
+    const auto minimalBlocks =
+        encodedLength / quantum + (encodedLength % quantum != 0);
+    reference.blockCount = retainUncompressedSpan
+        ? pageCeiling / quantum
+        : minimalBlocks;
+    reference.encodedLength = encodedLength;
+
+    miare::detail::ByteBuffer extent(reference.blockCount * quantum);
+    std::copy_n(
+        source.begin(),
+        miare::detail::ExtentLayout::bytes,
+        extent.begin());
+    miare::MutableByteView extentOutput{extent};
+    miare::detail::writeLittleEndian<std::uint32_t>(
+        1, extentOutput, miare::detail::ExtentLayout::flags);
+    miare::detail::writeLittleEndian<std::uint32_t>(
+        1, extentOutput, miare::detail::ExtentLayout::codec);
+    miare::detail::writeLittleEndian<std::uint32_t>(
+        1, extentOutput, miare::detail::ExtentLayout::codecProfile);
+    miare::detail::writeLittleEndian<std::uint64_t>(
+        reference.blockCount,
+        extentOutput,
+        miare::detail::ExtentLayout::blockCount);
+    miare::detail::writeLittleEndian<std::uint64_t>(
+        reference.encodedLength,
+        extentOutput,
+        miare::detail::ExtentLayout::encodedLength);
+    miare::detail::writeLittleEndian<std::uint64_t>(
+        compressed.size(),
+        extentOutput,
+        miare::detail::ExtentLayout::storedLength);
+    std::array<std::byte, miare::detail::aeadNonceBytes> nonce{};
+    crypto.randomBytes(nonce);
+    miare::detail::writeBytes(
+        extentOutput, miare::detail::ExtentLayout::nonce, nonce);
+    const auto associatedData = miare::detail::extentAssociatedData(
+        opened,
+        miare::ByteView{extent}.first(miare::detail::ExtentLayout::bytes));
+    crypto.encryptDetached(
+        opened.keys.mainData.view(),
+        nonce,
+        compressed,
+        associatedData,
+        miare::MutableByteView{extent}.subspan(
+            miare::detail::ExtentLayout::bytes,
+            compressed.size()),
+        miare::MutableByteView{extent}.subspan(
+            miare::detail::ExtentLayout::bytes + compressed.size(),
+            miare::detail::authenticationTagBytes));
+    const auto highWaterBytes =
+        (reference.blockIndex + reference.blockCount) * quantum;
+    file.writeExactAt(reference.blockIndex * quantum, extent);
+    file.resize(highWaterBytes);
+
+    auto publication = opened.publication;
+    const auto encodedReference = miare::detail::encodeExtentReference(reference);
+    miare::detail::writeBytes(
+        publication,
+        miare::detail::PublicationLayout::orderedRoot,
+        encodedReference);
+    miare::detail::writeLittleEndian<std::uint64_t>(
+        highWaterBytes / quantum,
+        publication,
+        miare::detail::PublicationLayout::highWaterBlocks);
+    const auto slotIndex = static_cast<std::uint16_t>(opened.format.generation % 2);
+    const auto slot = miare::detail::encodePublicationSlot(
+        opened, publication, slotIndex, providers);
+    file.writeExactAt(
+        miare::detail::bootstrapBytes +
+            slotIndex * miare::detail::publicationSlotBytes,
+        slot);
+    file.stableStorageBarrier();
+    return file.bytes();
+}
+
+[[nodiscard]] std::vector<std::byte> committedImage(
+    miare::Compression compression) {
+    auto file = std::make_unique<miare::testing::MemoryDurableFile>();
+    auto* fileView = file.get();
+    miare::CreateOptions options;
+    options.compression = compression;
+    auto database = miare::testing::DatabaseAccess::create(
+        std::move(file),
+        miare::EncryptionKeyView{keyBytes},
+        deterministicProviders(20),
+        options);
+    auto write = database.beginWrite();
+    write.put(bytes("key"), bytes("compressible value"));
+    write.commit();
+    const auto image = fileView->bytes();
+    database.close();
+    return image;
+}
+
+[[nodiscard]] std::vector<std::byte> rewriteLeafReferenceSpan(
+    const std::vector<std::byte>& image,
+    std::uint64_t blockCount) {
+    constexpr auto quantum = miare::DefaultLimits::allocationQuantumBytes;
+    auto providers = deterministicProviders(21);
+    miare::testing::MemoryDurableFile file;
+    file.replaceStableBytes(image);
+    auto openedResult = miare::detail::openFormat<miare::DefaultLimits>(
+        file,
+        miare::EncryptionKeyView{keyBytes},
+        providers);
+    assert(openedResult);
+    auto opened = std::move(openedResult).value();
+    auto reference = miare::detail::decodeExtentReference(
+        opened.format.orderedRoot);
+    reference.blockCount = blockCount;
+    const auto highWaterBytes =
+        (reference.blockIndex + reference.blockCount) * quantum;
+    file.resize(highWaterBytes);
+    auto publication = opened.publication;
+    const auto encodedReference = miare::detail::encodeExtentReference(reference);
+    miare::detail::writeBytes(
+        publication,
+        miare::detail::PublicationLayout::orderedRoot,
+        encodedReference);
+    miare::detail::writeLittleEndian<std::uint64_t>(
+        highWaterBytes / quantum,
+        publication,
+        miare::detail::PublicationLayout::highWaterBlocks);
+    const auto slotIndex = static_cast<std::uint16_t>(opened.format.generation % 2);
+    const auto slot = miare::detail::encodePublicationSlot(
+        opened, publication, slotIndex, providers);
+    file.writeExactAt(
+        miare::detail::bootstrapBytes +
+            slotIndex * miare::detail::publicationSlotBytes,
+        slot);
+    file.stableStorageBarrier();
+    return file.bytes();
+}
+
+void contradictoryAndNoncanonicalCompressionIsCorrupt() {
+    const auto uncompressed = committedImage(miare::Compression::None);
+    const auto compressedUnderNone = rewriteLeafAsCompressed(uncompressed, false);
+    expectImageDatabaseError(compressedUnderNone, miare::Errc::Corrupt);
+
+    const auto compressionEnabled = committedImage(miare::Compression::ZStd);
+    const auto sameSpanCompression = rewriteLeafAsCompressed(
+        compressionEnabled, true);
+    expectImageDatabaseError(sameSpanCompression, miare::Errc::Corrupt);
+
+    const auto oversizedReference = rewriteLeafReferenceSpan(
+        compressionEnabled, 5);
+    auto file = std::make_unique<miare::testing::MemoryDurableFile>();
+    file->replaceStableBytes(oversizedReference);
+    file->failReadsAtOrAfter(miare::detail::commonRegionBytes);
+    expectDatabaseError(miare::Errc::Corrupt, [&] {
+        (void)miare::testing::DatabaseAccess::open(
+            std::move(file),
+            miare::EncryptionKeyView{keyBytes},
+            deterministicProviders(22));
+    });
+}
+
 void interruptionsSelectOnlyCompleteGenerations() {
     auto file = std::make_unique<miare::testing::MemoryDurableFile>();
     auto* fileView = file.get();
@@ -454,6 +672,22 @@ void handlesEnforceAdmissionAffinityAndPreflightGuarantees() {
     database.close();
 }
 
+void closedDatabaseInvalidatesWriteHandle() {
+    std::optional<DefaultWrite> write;
+    {
+        auto file = std::make_unique<miare::testing::MemoryDurableFile>();
+        auto database = miare::testing::DatabaseAccess::create(
+            std::move(file),
+            miare::EncryptionKeyView{keyBytes},
+            deterministicProviders(17));
+        write.emplace(database.beginWrite());
+    }
+    expectContractError(miare::Errc::InvalidState, [&] {
+        (void)write->get(bytes("key"));
+    });
+    write->rollback();
+}
+
 void writerAdmissionIsFifo() {
     auto file = std::make_unique<miare::testing::MemoryDurableFile>();
     auto database = miare::testing::DatabaseAccess::create(
@@ -488,6 +722,20 @@ void writerAdmissionIsFifo() {
     first.join();
     second.join();
     assert((order == std::vector<int>{1, 2}));
+    database.close();
+}
+
+void tryWriterPreservesBlockingAdmissionSequence() {
+    auto file = std::make_unique<miare::testing::MemoryDurableFile>();
+    auto database = miare::testing::DatabaseAccess::create(
+        std::move(file),
+        miare::EncryptionKeyView{keyBytes},
+        deterministicProviders(18));
+    auto immediate = database.tryBeginWrite();
+    assert(immediate);
+    immediate.value().rollback();
+    auto blocking = database.beginWrite();
+    blocking.rollback();
     database.close();
 }
 
@@ -566,8 +814,11 @@ int main() {
     exactMutationsAreAtomicAndDurable(temporary);
     rollbackAndValidationPreserveCommittedState(temporary);
     commitUsesTwoDurabilityBarriersAndFailsStop();
+    contradictoryAndNoncanonicalCompressionIsCorrupt();
     interruptionsSelectOnlyCompleteGenerations();
     handlesEnforceAdmissionAffinityAndPreflightGuarantees();
+    closedDatabaseInvalidatesWriteHandle();
+    tryWriterPreservesBlockingAdmissionSequence();
     writerAdmissionIsFifo();
     openOptionsBoundReaderAdmission(temporary);
     transactionStateUsesTheDatabaseAllocator();

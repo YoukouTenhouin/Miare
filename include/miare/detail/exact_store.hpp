@@ -482,6 +482,17 @@ template<class Limits, class Allocator>
     }
     validateExtentReference<Limits>(
         reference, opened.format.generation, opened.format.highWaterBytes);
+    constexpr auto pageCeiling = std::max<std::uint64_t>(
+        16U * 1024U, Limits::allocationQuantumBytes);
+    constexpr auto uncompressedBlockCount =
+        pageCeiling / Limits::allocationQuantumBytes;
+    const auto minimalBlockCount =
+        reference.encodedLength / Limits::allocationQuantumBytes +
+        (reference.encodedLength % Limits::allocationQuantumBytes != 0);
+    if (reference.blockCount > uncompressedBlockCount ||
+        reference.blockCount != minimalBlockCount) {
+        throwCorrupt("ordered leaf extent span is noncanonical");
+    }
     ByteBuffer extent(reference.blockCount * Limits::allocationQuantumBytes);
     const auto offset = reference.blockIndex * Limits::allocationQuantumBytes;
     file.readExactAt(offset, extent);
@@ -514,13 +525,17 @@ template<class Limits, class Allocator>
         readLittleEndian<std::uint64_t>(input, ExtentLayout::storedLength);
     const auto decodedLength =
         readLittleEndian<std::uint64_t>(input, ExtentLayout::decodedLength);
+    const auto expectedStoredLength = reference.encodedLength -
+        ExtentLayout::bytes - authenticationTagBytes;
     if (flags > 1 || codec != flags || codecProfile != flags ||
-        reference.encodedLength !=
-            ExtentLayout::bytes + storedLength + authenticationTagBytes ||
+        storedLength != expectedStoredLength ||
         decodedLength !=
-            std::max<std::uint64_t>(16U * 1024U, Limits::allocationQuantumBytes) -
-                ExtentLayout::bytes - authenticationTagBytes ||
-        (flags == 0 && storedLength != decodedLength)) {
+            pageCeiling - ExtentLayout::bytes - authenticationTagBytes ||
+        (flags == 0 && storedLength != decodedLength) ||
+        (flags == 1 &&
+         (opened.format.compression != Compression::ZStd ||
+          storedLength >= decodedLength ||
+          reference.blockCount >= uncompressedBlockCount))) {
         throwCorrupt("ordered leaf extent representation is invalid");
     }
     ByteBuffer stored(storedLength);
@@ -551,6 +566,38 @@ struct PreparedPublication {
     std::uint16_t slotIndex;
 };
 
+[[nodiscard]] inline PublicationSlot encodePublicationSlot(
+    OpenedDatabase& opened,
+    const PublicationPlaintext& plaintext,
+    std::uint16_t slotIndex,
+    ProviderSet& providers) {
+    PublicationSlot slot{};
+    MutableByteView output{slot};
+    writeBytes(output, SlotEnvelopeLayout::magic, "MIARESLT");
+    writeLittleEndian<std::uint16_t>(1, output, SlotEnvelopeLayout::version);
+    writeLittleEndian<std::uint16_t>(slotIndex, output, SlotEnvelopeLayout::index);
+    writeLittleEndian<std::uint32_t>(
+        publicationEnvelopeBytes, output, SlotEnvelopeLayout::length);
+    writeLittleEndian<std::uint32_t>(
+        publicationPlaintextBytes, output, SlotEnvelopeLayout::ciphertextLength);
+    std::array<std::byte, aeadNonceBytes> nonce{};
+    auto& crypto = ProviderAccess::crypto(providers);
+    crypto.randomBytes(nonce);
+    writeBytes(output, SlotEnvelopeLayout::nonce, nonce);
+    const auto associatedData = publicationAssociatedData(
+        opened.bootstrap, ByteView{slot}.first(publicationEnvelopeBytes));
+    crypto.encryptDetached(
+        opened.keys.header.view(),
+        nonce,
+        plaintext,
+        associatedData,
+        MutableByteView{slot}.subspan(
+            SlotEnvelopeLayout::ciphertext, publicationPlaintextBytes),
+        MutableByteView{slot}.subspan(
+            SlotEnvelopeLayout::tag, authenticationTagBytes));
+    return slot;
+}
+
 template<class Limits>
 [[nodiscard]] inline PreparedPublication prepareExactPublication(
     OpenedDatabase& opened,
@@ -576,30 +623,7 @@ template<class Limits>
         plaintextOutput,
         PublicationLayout::highWaterBlocks);
 
-    PublicationSlot slot{};
-    MutableByteView output{slot};
-    writeBytes(output, SlotEnvelopeLayout::magic, "MIARESLT");
-    writeLittleEndian<std::uint16_t>(1, output, SlotEnvelopeLayout::version);
-    writeLittleEndian<std::uint16_t>(slotIndex, output, SlotEnvelopeLayout::index);
-    writeLittleEndian<std::uint32_t>(
-        publicationEnvelopeBytes, output, SlotEnvelopeLayout::length);
-    writeLittleEndian<std::uint32_t>(
-        publicationPlaintextBytes, output, SlotEnvelopeLayout::ciphertextLength);
-    std::array<std::byte, aeadNonceBytes> nonce{};
-    auto& crypto = ProviderAccess::crypto(providers);
-    crypto.randomBytes(nonce);
-    writeBytes(output, SlotEnvelopeLayout::nonce, nonce);
-    const auto associatedData = publicationAssociatedData(
-        opened.bootstrap, ByteView{slot}.first(publicationEnvelopeBytes));
-    crypto.encryptDetached(
-        opened.keys.header.view(),
-        nonce,
-        plaintext,
-        associatedData,
-        MutableByteView{slot}.subspan(
-            SlotEnvelopeLayout::ciphertext, publicationPlaintextBytes),
-        MutableByteView{slot}.subspan(
-            SlotEnvelopeLayout::tag, authenticationTagBytes));
+    auto slot = encodePublicationSlot(opened, plaintext, slotIndex, providers);
     return PreparedPublication{std::move(slot), std::move(plaintext), slotIndex};
 }
 

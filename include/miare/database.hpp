@@ -241,8 +241,12 @@ public:
             if (thread_ != std::this_thread::get_id()) {
                 throw ContractError{Errc::WrongThread, "write transaction belongs to another thread"};
             }
-            if (session_->state.load(std::memory_order_acquire) != DatabaseState::Open) {
+            const auto state = session_->state.load(std::memory_order_acquire);
+            if (state == DatabaseState::RecoveryRequired) {
                 throw DatabaseError{Errc::RecoveryRequired, "database requires recovery"};
+            }
+            if (state != DatabaseState::Open) {
+                throw ContractError{Errc::InvalidState, "database session is closed"};
             }
         }
 
@@ -421,8 +425,12 @@ public:
         if (session.writerActive || session.waitingWriters != 0) {
             return Result<WriteTransaction, WriterBusy>::failure(WriterBusy{});
         }
+        if (session.nextWriterTicket == std::numeric_limits<std::uint64_t>::max()) {
+            throw DatabaseError{Errc::ResourceLimit, "writer admission sequence exhausted"};
+        }
         auto snapshot = detail::makeOrderedKeyValues(session.allocator);
         snapshot = session.values;
+        ++session.nextWriterTicket;
         session.writerActive = true;
         ++session.liveTransactions;
         return Result<WriteTransaction, WriterBusy>::success(

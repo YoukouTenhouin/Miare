@@ -26,8 +26,10 @@ target_link_libraries(
 add_test(NAME miare.database_lifecycle COMMAND miare_database_lifecycle_test)
 
 add_executable(miare_exact_transaction_test exact_transaction_test.cpp)
-target_link_libraries(miare_exact_transaction_test PRIVATE miare::miare)
+target_link_libraries(
+    miare_exact_transaction_test PRIVATE miare::miare Threads::Threads)
 add_test(NAME miare.exact_transaction COMMAND miare_exact_transaction_test)
+set_tests_properties(miare.exact_transaction PROPERTIES TIMEOUT 10)
 
 add_test(
     NAME miare.zstd_header_compat

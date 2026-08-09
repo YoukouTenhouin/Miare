@@ -180,6 +180,9 @@ public:
     void readExactAt(std::uint64_t offset, MutableByteView destination) override {
         auto& operation = beginOperation(
             DurableFileOperationKind::Read, offset, destination.size());
+        if (failReadsAtOrAfter_ && offset >= *failReadsAtOrAfter_) {
+            throw DatabaseError{Errc::Io, "injected positioned read failure"};
+        }
         if (offset > bytes_.size() || destination.size() > bytes_.size() - offset) {
             throw DatabaseError{Errc::Io, "injected short read"};
         }
@@ -260,6 +263,9 @@ public:
     }
 
     void failAfterTransferredBytes(std::size_t bytes) { failAfterBytes_ = bytes; }
+    void failReadsAtOrAfter(std::uint64_t offset) noexcept {
+        failReadsAtOrAfter_ = offset;
+    }
     void failNextBarrier() noexcept { failBarrier_ = true; }
     void failBarrierAfter(std::size_t successfulBarriers) noexcept {
         failBarrierAfter_ = successfulBarriers;
@@ -302,6 +308,7 @@ public:
 
     void clearFaults() noexcept {
         failAfterBytes_.reset();
+        failReadsAtOrAfter_.reset();
         failBarrier_ = false;
         failBarrierAfter_.reset();
         failResize_ = false;
@@ -367,6 +374,7 @@ private:
     std::vector<UnbarrieredMutation> unbarrieredMutations_;
     std::size_t maxTransferBytes_ = std::numeric_limits<std::size_t>::max();
     std::optional<std::size_t> failAfterBytes_;
+    std::optional<std::uint64_t> failReadsAtOrAfter_;
     std::size_t barrierCount_ = 0;
     bool failBarrier_ = false;
     std::optional<std::size_t> failBarrierAfter_;
