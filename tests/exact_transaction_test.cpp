@@ -73,6 +73,9 @@ public:
         : counts(other.counts) {}
 
     [[nodiscard]] T* allocate(std::size_t count) {
+        std::cerr << "[DEBUG-win-child] allocator enter size=" << sizeof(T)
+                  << " count=" << count << '\n';
+        std::cerr.flush();
         const auto bytes = count * sizeof(T);
         counts->allocatedBytes.fetch_add(bytes, std::memory_order_relaxed);
         auto largest = counts->largestAllocationBytes.load(std::memory_order_relaxed);
@@ -80,7 +83,12 @@ public:
                !counts->largestAllocationBytes.compare_exchange_weak(
                    largest, bytes, std::memory_order_relaxed)) {
         }
-        return std::allocator<T>{}.allocate(count);
+        std::cerr << "[DEBUG-win-child] allocator backing allocate\n";
+        std::cerr.flush();
+        auto* result = std::allocator<T>{}.allocate(count);
+        std::cerr << "[DEBUG-win-child] allocator returned\n";
+        std::cerr.flush();
+        return result;
     }
 
     void deallocate(T* allocation, std::size_t count) noexcept {

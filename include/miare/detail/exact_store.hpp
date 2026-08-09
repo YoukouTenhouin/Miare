@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <condition_variable>
 #include <limits>
+#include <cstdio>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -75,7 +76,10 @@ struct DatabaseSession {
           allocator(std::move(openedAllocator)),
           opened(std::move(openedDatabase)),
           values(std::move(openedValues)),
-          maxReaders(configuredMaxReaders) {}
+          maxReaders(configuredMaxReaders) {
+        std::fputs("[DEBUG-win-child] session constructor body\n", stderr);
+        std::fflush(stderr);
+    }
 
     std::unique_ptr<DurableFile> file;
     std::optional<ProviderSet> providers;
