@@ -42,30 +42,12 @@ private:
         template rebind_alloc<Session>;
 
     struct ChildLifetime {
-        explicit ChildLifetime(const Allocator& allocator)
-            : sessionAllocator(allocator) {}
-
         std::atomic<bool> invalidated{false};
-        SessionAllocator sessionAllocator;
     };
 
-    struct SessionDeleter {
-        using Traits = std::allocator_traits<SessionAllocator>;
-        using pointer = typename Traits::pointer;
-
-        std::shared_ptr<ChildLifetime> lifetime;
-
-        void operator()(pointer session) noexcept {
-            if (session == nullptr) {
-                return;
-            }
-            Traits::destroy(
-                lifetime->sessionAllocator, std::to_address(session));
-            Traits::deallocate(lifetime->sessionAllocator, session, 1);
-        }
-    };
-
-    using SessionPtr = std::unique_ptr<Session, SessionDeleter>;
+    // allocate_shared routes the session and control block through Allocator;
+    // this pointer is never copied outside the sole Database owner.
+    using SessionPtr = std::shared_ptr<Session>;
 
 public:
     using OwnedBytes = std::vector<
@@ -543,35 +525,25 @@ private:
         const Allocator& allocator) {
         using LifetimeAllocator = typename std::allocator_traits<Allocator>::
             template rebind_alloc<ChildLifetime>;
-        return std::allocate_shared<ChildLifetime>(
-            LifetimeAllocator{allocator}, allocator);
+        return std::allocate_shared<ChildLifetime>(LifetimeAllocator{allocator});
     }
 
     [[nodiscard]] static SessionPtr makeSession(
-        const std::shared_ptr<ChildLifetime>& lifetime,
         std::unique_ptr<detail::DurableFile> file,
         ProviderSet providers,
         Allocator allocator,
         detail::OpenedDatabase opened,
         OrderedKeyValues values,
         std::uint32_t maxReaders) {
-        using Traits = std::allocator_traits<SessionAllocator>;
-        auto session = Traits::allocate(lifetime->sessionAllocator, 1);
-        try {
-            Traits::construct(
-                lifetime->sessionAllocator,
-                std::to_address(session),
-                std::move(file),
-                std::move(providers),
-                std::move(allocator),
-                std::move(opened),
-                std::move(values),
-                maxReaders);
-        } catch (...) {
-            Traits::deallocate(lifetime->sessionAllocator, session, 1);
-            throw;
-        }
-        return SessionPtr{session, SessionDeleter{lifetime}};
+        SessionAllocator sessionAllocator{allocator};
+        return std::allocate_shared<Session>(
+            sessionAllocator,
+            std::move(file),
+            std::move(providers),
+            std::move(allocator),
+            std::move(opened),
+            std::move(values),
+            maxReaders);
     }
 
     Database(
@@ -583,7 +555,6 @@ private:
         std::uint32_t maxReaders)
         : lifetime_(makeChildLifetime(allocator)),
           session_(makeSession(
-              lifetime_,
               std::move(file),
               std::move(providers),
               std::move(allocator),
