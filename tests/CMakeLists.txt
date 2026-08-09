@@ -1,3 +1,5 @@
+find_package(Threads REQUIRED)
+
 add_executable(miare_public_primitives_test public_primitives_test.cpp)
 target_link_libraries(miare_public_primitives_test PRIVATE miare::miare)
 add_test(NAME miare.public_primitives COMMAND miare_public_primitives_test)
@@ -17,6 +19,11 @@ add_test(NAME miare.provider COMMAND miare_provider_test)
 add_executable(miare_database_format_test database_format_test.cpp)
 target_link_libraries(miare_database_format_test PRIVATE miare::miare)
 add_test(NAME miare.database_format COMMAND miare_database_format_test)
+
+add_executable(miare_database_lifecycle_test database_lifecycle_test.cpp)
+target_link_libraries(
+    miare_database_lifecycle_test PRIVATE miare::miare Threads::Threads)
+add_test(NAME miare.database_lifecycle COMMAND miare_database_lifecycle_test)
 
 add_test(
     NAME miare.zstd_header_compat
