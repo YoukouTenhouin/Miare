@@ -54,6 +54,8 @@ public:
         std::uint64_t subkeyId,
         MutableByteView output) = 0;
 
+    virtual void hashBlake2b256(ByteView input, MutableByteView output) = 0;
+
     virtual void encryptDetached(
         ByteView key,
         ByteView nonce,
@@ -166,6 +168,20 @@ public:
                 context,
                 asUnsigned(databaseRoot.data())) != 0) {
             throwProviderFailure("BLAKE2b subkey derivation failed");
+        }
+    }
+
+    void hashBlake2b256(ByteView input, MutableByteView output) override {
+        requireSize(output, cryptoKeyBytes, "BLAKE2b-256 output");
+        if (input.size() > maxProviderUnitBytes ||
+            crypto_generichash(
+                asUnsigned(output.data()),
+                output.size(),
+                asUnsigned(input.data()),
+                input.size(),
+                nullptr,
+                0) != 0) {
+            throwProviderFailure("BLAKE2b-256 hashing failed");
         }
     }
 

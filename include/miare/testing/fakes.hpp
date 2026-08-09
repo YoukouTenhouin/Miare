@@ -89,6 +89,11 @@ public:
         delegate_.deriveSubkey(databaseRoot, subkeyId, output);
     }
 
+    void hashBlake2b256(ByteView input, MutableByteView output) override {
+        failProviderIfRequested();
+        delegate_.hashBlake2b256(input, output);
+    }
+
     void encryptDetached(
         ByteView key,
         ByteView nonce,
@@ -167,6 +172,10 @@ private:
 
 class MemoryDurableFile final : public detail::DurableFile {
 public:
+    [[nodiscard]] std::uint64_t size() const override {
+        return bytes_.size();
+    }
+
     void readExactAt(std::uint64_t offset, MutableByteView destination) override {
         auto& operation = beginOperation(
             DurableFileOperationKind::Read, offset, destination.size());
