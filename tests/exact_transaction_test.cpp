@@ -68,6 +68,10 @@ public:
     explicit CountingAllocator(std::shared_ptr<AllocationCounts> sharedCounts)
         : counts(std::move(sharedCounts)) {}
 
+    CountingAllocator(const CountingAllocator&) noexcept = default;
+    CountingAllocator(CountingAllocator&& other) noexcept
+        : counts(other.counts) {}
+
     template<class U>
     CountingAllocator(const CountingAllocator<U>& other) noexcept
         : counts(other.counts) {}

@@ -11,7 +11,6 @@
 #include <cassert>
 #include <condition_variable>
 #include <cstddef>
-#include <cstdio>
 #include <filesystem>
 #include <limits>
 #include <memory>
@@ -43,75 +42,12 @@ private:
         template rebind_alloc<Session>;
 
     struct ChildLifetime {
-        explicit ChildLifetime(const Allocator& allocator)
-            : sessionAllocator(allocator) {}
-
         std::atomic<bool> invalidated{false};
-        SessionAllocator sessionAllocator;
     };
 
-    class SessionOwner {
-    private:
-        using Traits = std::allocator_traits<SessionAllocator>;
-        using Pointer = typename Traits::pointer;
-
-    public:
-        SessionOwner() = default;
-        SessionOwner(const SessionOwner&) = delete;
-        SessionOwner& operator=(const SessionOwner&) = delete;
-
-        SessionOwner(SessionOwner&& other) noexcept
-            : lifetime_(std::move(other.lifetime_)),
-              session_(std::exchange(other.session_, Pointer{})) {
-            std::fputs("[DEBUG-owner] owner moved\n", stderr);
-            std::fflush(stderr);
-        }
-
-        SessionOwner& operator=(SessionOwner&&) = delete;
-
-        ~SessionOwner() { reset(); }
-
-        [[nodiscard]] explicit operator bool() const noexcept {
-            return session_ != Pointer{};
-        }
-
-        [[nodiscard]] Session& operator*() const noexcept {
-            return *std::to_address(session_);
-        }
-
-        [[nodiscard]] Session* operator->() const noexcept {
-            return std::to_address(session_);
-        }
-
-    private:
-        friend class Database;
-
-        SessionOwner(
-            Pointer session,
-            std::shared_ptr<ChildLifetime> lifetime) noexcept
-            : lifetime_(std::move(lifetime)), session_(session) {
-            std::fputs("[DEBUG-owner] owner constructed\n", stderr);
-            std::fflush(stderr);
-        }
-
-        void reset() noexcept {
-            if (session_ == Pointer{}) {
-                return;
-            }
-            Traits::destroy(
-                lifetime_->sessionAllocator,
-                std::to_address(session_));
-            Traits::deallocate(
-                lifetime_->sessionAllocator,
-                session_,
-                1);
-            session_ = Pointer{};
-            lifetime_.reset();
-        }
-
-        std::shared_ptr<ChildLifetime> lifetime_;
-        Pointer session_{};
-    };
+    // allocate_shared routes the session and control block through Allocator;
+    // this pointer is never copied outside the sole Database owner.
+    using SessionPtr = std::shared_ptr<Session>;
 
 public:
     using OwnedBytes = std::vector<
@@ -446,10 +382,7 @@ public:
 
     Database(Database&& other) noexcept
         : lifetime_(std::move(other.lifetime_)),
-          session_(std::move(other.session_)) {
-        std::fputs("[DEBUG-owner] database moved\n", stderr);
-        std::fflush(stderr);
-    }
+          session_(std::move(other.session_)) {}
 
     Database& operator=(Database&&) = delete;
 
@@ -592,45 +525,25 @@ private:
         const Allocator& allocator) {
         using LifetimeAllocator = typename std::allocator_traits<Allocator>::
             template rebind_alloc<ChildLifetime>;
-        return std::allocate_shared<ChildLifetime>(
-            LifetimeAllocator{allocator},
-            allocator);
+        return std::allocate_shared<ChildLifetime>(LifetimeAllocator{allocator});
     }
 
-    [[nodiscard]] static SessionOwner makeSession(
-        const std::shared_ptr<ChildLifetime>& lifetime,
+    [[nodiscard]] static SessionPtr makeSession(
         std::unique_ptr<detail::DurableFile> file,
         ProviderSet providers,
         Allocator allocator,
         detail::OpenedDatabase opened,
         OrderedKeyValues values,
         std::uint32_t maxReaders) {
-        using Traits = std::allocator_traits<SessionAllocator>;
-        std::fputs("[DEBUG-owner] allocate session\n", stderr);
-        std::fflush(stderr);
-        auto session = Traits::allocate(lifetime->sessionAllocator, 1);
-        std::fputs("[DEBUG-owner] session memory allocated\n", stderr);
-        std::fflush(stderr);
-        try {
-            Traits::construct(
-                lifetime->sessionAllocator,
-                std::to_address(session),
-                std::move(file),
-                std::move(providers),
-                std::move(allocator),
-                std::move(opened),
-                std::move(values),
-                maxReaders);
-            std::fputs("[DEBUG-owner] session constructed\n", stderr);
-            std::fflush(stderr);
-        } catch (...) {
-            Traits::deallocate(lifetime->sessionAllocator, session, 1);
-            throw;
-        }
-        auto owner = SessionOwner{session, lifetime};
-        std::fputs("[DEBUG-owner] return session owner\n", stderr);
-        std::fflush(stderr);
-        return owner;
+        SessionAllocator sessionAllocator{allocator};
+        return std::allocate_shared<Session>(
+            sessionAllocator,
+            std::move(file),
+            std::move(providers),
+            std::move(allocator),
+            std::move(opened),
+            std::move(values),
+            maxReaders);
     }
 
     Database(
@@ -642,16 +555,12 @@ private:
         std::uint32_t maxReaders)
         : lifetime_(makeChildLifetime(allocator)),
           session_(makeSession(
-              lifetime_,
               std::move(file),
               std::move(providers),
               std::move(allocator),
               std::move(opened),
               std::move(values),
-              maxReaders)) {
-        std::fputs("[DEBUG-owner] database constructed\n", stderr);
-        std::fflush(stderr);
-    }
+              maxReaders)) {}
 
     [[nodiscard]] Session& requireSession() {
         if (!session_) {
@@ -810,7 +719,7 @@ private:
     }
 
     std::shared_ptr<ChildLifetime> lifetime_;
-    SessionOwner session_;
+    SessionPtr session_;
 };
 
 } // namespace miare
