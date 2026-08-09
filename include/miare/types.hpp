@@ -31,6 +31,13 @@ enum class EncryptionSuite : std::uint32_t {
     XChaCha20Poly1305Ietf,
 };
 
+enum class DatabaseState : std::uint8_t {
+    Open,
+    Closing,
+    RecoveryRequired,
+    Closed,
+};
+
 struct CreateOptions {
     StorageBackend storageBackend = StorageBackend::BTree;
     Compression compression = Compression::ZStd;
@@ -144,26 +151,6 @@ concept LimitPolicy = requires {
     Limits::blobChunkBytes <= 16U * 1024U * 1024U &&
     Limits::blobChunkBytes >= Limits::allocationQuantumBytes &&
     Limits::maxInlineValueBytes <= Limits::maxValueBytes;
-
-template<
-    class Allocator = std::allocator<std::byte>,
-    class Limits = DefaultLimits>
-requires DatabaseAllocator<Allocator> && LimitPolicy<Limits>
-class Database {
-public:
-    using OwnedBytes = std::vector<
-        std::byte,
-        typename std::allocator_traits<Allocator>::template rebind_alloc<std::byte>>;
-
-    Database(const Database&) = delete;
-    Database& operator=(const Database&) = delete;
-    Database(Database&&) noexcept = default;
-    Database& operator=(Database&&) = delete;
-    ~Database() = default;
-
-private:
-    Database() = default;
-};
 
 } // namespace miare
 
