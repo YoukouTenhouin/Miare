@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <vector>
 
@@ -383,6 +384,18 @@ private:
 
 class DatabaseAccess {
 public:
+    template<class Allocator, class Limits>
+    [[nodiscard]] static auto lockSession(
+        Database<Allocator, Limits>& database) {
+        return std::unique_lock{database.session_->mutex};
+    }
+
+    template<class Allocator, class Limits>
+    static void forceRecoveryRequired(Database<Allocator, Limits>& database) {
+        database.session_->state.store(
+            DatabaseState::RecoveryRequired, std::memory_order_release);
+    }
+
     template<class Allocator, class Limits>
     [[nodiscard]] static std::size_t waitingWriters(
         Database<Allocator, Limits>& database) {

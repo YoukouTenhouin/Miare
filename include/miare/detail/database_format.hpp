@@ -591,8 +591,18 @@ template<class Limits>
     }
     const auto highWaterBlocks = readLittleEndian<std::uint64_t>(
         input, PublicationLayout::highWaterBlocks);
-    if (highWaterBlocks < commonRegionBytes / Limits::allocationQuantumBytes ||
-        highWaterBlocks > Limits::maxDatabaseBytes / Limits::allocationQuantumBytes) {
+    const auto commonRegionBlocks =
+        commonRegionBytes / Limits::allocationQuantumBytes;
+    if ((generation == 1 &&
+         (!allZero(
+              input,
+              PublicationLayout::orderedRoot,
+              PublicationLayout::highWaterBlocks) ||
+          highWaterBlocks != commonRegionBlocks)) ||
+        (generation > 1 &&
+         (highWaterBlocks < commonRegionBlocks ||
+          highWaterBlocks > Limits::maxDatabaseBytes /
+              Limits::allocationQuantumBytes))) {
         throwCorrupt("database has an invalid committed boundary");
     }
     if (readLittleEndian<std::uint64_t>(input, PublicationLayout::flags) != 0) {

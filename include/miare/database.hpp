@@ -403,8 +403,8 @@ public:
             --session.waitingWriters;
             if (ticket == session.servingWriterTicket) {
                 ++session.servingWriterTicket;
-                session.writerAvailable.notify_all();
             }
+            session.writerAvailable.notify_all();
             requireOpen(session);
         }
         OrderedKeyValues snapshot = detail::makeOrderedKeyValues(session.allocator);
@@ -458,9 +458,20 @@ public:
             }
         }
         {
-            std::lock_guard lock{session.mutex};
+            std::unique_lock lock{session.mutex};
+            session.writerAvailable.notify_all();
+            session.writerAvailable.wait(lock, [&] {
+                return session.waitingWriters == 0;
+            });
+            session.servingWriterTicket = session.nextWriterTicket -
+                static_cast<std::uint64_t>(session.writerActive);
             if (session.liveTransactions != 0) {
-                session.state.store(expected, std::memory_order_release);
+                auto closing = DatabaseState::Closing;
+                (void)session.state.compare_exchange_strong(
+                    closing,
+                    expected,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire);
                 throw ContractError{
                     Errc::LiveChildren,
                     "database has live transactions"};

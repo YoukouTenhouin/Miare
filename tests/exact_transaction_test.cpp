@@ -500,6 +500,47 @@ void expectImageDatabaseError(
     return image;
 }
 
+[[nodiscard]] std::vector<std::byte> generationOneWithBackendData() {
+    constexpr auto quantum = miare::DefaultLimits::allocationQuantumBytes;
+    auto providers = deterministicProviders(25);
+    miare::testing::MemoryDurableFile file;
+    const auto commonRegion =
+        miare::detail::makeInitialCommonRegion<miare::DefaultLimits>(
+            miare::EncryptionKeyView{keyBytes},
+            miare::detail::ProviderAccess::crypto(providers),
+            miare::Compression::ZStd);
+    file.replaceStableBytes(commonRegion);
+    auto openedResult = miare::detail::openFormat<miare::DefaultLimits>(
+        file,
+        miare::EncryptionKeyView{keyBytes},
+        providers);
+    assert(openedResult);
+    auto opened = std::move(openedResult).value();
+    file.resize(miare::detail::commonRegionBytes + quantum);
+    for (std::uint16_t slotIndex = 0; slotIndex != 2; ++slotIndex) {
+        auto publication = opened.publication;
+        miare::MutableByteView output{publication};
+        miare::detail::writeLittleEndian<std::uint16_t>(
+            slotIndex, output, miare::detail::PublicationLayout::slotIndex);
+        miare::detail::writeLittleEndian<std::uint64_t>(
+            (miare::detail::commonRegionBytes + quantum) / quantum,
+            output,
+            miare::detail::PublicationLayout::highWaterBlocks);
+        const auto slot = miare::detail::encodePublicationSlot(
+            opened, publication, slotIndex, providers);
+        file.writeExactAt(
+            miare::detail::bootstrapBytes +
+                slotIndex * miare::detail::publicationSlotBytes,
+            slot);
+    }
+    file.stableStorageBarrier();
+    return file.bytes();
+}
+
+void generationOneMustBeTheCanonicalEmptyDatabase() {
+    expectImageDatabaseError(generationOneWithBackendData(), miare::Errc::Corrupt);
+}
+
 [[nodiscard]] std::vector<std::byte> rewriteLeafReferenceSpan(
     const std::vector<std::byte>& image,
     std::uint64_t blockCount) {
@@ -743,6 +784,84 @@ void writerAdmissionIsFifo() {
     database.close();
 }
 
+void closeCancelsQueuedWriterAdmission() {
+    auto file = std::make_unique<miare::testing::MemoryDurableFile>();
+    auto database = miare::testing::DatabaseAccess::create(
+        std::move(file),
+        miare::EncryptionKeyView{keyBytes},
+        deterministicProviders(26));
+    auto admitted = database.beginWrite();
+    std::atomic<bool> cancelled{false};
+    std::atomic<bool> finished{false};
+    std::thread queued([&] {
+        try {
+            auto unexpected = database.beginWrite();
+            unexpected.rollback();
+        } catch (const miare::ContractError& error) {
+            cancelled.store(
+                error.code() == miare::Errc::InvalidState,
+                std::memory_order_release);
+        }
+        finished.store(true, std::memory_order_release);
+    });
+    for (std::size_t attempt = 0; attempt != 1'000'000; ++attempt) {
+        if (miare::testing::DatabaseAccess::waitingWriters(database) == 1) {
+            break;
+        }
+        std::this_thread::yield();
+    }
+    assert(miare::testing::DatabaseAccess::waitingWriters(database) == 1);
+    expectContractError(miare::Errc::LiveChildren, [&] { database.close(); });
+
+    bool settled = false;
+    for (std::size_t attempt = 0; attempt != 1'000'000; ++attempt) {
+        if (finished.load(std::memory_order_acquire)) {
+            settled = true;
+            break;
+        }
+        std::this_thread::yield();
+    }
+    if (!settled) {
+        admitted.rollback();
+        queued.join();
+        assert(false);
+    }
+    queued.join();
+    assert(cancelled.load(std::memory_order_acquire));
+    admitted.rollback();
+    database.close();
+}
+
+void closePreservesConcurrentRecoveryTransition() {
+    auto file = std::make_unique<miare::testing::MemoryDurableFile>();
+    auto database = miare::testing::DatabaseAccess::create(
+        std::move(file),
+        miare::EncryptionKeyView{keyBytes},
+        deterministicProviders(27));
+    auto writer = database.beginWrite();
+    auto sessionLock = miare::testing::DatabaseAccess::lockSession(database);
+    std::atomic<bool> liveChildren{false};
+    std::thread closer([&] {
+        try {
+            database.close();
+        } catch (const miare::ContractError& error) {
+            liveChildren.store(
+                error.code() == miare::Errc::LiveChildren,
+                std::memory_order_release);
+        }
+    });
+    while (database.state() != miare::DatabaseState::Closing) {
+        std::this_thread::yield();
+    }
+    miare::testing::DatabaseAccess::forceRecoveryRequired(database);
+    sessionLock.unlock();
+    closer.join();
+    assert(liveChildren.load(std::memory_order_acquire));
+    assert(database.state() == miare::DatabaseState::RecoveryRequired);
+    writer.rollback();
+    database.close();
+}
+
 void readersObserveCompleteGenerationsDuringCommit() {
     auto file = std::make_unique<miare::testing::MemoryDurableFile>();
     auto database = miare::testing::DatabaseAccess::create(
@@ -890,12 +1009,15 @@ int main() {
     rollbackAndValidationPreserveCommittedState(temporary);
     commitUsesTwoDurabilityBarriersAndFailsStop();
     contradictoryAndNoncanonicalCompressionIsCorrupt();
+    generationOneMustBeTheCanonicalEmptyDatabase();
     interruptionsSelectOnlyCompleteGenerations();
     handlesEnforceAdmissionAffinityAndPreflightGuarantees();
     closedDatabaseInvalidatesWriteHandle();
     closeErasesDerivedKeys();
     tryWriterPreservesBlockingAdmissionSequence();
     writerAdmissionIsFifo();
+    closeCancelsQueuedWriterAdmission();
+    closePreservesConcurrentRecoveryTransition();
     readersObserveCompleteGenerationsDuringCommit();
     openOptionsBoundReaderAdmission(temporary);
     transactionStateUsesTheDatabaseAllocator();
