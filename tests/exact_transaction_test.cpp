@@ -57,6 +57,7 @@ struct AllocationCounts {
     std::atomic<std::size_t> allocatedBytes{0};
     std::atomic<std::size_t> deallocatedBytes{0};
     std::atomic<std::size_t> largestAllocationBytes{0};
+    std::atomic<std::size_t> allocatorSelections{0};
 };
 
 template<class T>
@@ -95,6 +96,7 @@ public:
     }
 
     [[nodiscard]] CountingAllocator select_on_container_copy_construction() const {
+        counts->allocatorSelections.fetch_add(1, std::memory_order_relaxed);
         return CountingAllocator{};
     }
 
@@ -1076,7 +1078,9 @@ void transactionStateUsesTheDatabaseAllocator() {
     requireTest(
         counts->allocatedBytes.load(std::memory_order_relaxed) > beforeSession);
     const auto beforeMutation = counts->allocatedBytes.load(std::memory_order_relaxed);
+    counts->allocatorSelections.store(0, std::memory_order_relaxed);
     auto write = database.beginWrite();
+    assert(counts->allocatorSelections.load(std::memory_order_relaxed) == 0);
     write.put(bytes("allocated-key"), bytes("allocated-value"));
     assert(counts->allocatedBytes.load(std::memory_order_relaxed) > beforeMutation);
     counts->largestAllocationBytes.store(0, std::memory_order_relaxed);
@@ -1084,7 +1088,9 @@ void transactionStateUsesTheDatabaseAllocator() {
     assert(counts->largestAllocationBytes.load(std::memory_order_relaxed) >=
            15U * 1024U);
     const auto beforeRead = counts->allocatedBytes.load(std::memory_order_relaxed);
+    counts->allocatorSelections.store(0, std::memory_order_relaxed);
     auto read = database.beginRead();
+    assert(counts->allocatorSelections.load(std::memory_order_relaxed) == 0);
     assert(counts->allocatedBytes.load(std::memory_order_relaxed) > beforeRead);
     auto value = read.get(bytes("allocated-key"));
     assert(value);

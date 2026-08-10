@@ -1,6 +1,6 @@
 #pragma once
 
-#include <miare/detail/exact_store.hpp>
+#include <miare/detail/ordered_cursor.hpp>
 #include <miare/detail/providers.hpp>
 #include <miare/error.hpp>
 #include <miare/result.hpp>
@@ -28,6 +28,51 @@ namespace testing {
 class DatabaseAccess;
 }
 
+template<class Allocator, class Limits>
+requires DatabaseAllocator<Allocator> && LimitPolicy<Limits>
+class Database;
+
+class KeyRangeView {
+public:
+    [[nodiscard]] static KeyRangeView all() noexcept {
+        return KeyRangeView{
+            detail::OrderedRangeKind::All,
+            std::nullopt,
+            std::nullopt};
+    }
+
+    [[nodiscard]] static KeyRangeView halfOpen(
+        std::optional<ByteView> lowerInclusive,
+        std::optional<ByteView> upperExclusive) noexcept {
+        return KeyRangeView{
+            detail::OrderedRangeKind::HalfOpen,
+            lowerInclusive,
+            upperExclusive};
+    }
+
+    [[nodiscard]] static KeyRangeView prefix(ByteView prefix) noexcept {
+        return KeyRangeView{
+            detail::OrderedRangeKind::Prefix,
+            prefix,
+            std::nullopt};
+    }
+
+private:
+    KeyRangeView(
+        detail::OrderedRangeKind kind,
+        std::optional<ByteView> lower,
+        std::optional<ByteView> upper) noexcept
+        : kind_(kind), lower_(lower), upper_(upper) {}
+
+    detail::OrderedRangeKind kind_;
+    std::optional<ByteView> lower_;
+    std::optional<ByteView> upper_;
+
+    template<class Allocator, class Limits>
+    requires DatabaseAllocator<Allocator> && LimitPolicy<Limits>
+    friend class Database;
+};
+
 template<
     class Allocator = std::allocator<std::byte>,
     class Limits = DefaultLimits>
@@ -38,12 +83,11 @@ private:
     using Session = detail::DatabaseSession<Allocator, Limits>;
     using OrderedKeyValues = detail::OrderedKeyValues<Allocator>;
     using StoredBytes = detail::StoredBytes<Allocator>;
+    using MutableTree = detail::MutableTreeNode<Allocator>;
+    using ChildLifetime = detail::SessionChildLifetime;
+    using CursorLifetime = detail::OrderedCursorLifetime<Allocator>;
     using SessionAllocator = typename std::allocator_traits<Allocator>::
         template rebind_alloc<Session>;
-
-    struct ChildLifetime {
-        std::atomic<bool> invalidated{false};
-    };
 
     // allocate_shared routes the session and control block through Allocator;
     // this pointer is never copied outside the sole Database owner.
@@ -54,6 +98,10 @@ public:
         std::byte,
         typename std::allocator_traits<Allocator>::template rebind_alloc<std::byte>>;
 
+public:
+    using ReadCursor = detail::OrderedCursor<Allocator, Limits, false>;
+    using WriteCursor = detail::OrderedCursor<Allocator, Limits, true>;
+
     class ReadTransaction {
     public:
         ReadTransaction(const ReadTransaction&) = delete;
@@ -63,13 +111,25 @@ public:
             : session_(std::exchange(other.session_, nullptr)),
               lifetime_(std::move(other.lifetime_)),
               values_(std::move(other.values_)),
+              tree_(std::move(other.tree_)),
+              cursorLifetime_(std::move(other.cursorLifetime_)),
               generation_(other.generation_),
               thread_(other.thread_),
-              active_(std::exchange(other.active_, false)) {}
+              active_(std::exchange(other.active_, false)) {
+            if (cursorLifetime_) {
+                cursorLifetime_->root = &tree_;
+            }
+        }
 
         ReadTransaction& operator=(ReadTransaction&&) = delete;
 
-        ~ReadTransaction() { end(); }
+        ~ReadTransaction() {
+#ifndef NDEBUG
+            assert(!active_ || !cursorLifetime_ ||
+                cursorLifetime_->liveCursors == 0);
+#endif
+            end();
+        }
 
         [[nodiscard]] std::optional<OwnedBytes> get(ByteView key) {
             requireFunctional();
@@ -83,11 +143,18 @@ public:
             return values_.contains(key);
         }
 
+        [[nodiscard]] ReadCursor scan(
+            KeyRangeView range = KeyRangeView::all()) {
+            requireFunctional();
+            return makeCursor<false>(*session_, cursorLifetime_, range);
+        }
+
         void end() noexcept {
             if (!active_) {
                 return;
             }
             active_ = false;
+            detail::invalidateCursors(cursorLifetime_);
             if (lifetime_ &&
                 !lifetime_->invalidated.load(std::memory_order_acquire)) {
                 releaseTransaction(
@@ -109,13 +176,19 @@ public:
             Session& session,
             std::shared_ptr<ChildLifetime> lifetime,
             OrderedKeyValues values,
+            MutableTree tree,
+            std::shared_ptr<CursorLifetime> cursorLifetime,
             std::uint64_t generation)
             : session_(&session),
               lifetime_(std::move(lifetime)),
               values_(std::move(values)),
+              tree_(std::move(tree)),
+              cursorLifetime_(std::move(cursorLifetime)),
               generation_(generation),
               thread_(std::this_thread::get_id()),
-              active_(true) {}
+              active_(true) {
+            cursorLifetime_->root = &tree_;
+        }
 
         void requireFunctional() const {
             if (!active()) {
@@ -133,6 +206,8 @@ public:
         Session* session_;
         std::shared_ptr<ChildLifetime> lifetime_;
         OrderedKeyValues values_;
+        MutableTree tree_;
+        std::shared_ptr<CursorLifetime> cursorLifetime_;
         std::uint64_t generation_;
         std::thread::id thread_;
         bool active_;
@@ -147,14 +222,27 @@ public:
             : session_(std::exchange(other.session_, nullptr)),
               lifetime_(std::move(other.lifetime_)),
               values_(std::move(other.values_)),
+              tree_(std::move(other.tree_)),
+              cursorLifetime_(std::move(other.cursorLifetime_)),
               thread_(other.thread_),
               keyMutations_(other.keyMutations_),
               changed_(other.changed_),
-              active_(std::exchange(other.active_, false)) {}
+              treeCurrent_(other.treeCurrent_),
+              active_(std::exchange(other.active_, false)) {
+            if (cursorLifetime_) {
+                cursorLifetime_->root = &tree_;
+            }
+        }
 
         WriteTransaction& operator=(WriteTransaction&&) = delete;
 
-        ~WriteTransaction() { rollback(); }
+        ~WriteTransaction() {
+#ifndef NDEBUG
+            assert(!active_ || !cursorLifetime_ ||
+                cursorLifetime_->liveCursors == 0);
+#endif
+            rollback();
+        }
 
         [[nodiscard]] std::optional<OwnedBytes> get(ByteView key) {
             requireFunctional();
@@ -166,6 +254,13 @@ public:
             requireFunctional();
             requireKey(key);
             return values_.contains(key);
+        }
+
+        [[nodiscard]] WriteCursor scan(
+            KeyRangeView range = KeyRangeView::all()) {
+            requireFunctional();
+            ensureCursorTree();
+            return makeCursor<true>(*session_, cursorLifetime_, range);
         }
 
         void put(ByteView key, ByteView value) {
@@ -184,6 +279,8 @@ public:
             values_.insert_or_assign(std::move(ownedKey), std::move(ownedValue));
             ++keyMutations_;
             changed_ = true;
+            detail::invalidateWriteCursors(cursorLifetime_);
+            treeCurrent_ = false;
         }
 
         [[nodiscard]] bool erase(ByteView key) {
@@ -197,6 +294,8 @@ public:
             values_.erase(found);
             ++keyMutations_;
             changed_ = true;
+            detail::invalidateWriteCursors(cursorLifetime_);
+            treeCurrent_ = false;
             return true;
         }
 
@@ -219,6 +318,7 @@ public:
             requireFunctional();
             if (!changed_) {
                 active_ = false;
+                detail::invalidateCursors(cursorLifetime_);
                 releaseTransaction(*session_, *lifetime_, true);
                 return;
             }
@@ -231,6 +331,7 @@ public:
                 if (session_->state.load(std::memory_order_acquire) ==
                     DatabaseState::RecoveryRequired) {
                     active_ = false;
+                    detail::invalidateCursors(cursorLifetime_);
                     releaseTransaction(*session_, *lifetime_, true);
                 }
                 throw;
@@ -238,11 +339,13 @@ public:
                 if (session_->state.load(std::memory_order_acquire) ==
                     DatabaseState::RecoveryRequired) {
                     active_ = false;
+                    detail::invalidateCursors(cursorLifetime_);
                     releaseTransaction(*session_, *lifetime_, true);
                 }
                 throw;
             }
             active_ = false;
+            detail::invalidateCursors(cursorLifetime_);
             releaseTransaction(*session_, *lifetime_, true);
         }
 
@@ -251,6 +354,7 @@ public:
                 return;
             }
             active_ = false;
+            detail::invalidateCursors(cursorLifetime_);
             if (lifetime_ &&
                 !lifetime_->invalidated.load(std::memory_order_acquire)) {
                 releaseTransaction(*session_, *lifetime_, true);
@@ -270,14 +374,21 @@ public:
         WriteTransaction(
             Session& session,
             std::shared_ptr<ChildLifetime> lifetime,
-            OrderedKeyValues values)
+            OrderedKeyValues values,
+            MutableTree tree,
+            std::shared_ptr<CursorLifetime> cursorLifetime)
             : session_(&session),
               lifetime_(std::move(lifetime)),
               values_(std::move(values)),
+              tree_(std::move(tree)),
+              cursorLifetime_(std::move(cursorLifetime)),
               thread_(std::this_thread::get_id()),
               keyMutations_(0),
               changed_(false),
-              active_(true) {}
+              treeCurrent_(true),
+              active_(true) {
+            cursorLifetime_->root = &tree_;
+        }
 
         void requireFunctional() const {
             if (!active()) {
@@ -303,12 +414,26 @@ public:
             }
         }
 
+        void ensureCursorTree() {
+            if (treeCurrent_) {
+                return;
+            }
+            auto rebuilt = detail::buildMutableTree<Limits>(
+                values_, session_->allocator);
+            tree_ = std::move(rebuilt);
+            cursorLifetime_->root = &tree_;
+            treeCurrent_ = true;
+        }
+
         Session* session_;
         std::shared_ptr<ChildLifetime> lifetime_;
         OrderedKeyValues values_;
+        MutableTree tree_;
+        std::shared_ptr<CursorLifetime> cursorLifetime_;
         std::thread::id thread_;
         std::uint64_t keyMutations_;
         bool changed_;
+        bool treeCurrent_;
         bool active_;
     };
 
@@ -430,12 +555,20 @@ public:
         }
         auto snapshot = detail::makeOrderedKeyValues(session.allocator);
         snapshot = session.values;
+        auto tree = snapshotCursorTree(session);
+        auto cursorLifetime = detail::makeOrderedCursorLifetime(
+            tree, lifetime_, session.allocator);
         const auto generation = session.opened.format.generation;
         session.activeReadGenerations.insert(generation);
         ++session.activeReaders;
         ++session.liveTransactions;
         return ReadTransaction{
-            session, lifetime_, std::move(snapshot), generation};
+            session,
+            lifetime_,
+            std::move(snapshot),
+            std::move(tree),
+            std::move(cursorLifetime),
+            generation};
     }
 
     [[nodiscard]] WriteTransaction beginWrite() {
@@ -462,8 +595,13 @@ public:
             requireOpen(session);
         }
         OrderedKeyValues snapshot = detail::makeOrderedKeyValues(session.allocator);
+        MutableTree tree{session.allocator};
+        std::shared_ptr<CursorLifetime> cursorLifetime;
         try {
             snapshot = session.values;
+            tree = snapshotCursorTree(session);
+            cursorLifetime = detail::makeOrderedCursorLifetime(
+                tree, lifetime_, session.allocator);
         } catch (...) {
             --session.waitingWriters;
             ++session.servingWriterTicket;
@@ -473,7 +611,12 @@ public:
         --session.waitingWriters;
         session.writerActive = true;
         ++session.liveTransactions;
-        return WriteTransaction{session, lifetime_, std::move(snapshot)};
+        return WriteTransaction{
+            session,
+            lifetime_,
+            std::move(snapshot),
+            std::move(tree),
+            std::move(cursorLifetime)};
     }
 
     [[nodiscard]] Result<WriteTransaction, WriterBusy> tryBeginWrite() {
@@ -489,11 +632,19 @@ public:
         }
         auto snapshot = detail::makeOrderedKeyValues(session.allocator);
         snapshot = session.values;
+        auto tree = snapshotCursorTree(session);
+        auto cursorLifetime = detail::makeOrderedCursorLifetime(
+            tree, lifetime_, session.allocator);
         ++session.nextWriterTicket;
         session.writerActive = true;
         ++session.liveTransactions;
         return Result<WriteTransaction, WriterBusy>::success(
-            WriteTransaction{session, lifetime_, std::move(snapshot)});
+            WriteTransaction{
+                session,
+                lifetime_,
+                std::move(snapshot),
+                std::move(tree),
+                std::move(cursorLifetime)});
     }
 
     void close() {
@@ -541,6 +692,25 @@ private:
         detail::OpenedDatabase opened;
         OrderedKeyValues values;
     };
+
+    [[nodiscard]] static MutableTree snapshotCursorTree(
+        const Session& session) {
+        return detail::cloneMutableTree(
+            *session.cursorTree, session.allocator);
+    }
+
+    template<bool Write>
+    [[nodiscard]] static detail::OrderedCursor<Allocator, Limits, Write> makeCursor(
+        Session& session,
+        const std::shared_ptr<CursorLifetime>& lifetime,
+        KeyRangeView range) {
+        return detail::makeOrderedCursor<Allocator, Limits, Write>(
+            lifetime,
+            range.kind_,
+            range.lower_,
+            range.upper_,
+            session.allocator);
+    }
 
     [[nodiscard]] static std::shared_ptr<ChildLifetime> makeChildLifetime(
         const Allocator& allocator) {
@@ -695,7 +865,9 @@ private:
                 *session.file,
                 session.opened,
                 *session.providers,
-                session.allocator);
+                session.allocator,
+                nullptr,
+                session.cursorTree.get());
             session.values = std::move(values);
             session.valuesLoaded = true;
         } catch (const DatabaseError& error) {

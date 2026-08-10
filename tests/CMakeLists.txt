@@ -43,6 +43,21 @@ add_test(
     NAME miare.ordered_keyspace_growth
     COMMAND miare_ordered_keyspace_growth_test)
 set_tests_properties(miare.ordered_keyspace_growth PROPERTIES TIMEOUT 30)
+
+add_executable(miare_ordered_traversal_test ordered_traversal_test.cpp)
+target_link_libraries(
+    miare_ordered_traversal_test PRIVATE miare::miare Threads::Threads)
+add_test(NAME miare.ordered_traversal COMMAND miare_ordered_traversal_test)
+set_tests_properties(miare.ordered_traversal PROPERTIES TIMEOUT 30)
+add_test(
+    NAME miare.ordered_traversal_live_child_assertion
+    COMMAND
+        ${CMAKE_COMMAND}
+        -DTEST_EXECUTABLE=$<TARGET_FILE:miare_ordered_traversal_test>
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/cursor_live_child_assertion_test.cmake)
+set_tests_properties(
+    miare.ordered_traversal_live_child_assertion PROPERTIES TIMEOUT 10)
+
 if(MIARE_BUILD_QUALIFICATION_TESTS)
     add_test(
         NAME miare.ordered_keyspace_qualification
