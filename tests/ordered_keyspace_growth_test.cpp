@@ -562,7 +562,8 @@ void authenticatedExtentBoundariesRejectPhysicalTampering() {
 
 void randomizedHistoriesMatchAnIndependentReferenceModel(
     unsigned seedCount,
-    unsigned operationsPerSeed) {
+    unsigned operationsPerSeed,
+    unsigned maxOperationsPerTransaction) {
     using Model = std::map<std::vector<std::byte>, std::vector<std::byte>>;
     for (unsigned seed = 0; seed != seedCount; ++seed) {
         auto file = std::make_unique<miare::testing::MemoryDurableFile>();
@@ -605,7 +606,7 @@ void randomizedHistoriesMatchAnIndependentReferenceModel(
             auto candidate = model;
             auto write = database->beginWrite();
             const auto operationCount = std::min(
-                1U + nextRandom() % 9U,
+                1U + nextRandom() % maxOperationsPerTransaction,
                 operationsPerSeed - completedOperations);
             for (unsigned operation = 0;
                  operation != operationCount;
@@ -673,5 +674,6 @@ int main(int argc, char** argv) {
         std::string_view{argv[1]} == "--qualification";
     randomizedHistoriesMatchAnIndependentReferenceModel(
         fullQualification ? 1'000U : 32U,
-        fullQualification ? 10'000U : 512U);
+        fullQualification ? 10'000U : 512U,
+        fullQualification ? 100U : 9U);
 }
