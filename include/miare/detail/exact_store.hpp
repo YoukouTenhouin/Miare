@@ -20,6 +20,8 @@
 
 namespace miare::detail {
 
+inline constexpr std::uint32_t maximumTreeLevel = 64;
+
 struct UnsignedBytesLess {
     using is_transparent = void;
 
@@ -92,6 +94,7 @@ struct DatabaseSession {
     Allocator allocator;
     OpenedDatabase opened;
     OrderedKeyValues<Allocator> values;
+    bool valuesLoaded = false;
     std::multiset<
         std::uint64_t,
         std::less<std::uint64_t>,
@@ -887,7 +890,8 @@ template<class Limits, class Allocator>
     reachable.push_back(reference);
     const auto level = readLittleEndian<std::uint32_t>(
         payload, PageLayout::level);
-    if ((expectedLevel && level != *expectedLevel) || level > 64 ||
+    if ((expectedLevel && level != *expectedLevel) ||
+        level > maximumTreeLevel ||
         (kind == leafKind) != (level == 0)) {
         throwCorrupt("allocator index level is invalid");
     }
@@ -1148,6 +1152,76 @@ inline void subtractRetainedReferences(
 }
 
 template<class Limits, class Allocator>
+[[nodiscard]] inline std::optional<StoredBytes<Allocator>>
+shallowValidateAllocatorRoot(
+    DurableFile& file,
+    OpenedDatabase& opened,
+    ProviderSet& providers,
+    const Allocator& allocator) {
+    const auto root = decodeExtentReference(opened.format.allocatorRoot);
+    if (opened.format.generation == 1) {
+        if (!root.null()) {
+            throwCorrupt("initial database has allocator state");
+        }
+        return std::nullopt;
+    }
+    if (root.null()) {
+        throwCorrupt("committed generation has no allocator root");
+    }
+    if (root.creationGeneration != opened.format.generation) {
+        throwCorrupt("allocator root generation does not match publication");
+    }
+    auto payload = readAuthenticatedExtent<Limits>(
+        file,
+        root,
+        14,
+        AllocatorRootLayout::bytes,
+        opened,
+        providers,
+        allocator,
+        false);
+    const auto freeRoot = decodeExtentReference(
+        ByteView{payload}.subspan(AllocatorRootLayout::freeRoot, 32));
+    const auto retiredRoot = decodeExtentReference(
+        ByteView{payload}.subspan(AllocatorRootLayout::retiredRoot, 32));
+    const auto freeBlocks = readLittleEndian<std::uint64_t>(
+        payload, AllocatorRootLayout::freeBlocks);
+    const auto retiredBlocks = readLittleEndian<std::uint64_t>(
+        payload, AllocatorRootLayout::retiredBlocks);
+    if (!matches(payload, AllocatorRootLayout::magic, "MIAREALC") ||
+        readLittleEndian<std::uint16_t>(
+            payload, AllocatorRootLayout::version) != 1 ||
+        readLittleEndian<std::uint16_t>(
+            payload, AllocatorRootLayout::flags) != 0 ||
+        readLittleEndian<std::uint32_t>(
+            payload, AllocatorRootLayout::length) !=
+            AllocatorRootLayout::bytes ||
+        readLittleEndian<std::uint64_t>(
+            payload, AllocatorRootLayout::generation) !=
+            opened.format.generation ||
+        readLittleEndian<std::uint64_t>(
+            payload, AllocatorRootLayout::highWaterBlocks) !=
+            opened.format.highWaterBytes / Limits::allocationQuantumBytes ||
+        freeRoot.null() != (freeBlocks == 0) ||
+        retiredRoot.null() != (retiredBlocks == 0) ||
+        !allZero(
+            payload,
+            AllocatorRootLayout::reserved,
+            AllocatorRootLayout::bytes)) {
+        throwCorrupt("allocator root is noncanonical");
+    }
+    validateExtentReference<Limits>(
+        freeRoot,
+        opened.format.generation,
+        opened.format.highWaterBytes);
+    validateExtentReference<Limits>(
+        retiredRoot,
+        opened.format.generation,
+        opened.format.highWaterBytes);
+    return payload;
+}
+
+template<class Limits, class Allocator>
 inline void loadAllocatorReferences(
     DurableFile& file,
     OpenedDatabase& opened,
@@ -1157,30 +1231,12 @@ inline void loadAllocatorReferences(
     ExtentRuns<Allocator>* loadedFreeRuns = nullptr,
     ExtentRuns<Allocator>* loadedRetiredRuns = nullptr) {
     const auto root = decodeExtentReference(opened.format.allocatorRoot);
-    if (opened.format.generation == 1) {
-        if (!root.null()) {
-            throwCorrupt("initial database has allocator state");
-        }
+    auto payloadResult = shallowValidateAllocatorRoot<Limits>(
+        file, opened, providers, allocator);
+    if (!payloadResult) {
         return;
     }
-    if (root.null()) {
-        throwCorrupt("committed generation has no allocator root");
-    }
-    auto payload = readAuthenticatedExtent<Limits>(
-        file, root, 14, AllocatorRootLayout::bytes,
-        opened, providers, allocator, false);
-    if (!matches(payload, AllocatorRootLayout::magic, "MIAREALC") ||
-        readLittleEndian<std::uint16_t>(payload, AllocatorRootLayout::version) != 1 ||
-        readLittleEndian<std::uint16_t>(payload, AllocatorRootLayout::flags) != 0 ||
-        readLittleEndian<std::uint32_t>(payload, AllocatorRootLayout::length) !=
-            AllocatorRootLayout::bytes ||
-        readLittleEndian<std::uint64_t>(payload, AllocatorRootLayout::generation) !=
-            opened.format.generation ||
-        readLittleEndian<std::uint64_t>(payload, AllocatorRootLayout::highWaterBlocks) !=
-            opened.format.highWaterBytes / Limits::allocationQuantumBytes ||
-        !allZero(payload, AllocatorRootLayout::reserved, AllocatorRootLayout::bytes)) {
-        throwCorrupt("allocator root is noncanonical");
-    }
+    auto payload = std::move(*payloadResult);
     reachable.push_back(root);
     const auto addIndex = [&](std::size_t offset, bool retired) {
         const auto reference = decodeExtentReference(ByteView{payload}.subspan(offset, 32));
@@ -1309,6 +1365,9 @@ inline OrderedPageBounds<Allocator> loadOrderedPage(
     OrderedKeyValues<Allocator>& values,
     ExtentReferences<Allocator>* reachable = nullptr,
     MutableTreeNode<Allocator>* mutableNode = nullptr) {
+    if (expectedLevel > maximumTreeLevel) {
+        throwCorrupt("ordered tree level exceeds the supported depth");
+    }
     using ByteAllocator = typename std::allocator_traits<Allocator>::
         template rebind_alloc<std::byte>;
     validateOrderedPageReference<Limits>(
@@ -1478,6 +1537,80 @@ inline OrderedPageBounds<Allocator> loadOrderedPage(
 }
 
 template<class Limits, class Allocator>
+[[nodiscard]] inline std::optional<std::uint32_t> shallowValidateOrderedRoot(
+    DurableFile& file,
+    OpenedDatabase& opened,
+    ProviderSet& providers,
+    const Allocator& allocator) {
+    const auto reference = decodeExtentReference(opened.format.orderedRoot);
+    if (reference.null()) {
+        return std::nullopt;
+    }
+    validateOrderedPageReference<Limits>(
+        reference, opened.format.generation, opened.format.highWaterBytes);
+    std::array<std::byte, ExtentLayout::bytes> preamble{};
+    file.readExactAt(
+        reference.blockIndex * Limits::allocationQuantumBytes,
+        preamble);
+    const auto kind = readLittleEndian<std::uint16_t>(
+        preamble, ExtentLayout::unitKind);
+    if (kind != 1 && kind != 2) {
+        throwCorrupt("ordered root role is invalid");
+    }
+    const auto payload = readAuthenticatedExtent<Limits>(
+        file,
+        reference,
+        kind,
+        std::nullopt,
+        opened,
+        providers,
+        allocator);
+    const auto type = readLittleEndian<std::uint16_t>(
+        payload, PageLayout::type);
+    const auto level = readLittleEndian<std::uint32_t>(
+        payload, PageLayout::level);
+    const auto count = readLittleEndian<std::uint32_t>(
+        payload, PageLayout::entryCount);
+    const auto prefixLength = readLittleEndian<std::uint32_t>(
+        payload, PageLayout::prefixLength);
+    const auto slotsOffset = readLittleEndian<std::uint32_t>(
+        payload, PageLayout::slotsOffset);
+    const auto entriesOffset = readLittleEndian<std::uint32_t>(
+        payload, PageLayout::entriesOffset);
+    const auto usedLength = readLittleEndian<std::uint32_t>(
+        payload, PageLayout::usedLength);
+    if (!matches(payload, PageLayout::magic, "MIAREPG\0") ||
+        readLittleEndian<std::uint16_t>(payload, PageLayout::version) != 1 ||
+        (type != 1 && type != 2) || kind != (type == 1 ? 2 : 1) ||
+        readLittleEndian<std::uint32_t>(
+            payload, PageLayout::headerLength) != PageLayout::bytes ||
+        readLittleEndian<std::uint32_t>(payload, PageLayout::role) != 1 ||
+        level > maximumTreeLevel || (type == 1) != (level == 0) ||
+        (type == 1 && count == 0) || (type == 2 && count == 0) ||
+        readLittleEndian<std::uint32_t>(payload, PageLayout::flags) != 0 ||
+        slotsOffset != PageLayout::bytes + prefixLength ||
+        entriesOffset != slotsOffset + static_cast<std::uint64_t>(count) * 8 ||
+        usedLength < entriesOffset || usedLength > payload.size() ||
+        !allZero(payload, PageLayout::reserved, PageLayout::bytes) ||
+        (type == 1 &&
+         !allZero(payload, PageLayout::leftmostChild, PageLayout::reserved))) {
+        throwCorrupt("ordered root header is invalid");
+    }
+    if (type == 2) {
+        const auto leftmost = decodeExtentReference(
+            ByteView{payload}.subspan(PageLayout::leftmostChild, 32));
+        if (leftmost.null()) {
+            throwCorrupt("ordered internal root has a null child");
+        }
+        validateOrderedPageReference<Limits>(
+            leftmost,
+            opened.format.generation,
+            opened.format.highWaterBytes);
+    }
+    return level;
+}
+
+template<class Limits, class Allocator>
 [[nodiscard]] inline OrderedKeyValues<Allocator> loadExactValues(
     DurableFile& file,
     OpenedDatabase& opened,
@@ -1487,28 +1620,13 @@ template<class Limits, class Allocator>
     MutableTreeNode<Allocator>* mutableRoot = nullptr) {
     auto values = makeOrderedKeyValues(allocator);
     const auto reference = decodeExtentReference(opened.format.orderedRoot);
-    if (reference.null()) {
+    const auto level = shallowValidateOrderedRoot<Limits>(
+        file, opened, providers, allocator);
+    if (!level) {
         return values;
     }
-    validateOrderedPageReference<Limits>(
-        reference, opened.format.generation, opened.format.highWaterBytes);
-    std::array<std::byte, ExtentLayout::bytes> preamble{};
-    file.readExactAt(reference.blockIndex * Limits::allocationQuantumBytes, preamble);
-    const auto kind = readLittleEndian<std::uint16_t>(preamble, ExtentLayout::unitKind);
-    if (kind != 1 && kind != 2) {
-        throwCorrupt("ordered root role is invalid");
-    }
-    auto rootPayload = readAuthenticatedExtent<Limits>(
-        file, reference, kind, std::nullopt, opened, providers, allocator);
-    if (readLittleEndian<std::uint16_t>(
-            rootPayload, PageLayout::type) == 2 &&
-        readLittleEndian<std::uint32_t>(
-            rootPayload, PageLayout::entryCount) == 0) {
-        throwCorrupt("ordered internal root has no separators");
-    }
-    const auto level = readLittleEndian<std::uint32_t>(rootPayload, PageLayout::level);
     (void)loadOrderedPage<Limits>(
-        file, reference, level, opened, providers, allocator, values, reachable,
+        file, reference, *level, opened, providers, allocator, values, reachable,
         mutableRoot);
     return values;
 }
@@ -2326,6 +2444,7 @@ inline void commitExact(
         session.opened.format.orderedRoot = encodeExtentReference(root);
         session.opened.format.allocatorRoot = encodeExtentReference(allocatorRoot);
         session.values = std::move(committedValues);
+        session.valuesLoaded = true;
     }
 }
 

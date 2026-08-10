@@ -456,13 +456,11 @@ public:
                 AuthenticationFailed{});
         }
         auto openedDatabase = std::move(opened).value();
-        detail::ExtentReferences<Allocator> reachable{
-            typename std::allocator_traits<Allocator>::
-                template rebind_alloc<detail::ExtentReference>{allocator}};
-        auto values = detail::loadExactValues<Limits>(
-            *file, openedDatabase, providers, allocator, &reachable);
-        detail::loadAllocatorReferences<Limits>(
-            *file, openedDatabase, providers, allocator, reachable);
+        (void)detail::shallowValidateOrderedRoot<Limits>(
+            *file, openedDatabase, providers, allocator);
+        (void)detail::shallowValidateAllocatorRoot<Limits>(
+            *file, openedDatabase, providers, allocator);
+        auto values = detail::makeOrderedKeyValues(allocator);
         std::unique_ptr<detail::DurableFile> durableFile = std::move(file);
         return Result<Database<Allocator, Limits>, AuthenticationFailed>::success(
             Database<Allocator, Limits>{

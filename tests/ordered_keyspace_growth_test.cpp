@@ -235,6 +235,72 @@ void postCreateGenerationsPublishAllocatorState() {
     requireCorruptImage(std::move(corrupted));
 }
 
+void allocatorRootCreationGenerationMatchesPublication() {
+    auto file = std::make_unique<miare::testing::MemoryDurableFile>();
+    auto* fileView = file.get();
+    auto database = miare::testing::DatabaseAccess::create(
+        std::move(file),
+        miare::EncryptionKeyView{encryptionKey},
+        deterministicProviders(80));
+    auto write = database.beginWrite();
+    write.put(keyFor(1), valueFor(1));
+    write.commit();
+    const auto image = fileView->bytes();
+    database.close();
+
+    auto providers = deterministicProviders(81);
+    miare::testing::MemoryDurableFile persisted;
+    persisted.replaceStableBytes(image);
+    auto openedResult = miare::detail::openFormat<miare::DefaultLimits>(
+        persisted,
+        miare::EncryptionKeyView{encryptionKey},
+        providers);
+    assert(openedResult.hasValue());
+    auto opened = std::move(openedResult).value();
+    const auto root = miare::detail::decodeExtentReference(
+        opened.format.allocatorRoot);
+    auto payload = miare::detail::readAuthenticatedExtent<
+        miare::DefaultLimits>(
+            persisted,
+            root,
+            14,
+            miare::detail::AllocatorRootLayout::bytes,
+            opened,
+            providers,
+            std::allocator<std::byte>{},
+            false);
+    auto rewritten = miare::detail::prepareAuthenticatedExtent<
+        miare::DefaultLimits>(
+            payload,
+            14,
+            opened.format.generation - 1,
+            root.blockIndex,
+            opened,
+            providers,
+            std::allocator<std::byte>{},
+            false);
+    persisted.writeExactAt(
+        root.blockIndex * miare::DefaultLimits::allocationQuantumBytes,
+        rewritten.bytes);
+    opened.format.allocatorRoot =
+        miare::detail::encodeExtentReference(rewritten.reference);
+    miare::detail::ExtentReferences<std::allocator<std::byte>> reachable;
+    (void)miare::detail::loadExactValues<miare::DefaultLimits>(
+        persisted,
+        opened,
+        providers,
+        std::allocator<std::byte>{},
+        &reachable);
+    expectDatabaseError(miare::Errc::Corrupt, [&] {
+        miare::detail::loadAllocatorReferences<miare::DefaultLimits>(
+            persisted,
+            opened,
+            providers,
+            std::allocator<std::byte>{},
+            reachable);
+    });
+}
+
 void allocatorPartitionValidationScalesWithRunCount() {
     using Allocator = std::allocator<std::byte>;
     constexpr auto commonBlocks = miare::detail::commonRegionBytes /
@@ -590,16 +656,108 @@ void mutationsRewriteOnlyAffectedTreePaths() {
     database.close();
 }
 
+void excessiveOrderedDepthIsRejectedBeforeTraversal() {
+    auto file = std::make_unique<miare::testing::MemoryDurableFile>();
+    auto* fileView = file.get();
+    auto database = miare::testing::DatabaseAccess::create(
+        std::move(file),
+        miare::EncryptionKeyView{encryptionKey},
+        deterministicProviders(82));
+    auto write = database.beginWrite();
+    write.put(keyFor(1), valueFor(1));
+    write.commit();
+    const auto image = fileView->bytes();
+    database.close();
+
+    auto providers = deterministicProviders(83);
+    miare::testing::MemoryDurableFile persisted;
+    persisted.replaceStableBytes(image);
+    auto openedResult = miare::detail::openFormat<miare::DefaultLimits>(
+        persisted,
+        miare::EncryptionKeyView{encryptionKey},
+        providers);
+    assert(openedResult.hasValue());
+    auto opened = std::move(openedResult).value();
+    const auto root = miare::detail::decodeExtentReference(
+        opened.format.orderedRoot);
+    persisted.clearOperations();
+    auto values = miare::detail::makeOrderedKeyValues(
+        std::allocator<std::byte>{});
+    expectDatabaseError(miare::Errc::Corrupt, [&] {
+        (void)miare::detail::loadOrderedPage<miare::DefaultLimits>(
+            persisted,
+            root,
+            65,
+            opened,
+            providers,
+            std::allocator<std::byte>{},
+            values);
+    });
+    assert(persisted.operations().empty());
+}
+
+void openPerformsOnlyShallowRootValidation() {
+    auto file = std::make_unique<miare::testing::MemoryDurableFile>();
+    auto* fileView = file.get();
+    auto database = miare::testing::DatabaseAccess::create(
+        std::move(file),
+        miare::EncryptionKeyView{encryptionKey},
+        deterministicProviders(84));
+    auto write = database.beginWrite();
+    for (std::uint16_t index = 0; index != 120; ++index) {
+        write.put(keyFor(index), valueFor(index));
+    }
+    write.commit();
+    const auto image = fileView->bytes();
+    database.close();
+
+    auto reopenedFile =
+        std::make_unique<miare::testing::MemoryDurableFile>();
+    auto* reopenedView = reopenedFile.get();
+    reopenedFile->replaceStableBytes(image);
+    auto reopenedResult = miare::testing::DatabaseAccess::open(
+        std::move(reopenedFile),
+        miare::EncryptionKeyView{encryptionKey},
+        deterministicProviders(85));
+    assert(reopenedResult.hasValue());
+    auto reopened = std::move(reopenedResult).value();
+    const auto openReads = std::count_if(
+        reopenedView->operations().begin(),
+        reopenedView->operations().end(),
+        [](const auto& operation) {
+            return operation.kind ==
+                miare::testing::DurableFileOperationKind::Read;
+        });
+    assert(openReads <= 6);
+    auto read = reopened.beginRead();
+    assert(read.get(keyFor(119)).has_value());
+    const auto accessReads = std::count_if(
+        reopenedView->operations().begin(),
+        reopenedView->operations().end(),
+        [](const auto& operation) {
+            return operation.kind ==
+                miare::testing::DurableFileOperationKind::Read;
+        });
+    assert(accessReads > openReads);
+    read.end();
+    reopened.close();
+}
+
 void requireCorruptImage(std::vector<std::byte> image) {
     auto file = std::make_unique<miare::testing::MemoryDurableFile>();
     file->replaceStableBytes(std::move(image));
     try {
-        auto opened = miare::testing::DatabaseAccess::open(
+        auto openedResult = miare::testing::DatabaseAccess::open(
             std::move(file),
             miare::EncryptionKeyView{encryptionKey},
             deterministicProviders(8));
-        (void)opened;
-        assert(false);
+        assert(openedResult.hasValue());
+        auto opened = std::move(openedResult).value();
+        expectDatabaseError(miare::Errc::Corrupt, [&] {
+            (void)opened.beginRead();
+        });
+        assert(opened.state() == miare::DatabaseState::RecoveryRequired);
+        opened.close();
     } catch (const miare::DatabaseError& error) {
         assert(error.code() == miare::Errc::Corrupt);
     }
@@ -982,11 +1140,14 @@ int main(int argc, char** argv) {
     overflowValuesRemainAtomicAcrossReplacementAndDeletion();
     supersededStorageIsSafelyReused();
     postCreateGenerationsPublishAllocatorState();
+    allocatorRootCreationGenerationMatchesPublication();
     allocatorPartitionValidationScalesWithRunCount();
     retainedReferenceSubtractionScalesWithExtentCount();
     heldSnapshotsDelayRetiredExtentReuse();
     fragmentedAllocatorIndexesGrowBeyondOnePage();
     mutationsRewriteOnlyAffectedTreePaths();
+    excessiveOrderedDepthIsRejectedBeforeTraversal();
+    openPerformsOnlyShallowRootValidation();
     authenticatedExtentBoundariesRejectPhysicalTampering();
     malformedTreeMetadataReturnsCorrupt();
     corruptionDuringCommitInvalidatesTheSession();

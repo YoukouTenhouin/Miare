@@ -424,6 +424,7 @@ public:
         auto& session = requireSession();
         std::lock_guard lock{session.mutex};
         requireOpen(session);
+        ensureValuesLoaded(session, *lifetime_);
         if (session.activeReaders == session.maxReaders) {
             throw DatabaseError{Errc::ResourceLimit, "reader limit reached"};
         }
@@ -441,6 +442,7 @@ public:
         auto& session = requireSession();
         std::unique_lock lock{session.mutex};
         requireOpen(session);
+        ensureValuesLoaded(session, *lifetime_);
         if (session.nextWriterTicket == std::numeric_limits<std::uint64_t>::max()) {
             throw DatabaseError{Errc::ResourceLimit, "writer admission sequence exhausted"};
         }
@@ -478,6 +480,7 @@ public:
         auto& session = requireSession();
         std::lock_guard lock{session.mutex};
         requireOpen(session);
+        ensureValuesLoaded(session, *lifetime_);
         if (session.writerActive || session.waitingWriters != 0) {
             return Result<WriteTransaction, WriterBusy>::failure(WriterBusy{});
         }
@@ -652,26 +655,54 @@ private:
         session.opened.keys.blob.erase();
     }
 
+    static void enterRecoveryAfterCorruptionLocked(
+        Session& session,
+        ChildLifetime& lifetime) noexcept {
+        session.state.store(
+            DatabaseState::RecoveryRequired,
+            std::memory_order_release);
+        session.liveTransactions = 0;
+        session.activeReaders = 0;
+        session.activeReadGenerations.clear();
+        session.writerActive = false;
+        lifetime.invalidated.store(true, std::memory_order_release);
+        session.writerAvailable.notify_all();
+    }
+
     static void enterRecoveryAfterCorruption(
         Session& session,
         ChildLifetime& lifetime) noexcept {
         try {
             std::lock_guard lock{session.mutex};
-            session.state.store(
-                DatabaseState::RecoveryRequired,
-                std::memory_order_release);
-            session.liveTransactions = 0;
-            session.activeReaders = 0;
-            session.activeReadGenerations.clear();
-            session.writerActive = false;
-            lifetime.invalidated.store(true, std::memory_order_release);
-            session.writerAvailable.notify_all();
+            enterRecoveryAfterCorruptionLocked(session, lifetime);
         } catch (...) {
             session.state.store(
                 DatabaseState::RecoveryRequired,
                 std::memory_order_release);
             lifetime.invalidated.store(true, std::memory_order_release);
             session.writerAvailable.notify_all();
+        }
+    }
+
+    static void ensureValuesLoaded(
+        Session& session,
+        ChildLifetime& lifetime) {
+        if (session.valuesLoaded) {
+            return;
+        }
+        try {
+            auto values = detail::loadExactValues<Limits>(
+                *session.file,
+                session.opened,
+                *session.providers,
+                session.allocator);
+            session.values = std::move(values);
+            session.valuesLoaded = true;
+        } catch (const DatabaseError& error) {
+            if (error.code() == Errc::Corrupt) {
+                enterRecoveryAfterCorruptionLocked(session, lifetime);
+            }
+            throw;
         }
     }
 
@@ -748,13 +779,11 @@ private:
                 AuthenticationFailed{});
         }
         auto openedDatabase = std::move(opened).value();
-        detail::ExtentReferences<Allocator> reachable{
-            typename std::allocator_traits<Allocator>::
-                template rebind_alloc<detail::ExtentReference>{allocator}};
-        auto values = detail::loadExactValues<Limits>(
-            *file, openedDatabase, providers, allocator, &reachable);
-        detail::loadAllocatorReferences<Limits>(
-            *file, openedDatabase, providers, allocator, reachable);
+        (void)detail::shallowValidateOrderedRoot<Limits>(
+            *file, openedDatabase, providers, allocator);
+        (void)detail::shallowValidateAllocatorRoot<Limits>(
+            *file, openedDatabase, providers, allocator);
+        auto values = detail::makeOrderedKeyValues(allocator);
         return Result<ValidatedFile, AuthenticationFailed>::success(ValidatedFile{
             std::move(file),
             std::move(openedDatabase),
