@@ -3,6 +3,10 @@ cmake_minimum_required(VERSION 3.25)
 project(miare VERSION 0.1.0 LANGUAGES CXX)
 
 option(MIARE_BUILD_TESTS "Build the Miare test suite" ${PROJECT_IS_TOP_LEVEL})
+option(
+    MIARE_BUILD_QUALIFICATION_TESTS
+    "Register long-running backend qualification tests"
+    OFF)
 
 add_library(miare INTERFACE)
 add_library(miare::miare ALIAS miare)

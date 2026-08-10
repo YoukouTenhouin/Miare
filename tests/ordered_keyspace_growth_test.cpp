@@ -337,7 +337,7 @@ void fragmentedAllocatorIndexesGrowBeyondOnePage() {
     auto file = std::make_unique<miare::testing::MemoryDurableFile>();
     auto* fileView = file.get();
     miare::CreateOptions options;
-    options.compression = miare::Compression::None;
+    options.compression = miare::Compression::ZStd;
     auto database = miare::testing::DatabaseAccess::create(
         std::move(file),
         miare::EncryptionKeyView{encryptionKey},

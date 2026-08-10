@@ -304,9 +304,12 @@ void commitUsesTwoDurabilityBarriersAndFailsStop() {
     write.put(bytes("key"), bytes("value"));
     write.commit();
     const auto& operations = fileView->operations();
-    assert(operations.size() >= 5);
-    assert(operations[0].kind == miare::testing::DurableFileOperationKind::Write);
-    assert(operations[0].offset == miare::detail::commonRegionBytes);
+    assert(operations.size() >= 6);
+    assert(operations[0].kind ==
+        miare::testing::DurableFileOperationKind::Resize);
+    assert(operations[1].kind ==
+        miare::testing::DurableFileOperationKind::Write);
+    assert(operations[1].offset == miare::detail::commonRegionBytes);
     const auto firstBarrier = std::find_if(
         operations.begin(), operations.end(), [](const auto& operation) {
             return operation.kind ==
@@ -316,7 +319,9 @@ void commitUsesTwoDurabilityBarriersAndFailsStop() {
     assert(std::all_of(
         operations.begin(), firstBarrier, [](const auto& operation) {
             return operation.kind ==
-                miare::testing::DurableFileOperationKind::Write;
+                    miare::testing::DurableFileOperationKind::Resize ||
+                operation.kind ==
+                    miare::testing::DurableFileOperationKind::Write;
         }));
     assert(std::next(firstBarrier)->kind ==
         miare::testing::DurableFileOperationKind::Write);

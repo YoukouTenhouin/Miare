@@ -1971,92 +1971,154 @@ inline void commitExact(
         }
         retiredRuns = std::move(coalesced);
     };
-    constexpr std::size_t metadataConvergenceLimit = 64;
+    constexpr auto metadataPageBlocks = std::max<std::uint64_t>(
+        16U * 1024U, Limits::allocationQuantumBytes) /
+        Limits::allocationQuantumBytes;
+    ExtentReferences<Allocator> metadataReservations{
+        typename std::allocator_traits<Allocator>::
+            template rebind_alloc<ExtentReference>{session.allocator}};
+    ExtentRuns<Allocator> representedFreeRuns{
+        freeRuns.begin(), freeRuns.end(), RunAllocator{session.allocator}};
+    const auto coalesceFreeRuns = [&](ExtentRuns<Allocator> runs) {
+        std::sort(
+            runs.begin(), runs.end(),
+            [](const auto& left, const auto& right) {
+                return left.start < right.start;
+            });
+        ExtentRuns<Allocator> coalesced{RunAllocator{session.allocator}};
+        for (const auto& run : runs) {
+            if (run.count == 0) {
+                continue;
+            }
+            if (!coalesced.empty() &&
+                coalesced.back().start + coalesced.back().count == run.start) {
+                coalesced.back().count += run.count;
+            } else {
+                coalesced.push_back(run);
+            }
+        }
+        return coalesced;
+    };
+    const auto sameRuns = [](const auto& left, const auto& right) {
+        return left.size() == right.size() && std::equal(
+            left.begin(), left.end(), right.begin(),
+            [](const auto& lhs, const auto& rhs) {
+                return lhs.start == rhs.start && lhs.count == rhs.count &&
+                    lhs.retirementGeneration == rhs.retirementGeneration;
+            });
+    };
+    const auto removeFreeRange = [&](std::uint64_t start, std::uint64_t count) {
+        ExtentRuns<Allocator> remaining{RunAllocator{session.allocator}};
+        const auto end = start + count;
+        for (const auto& run : freeRuns) {
+            const auto runEnd = run.start + run.count;
+            if (end <= run.start || start >= runEnd) {
+                remaining.push_back(run);
+                continue;
+            }
+            if (start > run.start) {
+                remaining.push_back(ExtentRun{
+                    run.start, start - run.start});
+            }
+            if (end < runEnd) {
+                remaining.push_back(ExtentRun{end, runEnd - end});
+            }
+        }
+        freeRuns = std::move(remaining);
+    };
+    constexpr std::size_t metadataConvergenceLimit = 128;
     bool metadataConverged = false;
     for (std::size_t attempt = 0;
          attempt != metadataConvergenceLimit && !metadataConverged;
          ++attempt) {
-        const auto attemptBegin = extents.size();
+        StoredVector<PreparedExactExtent<Allocator>, Allocator> metadataExtents{
+            ExtentAllocator{session.allocator}};
+        std::size_t reservation = 0;
+        const auto prepareReserved = [&](ByteView decoded, std::uint16_t kind) {
+            const auto blockIndex = reservation < metadataReservations.size()
+                ? metadataReservations[reservation].blockIndex
+                : nextBlock;
+            ++reservation;
+            return prepareAuthenticatedExtent<Limits>(
+                decoded,
+                kind,
+                generation,
+                blockIndex,
+                session.opened,
+                *session.providers,
+                session.allocator);
+        };
         retiredRoot = persistAllocatorIndex<Limits>(
             retiredRuns,
             true,
             session.allocator,
-            prepareExtent,
-            extents);
-        eraseEmptyRuns();
-        if (freeRuns.empty()) {
-            freeRoot = {};
-            metadataConverged = true;
-            break;
-        }
-
-        const auto freeDraftBegin = extents.size();
-        (void)persistAllocatorIndex<Limits>(
-            freeRuns,
+            prepareReserved,
+            metadataExtents);
+        freeRoot = persistAllocatorIndex<Limits>(
+            representedFreeRuns,
             false,
             session.allocator,
-            prepareExtent,
-            extents);
-        ExtentReferences<Allocator> reservations{
-            typename std::allocator_traits<Allocator>::
-                template rebind_alloc<ExtentReference>{session.allocator}};
-        for (auto index = freeDraftBegin; index != extents.size(); ++index) {
-            reservations.push_back(extents[index].reference);
+            prepareReserved,
+            metadataExtents);
+        if (reservation > metadataReservations.size()) {
+            freeRuns.assign(
+                representedFreeRuns.begin(), representedFreeRuns.end());
+            while (metadataReservations.size() != reservation) {
+                const auto blockIndex = allocateBlocks(metadataPageBlocks);
+                metadataReservations.push_back(ExtentReference{
+                    blockIndex, metadataPageBlocks, 0, generation});
+            }
+            eraseEmptyRuns();
+            representedFreeRuns.assign(freeRuns.begin(), freeRuns.end());
+            continue;
         }
-        extents.resize(freeDraftBegin);
-        eraseEmptyRuns();
-        if (!freeRuns.empty()) {
-            std::size_t reservation = 0;
-            bool compatible = true;
-            const auto prepareReserved = [&](ByteView decoded, std::uint16_t kind) {
-                const auto blockIndex = reservation < reservations.size()
-                    ? reservations[reservation].blockIndex
-                    : nextBlock;
-                auto prepared = prepareAuthenticatedExtent<Limits>(
-                    decoded,
-                    kind,
-                    generation,
-                    blockIndex,
-                    session.opened,
-                    *session.providers,
-                    session.allocator);
-                if (reservation >= reservations.size() ||
-                    prepared.reference.blockCount !=
-                        reservations[reservation].blockCount) {
-                    compatible = false;
-                }
-                ++reservation;
-                return prepared;
-            };
-            freeRoot = persistAllocatorIndex<Limits>(
-                freeRuns,
-                false,
-                session.allocator,
-                prepareReserved,
-                extents);
-            compatible = compatible && reservation == reservations.size();
-            if (compatible) {
-                metadataConverged = true;
-                break;
+        if (reservation < metadataReservations.size()) {
+            for (auto index = reservation;
+                 index != metadataReservations.size();
+                 ++index) {
+                removeFreeRange(
+                    metadataReservations[index].blockIndex,
+                    metadataReservations[index].blockCount);
+                retiredRuns.push_back(ExtentRun{
+                    metadataReservations[index].blockIndex,
+                    metadataReservations[index].blockCount,
+                    generation});
+            }
+            metadataReservations.resize(reservation);
+            coalesceRetiredRuns();
+            representedFreeRuns.assign(freeRuns.begin(), freeRuns.end());
+            continue;
+        }
+        for (const auto& reserved : metadataReservations) {
+            removeFreeRange(reserved.blockIndex, reserved.blockCount);
+        }
+        ExtentRuns<Allocator> finalFreeRuns{
+            freeRuns.begin(), freeRuns.end(), RunAllocator{session.allocator}};
+        for (std::size_t index = 0; index != reservation; ++index) {
+            const auto usedBlocks = metadataExtents[index].reference.blockCount;
+            if (usedBlocks > metadataPageBlocks) {
+                throw DatabaseError{
+                    Errc::ResourceLimit,
+                    "allocator metadata exceeds its full-page reservation"};
+            }
+            if (usedBlocks != metadataPageBlocks) {
+                finalFreeRuns.push_back(ExtentRun{
+                    metadataReservations[index].blockIndex + usedBlocks,
+                    metadataPageBlocks - usedBlocks});
             }
         }
-
-        ExtentReferences<Allocator> abandoned{
-            typename std::allocator_traits<Allocator>::
-                template rebind_alloc<ExtentReference>{session.allocator}};
-        for (auto index = attemptBegin; index != freeDraftBegin; ++index) {
-            abandoned.push_back(extents[index].reference);
+        finalFreeRuns = coalesceFreeRuns(std::move(finalFreeRuns));
+        if (!sameRuns(finalFreeRuns, representedFreeRuns)) {
+            freeRuns = finalFreeRuns;
+            representedFreeRuns = std::move(finalFreeRuns);
+            continue;
         }
-        abandoned.insert(
-            abandoned.end(), reservations.begin(), reservations.end());
-        extents.resize(attemptBegin);
-        for (const auto& reference : abandoned) {
-            retiredRuns.push_back(ExtentRun{
-                reference.blockIndex,
-                reference.blockCount,
-                generation});
-        }
-        coalesceRetiredRuns();
+        freeRuns = std::move(finalFreeRuns);
+        extents.insert(
+            extents.end(),
+            std::make_move_iterator(metadataExtents.begin()),
+            std::make_move_iterator(metadataExtents.end()));
+        metadataConverged = true;
     }
     if (!metadataConverged) {
         throw DatabaseError{
@@ -2132,6 +2194,7 @@ inline void commitExact(
 
     bool publicationStarted = false;
     try {
+        session.file->resize(highWaterBytes);
         for (const auto& extent : extents) {
             session.file->writeExactAt(
                 extent.reference.blockIndex * Limits::allocationQuantumBytes,
