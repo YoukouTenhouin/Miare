@@ -656,6 +656,44 @@ void mutationsRewriteOnlyAffectedTreePaths() {
     database.close();
 }
 
+void eraseAllThenInsertRebuildsAnEmptyInternalRoot() {
+    auto file = std::make_unique<miare::testing::MemoryDurableFile>();
+    auto* fileView = file.get();
+    auto database = miare::testing::DatabaseAccess::create(
+        std::move(file),
+        miare::EncryptionKeyView{encryptionKey},
+        deterministicProviders(86));
+    auto seed = database.beginWrite();
+    for (std::uint16_t index = 0; index != 120; ++index) {
+        seed.put(keyFor(index), valueFor(index));
+    }
+    seed.commit();
+    assert(orderedRootKind(fileView->bytes(), 87) == 1);
+
+    auto replace = database.beginWrite();
+    for (std::uint16_t index = 0; index != 120; ++index) {
+        assert(replace.erase(keyFor(index)));
+    }
+    for (std::uint16_t index = 200; index != 204; ++index) {
+        replace.put(keyFor(index), valueFor(index));
+    }
+    replace.commit();
+    assert(orderedRootKind(fileView->bytes(), 88) == 2);
+
+    auto read = database.beginRead();
+    for (std::uint16_t index = 0; index != 120; ++index) {
+        assert(!read.get(keyFor(index)).has_value());
+    }
+    for (std::uint16_t index = 200; index != 204; ++index) {
+        const auto value = read.get(keyFor(index));
+        assert(value.has_value());
+        assert(std::equal(
+            value->begin(), value->end(), valueFor(index).begin()));
+    }
+    read.end();
+    database.close();
+}
+
 void excessiveOrderedDepthIsRejectedBeforeTraversal() {
     auto file = std::make_unique<miare::testing::MemoryDurableFile>();
     auto* fileView = file.get();
@@ -1146,6 +1184,7 @@ int main(int argc, char** argv) {
     heldSnapshotsDelayRetiredExtentReuse();
     fragmentedAllocatorIndexesGrowBeyondOnePage();
     mutationsRewriteOnlyAffectedTreePaths();
+    eraseAllThenInsertRebuildsAnEmptyInternalRoot();
     excessiveOrderedDepthIsRejectedBeforeTraversal();
     openPerformsOnlyShallowRootValidation();
     authenticatedExtentBoundariesRejectPhysicalTampering();

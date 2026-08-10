@@ -2047,6 +2047,12 @@ inline void commitExact(
                 (void)eraseMutableTree(mutableRoot, key);
             }
         }
+        if (mutableRoot.level != 0 && mutableRoot.children.empty()) {
+            mutableRoot.reference = {};
+            mutableRoot.minimumKey.clear();
+            mutableRoot.level = 0;
+            mutableRoot.dirty = true;
+        }
         for (const auto& [key, value] : values) {
             const auto old = session.values.find(key);
             if (old == session.values.end() || old->second != value) {
