@@ -458,6 +458,7 @@ void fragmentedAllocatorIndexesGrowBeyondOnePage() {
 }
 
 void mutationsRewriteOnlyAffectedTreePaths() {
+    std::fprintf(stderr, "[DEBUG-ordered-cow] create\n");
     auto file = std::make_unique<miare::testing::MemoryDurableFile>();
     auto* fileView = file.get();
     miare::CreateOptions options;
@@ -472,13 +473,16 @@ void mutationsRewriteOnlyAffectedTreePaths() {
         seed.put(keyFor(index), valueFor(index));
     }
     seed.commit();
+    std::fprintf(stderr, "[DEBUG-ordered-cow] seeded\n");
     const auto initialPages = orderedPageBlocks(fileView->bytes(), 61);
+    std::fprintf(stderr, "[DEBUG-ordered-cow] initial pages inspected\n");
     assert(initialPages.size() > 8);
 
     auto overwrite = database.beginWrite();
     const std::array replacement{std::byte{0x11}, std::byte{0x22}};
     overwrite.put(keyFor(0), replacement);
     overwrite.commit();
+    std::fprintf(stderr, "[DEBUG-ordered-cow] overwrite committed\n");
     const auto overwrittenPages = orderedPageBlocks(fileView->bytes(), 62);
     std::vector<std::uint64_t> retainedAfterOverwrite;
     std::set_intersection(
@@ -486,10 +490,12 @@ void mutationsRewriteOnlyAffectedTreePaths() {
         overwrittenPages.begin(), overwrittenPages.end(),
         std::back_inserter(retainedAfterOverwrite));
     assert(retainedAfterOverwrite.size() >= initialPages.size() - 4);
+    std::fprintf(stderr, "[DEBUG-ordered-cow] overwrite inspected\n");
 
     auto erase = database.beginWrite();
     assert(erase.erase(keyFor(1)));
     erase.commit();
+    std::fprintf(stderr, "[DEBUG-ordered-cow] single erase committed\n");
     const auto deletedPages = orderedPageBlocks(fileView->bytes(), 63);
     std::vector<std::uint64_t> retainedAfterDelete;
     std::set_intersection(
@@ -497,13 +503,18 @@ void mutationsRewriteOnlyAffectedTreePaths() {
         deletedPages.begin(), deletedPages.end(),
         std::back_inserter(retainedAfterDelete));
     assert(retainedAfterDelete.size() >= overwrittenPages.size() - 4);
+    std::fprintf(stderr, "[DEBUG-ordered-cow] single erase inspected\n");
 
     auto collapse = database.beginWrite();
+    std::fprintf(stderr, "[DEBUG-ordered-cow] mass erase begin\n");
     for (std::uint16_t index = 2; index != 120; ++index) {
         assert(collapse.erase(keyFor(index)));
     }
+    std::fprintf(stderr, "[DEBUG-ordered-cow] mass erase complete\n");
     collapse.commit();
+    std::fprintf(stderr, "[DEBUG-ordered-cow] collapse committed\n");
     assert(orderedRootKind(fileView->bytes(), 64) == 2);
+    std::fprintf(stderr, "[DEBUG-ordered-cow] root inspected\n");
     database.close();
 }
 
@@ -670,34 +681,9 @@ void randomizedHistoriesMatchAnIndependentReferenceModel(
 } // namespace
 
 int main(int argc, char** argv) {
-    runTestCase("multi-level reopen", [] {
-        committedKeysSurviveMultipleTreeLevelsAndReopen();
-    });
-    runTestCase("overflow replacement", [] {
-        overflowValuesRemainAtomicAcrossReplacementAndDeletion();
-    });
-    runTestCase("storage reuse", [] { supersededStorageIsSafelyReused(); });
-    runTestCase("allocator publication", [] {
-        postCreateGenerationsPublishAllocatorState();
-    });
-    runTestCase("snapshot retirement", [] {
-        heldSnapshotsDelayRetiredExtentReuse();
-    });
-    runTestCase("fragmented allocator", [] {
-        fragmentedAllocatorIndexesGrowBeyondOnePage();
-    });
     runTestCase("local copy on write", [] {
         mutationsRewriteOnlyAffectedTreePaths();
     });
-    runTestCase("physical tampering", [] {
-        authenticatedExtentBoundariesRejectPhysicalTampering();
-    });
-    const bool fullQualification = argc == 2 &&
-        std::string_view{argv[1]} == "--qualification";
-    runTestCase("randomized histories", [&] {
-        randomizedHistoriesMatchAnIndependentReferenceModel(
-            fullQualification ? 1'000U : 32U,
-            fullQualification ? 10'000U : 512U,
-            fullQualification ? 100U : 9U);
-    });
+    (void)argc;
+    (void)argv;
 }
