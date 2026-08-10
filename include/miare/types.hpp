@@ -3,12 +3,14 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <compare>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <type_traits>
 #include <vector>
@@ -38,6 +40,15 @@ enum class DatabaseState : std::uint8_t {
     Closed,
 };
 
+enum class RecoveryCause : std::uint8_t {
+    None = 0,
+    CommitKnownUnpublished,
+    CommitOutcomeUnknown,
+    MaintenancePersistenceFailed,
+    ClosePersistenceFailed,
+    ConfirmedCorruption,
+};
+
 struct CreateOptions {
     StorageBackend storageBackend = StorageBackend::BTree;
     Compression compression = Compression::ZStd;
@@ -55,6 +66,38 @@ struct WriteTransactionStats {
     std::uint64_t blobBytesWritten = 0;
     std::uint64_t estimatedFileGrowthBytes = 0;
     std::uint32_t openBlobWriters = 0;
+};
+
+struct DiagnosticsSnapshot {
+    DatabaseState state = DatabaseState::Closed;
+    std::uint32_t formatVersion = 0;
+    std::uint32_t capacityProfileVersion = 0;
+    std::array<std::byte, 32> capacityProfileDigest{};
+    StorageBackend storageBackend = StorageBackend::BTree;
+    Compression compression = Compression::None;
+    EncryptionSuite encryptionSuite =
+        EncryptionSuite::XChaCha20Poly1305Ietf;
+    std::uint64_t lastCommittedGeneration = 0;
+    std::uint64_t mainFileBytes = 0;
+    std::uint64_t sidecarBytes = 0;
+    std::uint64_t liveBytes = 0;
+    std::uint64_t reclaimableBytes = 0;
+    std::uint64_t snapshotRetainedBytes = 0;
+    std::uint64_t cacheCapacityBytes = 0;
+    std::uint64_t cacheUsedBytes = 0;
+    std::uint64_t cachePinnedBytes = 0;
+    std::uint64_t cacheEvictions = 0;
+    std::uint32_t activeReaders = 0;
+    std::optional<std::uint64_t> oldestReaderGeneration;
+    std::chrono::milliseconds oldestReaderAge{0};
+    bool writerActive = false;
+    bool maintenanceActive = false;
+    std::uint32_t writerQueueDepth = 0;
+    bool recoveryRequired = false;
+    RecoveryCause recoveryCause = RecoveryCause::None;
+    bool rejectedInactivePublication = false;
+    std::uint64_t abandonedTailBytes = 0;
+    std::uint64_t capacityFailureCount = 0;
 };
 
 class EncryptionKeyView {

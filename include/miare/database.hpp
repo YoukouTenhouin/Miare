@@ -113,7 +113,7 @@ public:
               values_(std::move(other.values_)),
               tree_(std::move(other.tree_)),
               cursorLifetime_(std::move(other.cursorLifetime_)),
-              generation_(other.generation_),
+              readerIdentity_(other.readerIdentity_),
               thread_(other.thread_),
               active_(std::exchange(other.active_, false)) {
             if (cursorLifetime_) {
@@ -158,7 +158,7 @@ public:
             if (lifetime_ &&
                 !lifetime_->invalidated.load(std::memory_order_acquire)) {
                 releaseTransaction(
-                    *session_, *lifetime_, false, generation_);
+                    *session_, *lifetime_, false, readerIdentity_);
             }
             session_ = nullptr;
             lifetime_.reset();
@@ -178,13 +178,13 @@ public:
             OrderedKeyValues values,
             MutableTree tree,
             std::shared_ptr<CursorLifetime> cursorLifetime,
-            std::uint64_t generation)
+            std::uint64_t readerIdentity)
             : session_(&session),
               lifetime_(std::move(lifetime)),
               values_(std::move(values)),
               tree_(std::move(tree)),
               cursorLifetime_(std::move(cursorLifetime)),
-              generation_(generation),
+              readerIdentity_(readerIdentity),
               thread_(std::this_thread::get_id()),
               active_(true) {
             cursorLifetime_->root = &tree_;
@@ -208,7 +208,7 @@ public:
         OrderedKeyValues values_;
         MutableTree tree_;
         std::shared_ptr<CursorLifetime> cursorLifetime_;
-        std::uint64_t generation_;
+        std::uint64_t readerIdentity_;
         std::thread::id thread_;
         bool active_;
     };
@@ -325,6 +325,10 @@ public:
             try {
                 detail::commitExact<Limits>(*session_, values_);
             } catch (const DatabaseError& error) {
+                if (error.code() == Errc::ResourceLimit) {
+                    session_->capacityFailureCount.fetch_add(
+                        1, std::memory_order_relaxed);
+                }
                 if (error.code() == Errc::Corrupt) {
                     enterRecoveryAfterCorruption(*session_, *lifetime_);
                 }
@@ -408,6 +412,8 @@ public:
 
         void requireMutationCapacity() const {
             if (keyMutations_ == Limits::maxKeyMutationsPerTransaction) {
+                session_->capacityFailureCount.fetch_add(
+                    1, std::memory_order_relaxed);
                 throw DatabaseError{
                     Errc::ResourceLimit,
                     "transaction key-mutation limit reached"};
@@ -479,6 +485,7 @@ public:
                 std::move(allocator),
                 std::move(validated.opened),
                 std::move(validated.values),
+                64U * 1024U * 1024U,
                 256};
         } catch (...) {
             std::error_code ignored;
@@ -514,6 +521,7 @@ public:
             std::move(allocator),
             std::move(validated.opened),
             std::move(validated.values),
+            options.cacheCapacityBytes,
             options.maxReaders});
     }
 
@@ -545,12 +553,92 @@ public:
             : DatabaseState::Closed;
     }
 
+    [[nodiscard]] DiagnosticsSnapshot diagnostics() const {
+        auto& session = requireSession();
+        std::lock_guard lock{session.mutex};
+        const auto current = session.state.load(std::memory_order_acquire);
+        if (current != DatabaseState::Open &&
+            current != DatabaseState::RecoveryRequired) {
+            throw ContractError{
+                Errc::InvalidState,
+                "database diagnostics require an open session"};
+        }
+        if (current == DatabaseState::Open) {
+            ensureAllocatorSnapshotLoaded(session, *lifetime_);
+        }
+        std::optional<std::uint64_t> oldestReaderGeneration;
+        std::optional<std::chrono::steady_clock::time_point> oldestReaderStart;
+        for (const auto& [identity, reader] : session.activeReaders) {
+            (void)identity;
+            oldestReaderGeneration = std::min(
+                oldestReaderGeneration.value_or(reader.generation),
+                reader.generation);
+            oldestReaderStart = std::min(
+                oldestReaderStart.value_or(reader.startedAt),
+                reader.startedAt);
+        }
+        const auto oldestReaderAge = oldestReaderStart
+            ? std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - *oldestReaderStart)
+            : std::chrono::milliseconds{0};
+        std::uint64_t reclaimableBlocks = 0;
+        std::uint64_t snapshotRetainedBlocks = 0;
+        for (const auto& [retirementGeneration, blocks] :
+             session.retiredBlocksByGeneration) {
+            if (oldestReaderGeneration &&
+                *oldestReaderGeneration < retirementGeneration) {
+                snapshotRetainedBlocks += blocks;
+            } else {
+                reclaimableBlocks += blocks;
+            }
+        }
+        const auto quantum = Limits::allocationQuantumBytes;
+        DiagnosticsSnapshot result;
+        result.state = current;
+        result.formatVersion = detail::commonFormatVersion;
+        result.capacityProfileVersion = detail::capacityProfileVersion;
+        std::copy_n(
+            session.opened.publication.begin() +
+                detail::PublicationLayout::capacityProfileDigest,
+            result.capacityProfileDigest.size(),
+            result.capacityProfileDigest.begin());
+        result.storageBackend = StorageBackend::BTree;
+        result.compression = session.opened.format.compression;
+        result.encryptionSuite = EncryptionSuite::XChaCha20Poly1305Ietf;
+        result.lastCommittedGeneration = session.opened.format.generation;
+        result.mainFileBytes = session.opened.format.highWaterBytes +
+            session.opened.abandonedTailBytes;
+        result.liveBytes = session.liveBlocks * quantum;
+        result.reclaimableBytes = reclaimableBlocks * quantum;
+        result.snapshotRetainedBytes = snapshotRetainedBlocks * quantum;
+        result.cacheCapacityBytes = session.cacheCapacityBytes;
+        result.activeReaders = static_cast<std::uint32_t>(
+            session.activeReaders.size());
+        result.oldestReaderGeneration = oldestReaderGeneration;
+        result.oldestReaderAge = oldestReaderAge;
+        result.writerActive = session.writerActive;
+        result.writerQueueDepth = static_cast<std::uint32_t>(
+            session.waitingWriters);
+        result.recoveryRequired = current == DatabaseState::RecoveryRequired;
+        result.recoveryCause = session.recoveryCause.load(
+            std::memory_order_acquire);
+        result.rejectedInactivePublication =
+            session.opened.rejectedInactivePublication;
+        result.abandonedTailBytes = session.opened.abandonedTailBytes;
+        result.capacityFailureCount = session.capacityFailureCount.load(
+            std::memory_order_relaxed);
+        return result;
+    }
+
     [[nodiscard]] ReadTransaction beginRead() {
         auto& session = requireSession();
         std::lock_guard lock{session.mutex};
         requireOpen(session);
         ensureValuesLoaded(session, *lifetime_);
-        if (session.activeReaders == session.maxReaders) {
+        if (session.activeReaders.size() == session.maxReaders ||
+            session.nextReaderIdentity ==
+                std::numeric_limits<std::uint64_t>::max()) {
+            session.capacityFailureCount.fetch_add(1, std::memory_order_relaxed);
             throw DatabaseError{Errc::ResourceLimit, "reader limit reached"};
         }
         auto snapshot = detail::makeOrderedKeyValues(session.allocator);
@@ -559,8 +647,10 @@ public:
         auto cursorLifetime = detail::makeOrderedCursorLifetime(
             tree, lifetime_, session.allocator);
         const auto generation = session.opened.format.generation;
-        session.activeReadGenerations.insert(generation);
-        ++session.activeReaders;
+        const auto startedAt = std::chrono::steady_clock::now();
+        const auto readerIdentity = session.nextReaderIdentity++;
+        session.activeReaders.emplace(
+            readerIdentity, detail::ActiveReader{generation, startedAt});
         ++session.liveTransactions;
         return ReadTransaction{
             session,
@@ -568,7 +658,7 @@ public:
             std::move(snapshot),
             std::move(tree),
             std::move(cursorLifetime),
-            generation};
+            readerIdentity};
     }
 
     [[nodiscard]] WriteTransaction beginWrite() {
@@ -576,7 +666,9 @@ public:
         std::unique_lock lock{session.mutex};
         requireOpen(session);
         ensureValuesLoaded(session, *lifetime_);
+        ensureAllocatorSnapshotLoaded(session, *lifetime_);
         if (session.nextWriterTicket == std::numeric_limits<std::uint64_t>::max()) {
+            session.capacityFailureCount.fetch_add(1, std::memory_order_relaxed);
             throw DatabaseError{Errc::ResourceLimit, "writer admission sequence exhausted"};
         }
         const auto ticket = session.nextWriterTicket++;
@@ -624,10 +716,12 @@ public:
         std::lock_guard lock{session.mutex};
         requireOpen(session);
         ensureValuesLoaded(session, *lifetime_);
+        ensureAllocatorSnapshotLoaded(session, *lifetime_);
         if (session.writerActive || session.waitingWriters != 0) {
             return Result<WriteTransaction, WriterBusy>::failure(WriterBusy{});
         }
         if (session.nextWriterTicket == std::numeric_limits<std::uint64_t>::max()) {
+            session.capacityFailureCount.fetch_add(1, std::memory_order_relaxed);
             throw DatabaseError{Errc::ResourceLimit, "writer admission sequence exhausted"};
         }
         auto snapshot = detail::makeOrderedKeyValues(session.allocator);
@@ -725,6 +819,7 @@ private:
         Allocator allocator,
         detail::OpenedDatabase opened,
         OrderedKeyValues values,
+        std::size_t cacheCapacityBytes,
         std::uint32_t maxReaders) {
         SessionAllocator sessionAllocator{allocator};
         return std::allocate_shared<Session>(
@@ -734,6 +829,7 @@ private:
             std::move(allocator),
             std::move(opened),
             std::move(values),
+            cacheCapacityBytes,
             maxReaders);
     }
 
@@ -743,6 +839,7 @@ private:
         Allocator allocator,
         detail::OpenedDatabase opened,
         OrderedKeyValues values,
+        std::size_t cacheCapacityBytes,
         std::uint32_t maxReaders)
         : lifetime_(makeChildLifetime(allocator)),
           session_(makeSession(
@@ -751,9 +848,17 @@ private:
               std::move(allocator),
               std::move(opened),
               std::move(values),
+              cacheCapacityBytes,
               maxReaders)) {}
 
     [[nodiscard]] Session& requireSession() {
+        if (!session_) {
+            throw ContractError{Errc::InvalidState, "database is inert"};
+        }
+        return *session_;
+    }
+
+    [[nodiscard]] Session& requireSession() const {
         if (!session_) {
             throw ContractError{Errc::InvalidState, "database is inert"};
         }
@@ -795,7 +900,7 @@ private:
         Session& session,
         const ChildLifetime& lifetime,
         bool writer,
-        std::optional<std::uint64_t> readGeneration = std::nullopt) noexcept {
+        std::optional<std::uint64_t> readerIdentity = std::nullopt) noexcept {
         try {
             std::lock_guard lock{session.mutex};
             if (lifetime.invalidated.load(std::memory_order_relaxed)) {
@@ -807,12 +912,7 @@ private:
                 ++session.servingWriterTicket;
                 session.writerAvailable.notify_all();
             } else {
-                --session.activeReaders;
-                const auto found = session.activeReadGenerations.find(
-                    *readGeneration);
-                if (found != session.activeReadGenerations.end()) {
-                    session.activeReadGenerations.erase(found);
-                }
+                session.activeReaders.erase(*readerIdentity);
             }
         } catch (...) {
         }
@@ -828,12 +928,14 @@ private:
     static void enterRecoveryAfterCorruptionLocked(
         Session& session,
         ChildLifetime& lifetime) noexcept {
+        session.recoveryCause.store(
+            RecoveryCause::ConfirmedCorruption,
+            std::memory_order_release);
         session.state.store(
             DatabaseState::RecoveryRequired,
             std::memory_order_release);
         session.liveTransactions = 0;
-        session.activeReaders = 0;
-        session.activeReadGenerations.clear();
+        session.activeReaders.clear();
         session.writerActive = false;
         lifetime.invalidated.store(true, std::memory_order_release);
         session.writerAvailable.notify_all();
@@ -846,6 +948,9 @@ private:
             std::lock_guard lock{session.mutex};
             enterRecoveryAfterCorruptionLocked(session, lifetime);
         } catch (...) {
+            session.recoveryCause.store(
+                RecoveryCause::ConfirmedCorruption,
+                std::memory_order_release);
             session.state.store(
                 DatabaseState::RecoveryRequired,
                 std::memory_order_release);
@@ -878,6 +983,30 @@ private:
         }
     }
 
+    static void ensureAllocatorSnapshotLoaded(
+        Session& session,
+        ChildLifetime& lifetime) {
+        if (session.allocatorSnapshotLoaded) {
+            return;
+        }
+        try {
+            auto snapshot = detail::loadAllocatorSnapshot<Limits>(
+                *session.file,
+                session.opened,
+                *session.providers,
+                session.allocator);
+            session.liveBlocks = snapshot.liveBlocks;
+            session.retiredBlocksByGeneration = std::move(
+                snapshot.retiredBlocksByGeneration);
+            session.allocatorSnapshotLoaded = true;
+        } catch (const DatabaseError& error) {
+            if (error.code() == Errc::Corrupt) {
+                enterRecoveryAfterCorruptionLocked(session, lifetime);
+            }
+            throw;
+        }
+    }
+
     static void shutdownSession(
         Session& session,
         ChildLifetime& lifetime) noexcept {
@@ -885,8 +1014,7 @@ private:
             std::lock_guard lock{session.mutex};
             lifetime.invalidated.store(true, std::memory_order_release);
             session.liveTransactions = 0;
-            session.activeReaders = 0;
-            session.activeReadGenerations.clear();
+            session.activeReaders.clear();
             session.waitingWriters = 0;
             session.writerActive = false;
             eraseSessionKeys(session);

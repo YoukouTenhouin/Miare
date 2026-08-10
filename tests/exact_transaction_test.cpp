@@ -348,6 +348,10 @@ void commitUsesTwoDurabilityBarriersAndFailsStop() {
     });
     assert(!failedWrite.active());
     assert(failing.state() == miare::DatabaseState::RecoveryRequired);
+    const auto failedDiagnostics = failing.diagnostics();
+    assert(failedDiagnostics.recoveryCause ==
+           miare::RecoveryCause::CommitKnownUnpublished);
+    assert(failedDiagnostics.abandonedTailBytes > 0);
     assert(!oldSnapshot.contains(bytes("uncommitted")));
     expectDatabaseError(miare::Errc::RecoveryRequired, [&] {
         (void)failing.beginRead();
@@ -368,6 +372,10 @@ void commitUsesTwoDurabilityBarriersAndFailsStop() {
         uncertainWrite.commit();
     });
     assert(!uncertainWrite.active());
+    const auto uncertainDiagnostics = uncertain.diagnostics();
+    assert(uncertainDiagnostics.recoveryCause ==
+           miare::RecoveryCause::CommitOutcomeUnknown);
+    assert(uncertainDiagnostics.abandonedTailBytes > 0);
     uncertainFileView->simulateCrash();
     const auto recoveredOldImage = uncertainFileView->bytes();
     assert(!imageContains(recoveredOldImage, "maybe", "published"));
@@ -1040,6 +1048,7 @@ void openOptionsBoundReaderAdmission(const TemporaryDirectory& temporary) {
     expectDatabaseError(miare::Errc::ResourceLimit, [&] {
         (void)opened.value().beginRead();
     });
+    assert(opened.value().diagnostics().capacityFailureCount == 1);
     reader.end();
     opened.value().close();
 
@@ -1060,6 +1069,68 @@ void openOptionsBoundReaderAdmission(const TemporaryDirectory& temporary) {
             miare::EncryptionKeyView{keyBytes},
             deterministicProviders(14),
             tooLittleCache);
+    });
+}
+
+void diagnosticsExposeSnapshotAndAdmissionPressure() {
+    auto file = std::make_unique<miare::testing::MemoryDurableFile>();
+    miare::CreateOptions options;
+    options.compression = miare::Compression::None;
+    auto database = miare::testing::DatabaseAccess::create(
+        std::move(file),
+        miare::EncryptionKeyView{keyBytes},
+        deterministicProviders(29),
+        options);
+
+    auto seed = database.beginWrite();
+    seed.put(bytes("key"), bytes("first"));
+    seed.commit();
+    auto retained = database.beginRead();
+    requireTest(waitUntil([&] {
+        return database.diagnostics().oldestReaderAge >=
+            std::chrono::milliseconds{1};
+    }));
+
+    auto replace = database.beginWrite();
+    replace.put(bytes("key"), bytes("second"));
+    replace.commit();
+
+    const auto pressured = database.diagnostics();
+    assert(pressured.state == miare::DatabaseState::Open);
+    assert(pressured.formatVersion == 1);
+    assert(pressured.capacityProfileVersion == 1);
+    assert(pressured.storageBackend == miare::StorageBackend::BTree);
+    assert(pressured.compression == miare::Compression::None);
+    assert(pressured.encryptionSuite ==
+           miare::EncryptionSuite::XChaCha20Poly1305Ietf);
+    assert(pressured.lastCommittedGeneration == 3);
+    assert(pressured.activeReaders == 1);
+    assert(pressured.oldestReaderGeneration == 2);
+    assert(pressured.oldestReaderAge >= std::chrono::milliseconds{1});
+    assert(pressured.snapshotRetainedBytes > 0);
+    assert(pressured.reclaimableBytes == 0);
+    assert(pressured.mainFileBytes >= pressured.liveBytes);
+    assert(pressured.sidecarBytes == 0);
+    assert(pressured.cacheCapacityBytes == 64U * 1024U * 1024U);
+    assert(!pressured.writerActive);
+    assert(!pressured.maintenanceActive);
+    assert(pressured.writerQueueDepth == 0);
+    assert(!pressured.recoveryRequired);
+    assert(pressured.recoveryCause == miare::RecoveryCause::None);
+    assert(!pressured.rejectedInactivePublication);
+    assert(pressured.abandonedTailBytes == 0);
+
+    retained.end();
+    const auto released = database.diagnostics();
+    assert(released.activeReaders == 0);
+    assert(!released.oldestReaderGeneration);
+    assert(released.oldestReaderAge == std::chrono::milliseconds{0});
+    assert(released.snapshotRetainedBytes == 0);
+    assert(released.reclaimableBytes >= pressured.snapshotRetainedBytes);
+
+    database.close();
+    expectContractError(miare::Errc::InvalidState, [&] {
+        (void)database.diagnostics();
     });
 }
 
@@ -1162,6 +1233,9 @@ int main(int argc, char** argv) {
     });
     runTestCase("reader admission budget", [&] {
         openOptionsBoundReaderAdmission(temporary);
+    });
+    runTestCase("snapshot pressure diagnostics", [&] {
+        diagnosticsExposeSnapshotAndAdmissionPressure();
     });
     runTestCase("allocator routing", [&] {
         transactionStateUsesTheDatabaseAllocator();
