@@ -30,6 +30,15 @@ target_link_libraries(
     miare_exact_transaction_test PRIVATE miare::miare Threads::Threads)
 add_test(NAME miare.exact_transaction COMMAND miare_exact_transaction_test)
 set_tests_properties(miare.exact_transaction PROPERTIES TIMEOUT 10)
+
+add_executable(
+    miare_ordered_keyspace_growth_test ordered_keyspace_growth_test.cpp)
+target_link_libraries(
+    miare_ordered_keyspace_growth_test PRIVATE miare::miare Threads::Threads)
+add_test(
+    NAME miare.ordered_keyspace_growth
+    COMMAND miare_ordered_keyspace_growth_test)
+set_tests_properties(miare.ordered_keyspace_growth PROPERTIES TIMEOUT 30)
 add_test(
     NAME miare.exact_transaction_live_child_assertion
     COMMAND

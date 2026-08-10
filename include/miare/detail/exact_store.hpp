@@ -193,95 +193,15 @@ inline void validateExtentReference(
     }
 }
 
-template<class Values>
-[[nodiscard]] inline std::size_t commonPrefixLength(const Values& values) {
-    if (values.empty()) {
-        return 0;
-    }
-    const auto& first = values.begin()->first;
-    const auto& last = values.rbegin()->first;
+[[nodiscard]] inline std::size_t commonPrefixLength(
+    ByteView first,
+    ByteView last) noexcept {
     std::size_t length = 0;
     while (length != first.size() && length != last.size() &&
            first[length] == last[length]) {
         ++length;
     }
     return length;
-}
-
-template<class Limits, class Allocator, class Values>
-[[nodiscard]] inline StoredBytes<Allocator> encodeLeafPage(
-    const Values& values,
-    const Allocator& allocator) {
-    constexpr auto ceiling = std::max<std::uint64_t>(
-        16U * 1024U, Limits::allocationQuantumBytes);
-    constexpr auto payloadBytes = ceiling - ExtentLayout::bytes - authenticationTagBytes;
-    using ByteAllocator = typename std::allocator_traits<Allocator>::
-        template rebind_alloc<std::byte>;
-    StoredBytes<Allocator> payload{ByteAllocator{allocator}};
-    payload.resize(static_cast<std::size_t>(payloadBytes));
-    const auto prefixLength = commonPrefixLength(values);
-    std::uint64_t used = PageLayout::bytes + prefixLength + values.size() * 8ULL;
-    for (const auto& [key, value] : values) {
-        if (value.size() > Limits::maxInlineValueBytes) {
-            throw DatabaseError{
-                Errc::ResourceLimit,
-                "overflow values are not available in the exact-operation foundation"};
-        }
-        used += 4ULL + key.size() - prefixLength + 16ULL + value.size();
-    }
-    if (used > payload.size()) {
-        throw DatabaseError{
-            Errc::ResourceLimit,
-            "exact-operation transaction exceeds one v1 leaf page"};
-    }
-
-    MutableByteView output{payload};
-    writeBytes(output, PageLayout::magic, "MIAREPG\0");
-    writeLittleEndian<std::uint16_t>(1, output, PageLayout::version);
-    writeLittleEndian<std::uint16_t>(1, output, PageLayout::type);
-    writeLittleEndian<std::uint32_t>(PageLayout::bytes, output, PageLayout::headerLength);
-    writeLittleEndian<std::uint32_t>(1, output, PageLayout::role);
-    writeLittleEndian<std::uint32_t>(0, output, PageLayout::level);
-    writeLittleEndian<std::uint32_t>(
-        static_cast<std::uint32_t>(values.size()), output, PageLayout::entryCount);
-    writeLittleEndian<std::uint32_t>(
-        static_cast<std::uint32_t>(prefixLength), output, PageLayout::prefixLength);
-    const auto slotsOffset = PageLayout::bytes + prefixLength;
-    const auto entriesOffset = slotsOffset + values.size() * 8U;
-    writeLittleEndian<std::uint32_t>(
-        static_cast<std::uint32_t>(slotsOffset), output, PageLayout::slotsOffset);
-    writeLittleEndian<std::uint32_t>(
-        static_cast<std::uint32_t>(entriesOffset), output, PageLayout::entriesOffset);
-    writeLittleEndian<std::uint32_t>(
-        static_cast<std::uint32_t>(used), output, PageLayout::usedLength);
-    if (!values.empty()) {
-        writeBytes(
-            output,
-            PageLayout::bytes,
-            ByteView{values.begin()->first}.first(prefixLength));
-    }
-
-    std::size_t slot = slotsOffset;
-    std::size_t entry = entriesOffset;
-    for (const auto& [key, value] : values) {
-        const auto suffixLength = key.size() - prefixLength;
-        const auto entryLength = 4U + suffixLength + 16U + value.size();
-        writeLittleEndian<std::uint32_t>(
-            static_cast<std::uint32_t>(entry), output, slot);
-        writeLittleEndian<std::uint32_t>(
-            static_cast<std::uint32_t>(entryLength), output, slot + 4);
-        writeLittleEndian<std::uint32_t>(
-            static_cast<std::uint32_t>(suffixLength), output, entry);
-        writeBytes(output, entry + 4, ByteView{key}.subspan(prefixLength));
-        const auto representation = entry + 4 + suffixLength;
-        output[representation] = std::byte{0};
-        writeLittleEndian<std::uint64_t>(
-            value.size(), output, representation + 8);
-        writeBytes(output, representation + 16, value);
-        slot += 8;
-        entry += entryLength;
-    }
-    return payload;
 }
 
 [[nodiscard]] inline std::array<std::byte, 240> extentAssociatedData(
@@ -313,9 +233,24 @@ struct PreparedExactExtent {
     StoredBytes<Allocator> bytes;
 };
 
-template<class Limits, class Allocator, class Values>
-[[nodiscard]] inline PreparedExactExtent<Allocator> prepareLeafExtent(
-    const Values& values,
+template<class Allocator>
+struct PersistedLeafEntry {
+    const StoredBytes<Allocator>* key;
+    const StoredBytes<Allocator>* value;
+    ExtentReference overflow;
+};
+
+template<class Allocator>
+struct PreparedTreeNode {
+    ExtentReference reference;
+    StoredBytes<Allocator> minimumKey;
+    std::uint32_t level;
+};
+
+template<class Limits, class Allocator>
+[[nodiscard]] inline PreparedExactExtent<Allocator> prepareAuthenticatedExtent(
+    ByteView decoded,
+    std::uint16_t unitKind,
     std::uint64_t generation,
     std::uint64_t blockIndex,
     OpenedDatabase& opened,
@@ -323,13 +258,12 @@ template<class Limits, class Allocator, class Values>
     const Allocator& allocator) {
     using ByteAllocator = typename std::allocator_traits<Allocator>::
         template rebind_alloc<std::byte>;
-    auto decoded = encodeLeafPage<Limits>(values, allocator);
     auto& crypto = ProviderAccess::crypto(providers);
     StoredBytes<Allocator> stored{ByteAllocator{allocator}};
-    stored = decoded;
+    stored.assign(decoded.begin(), decoded.end());
     std::uint32_t flags = 0;
     std::uint32_t codec = 0;
-    if (opened.format.compression == Compression::ZStd) {
+    if (opened.format.compression == Compression::ZStd && !decoded.empty()) {
         auto& compression = ProviderAccess::compression(providers);
         StoredBytes<Allocator> candidate{ByteAllocator{allocator}};
         candidate.resize(compression.compressBound(decoded.size()));
@@ -365,7 +299,7 @@ template<class Limits, class Allocator, class Values>
     MutableByteView output{extent};
     writeBytes(output, ExtentLayout::magic, "MIAREXT\0");
     writeLittleEndian<std::uint16_t>(1, output, ExtentLayout::version);
-    writeLittleEndian<std::uint16_t>(2, output, ExtentLayout::unitKind);
+    writeLittleEndian<std::uint16_t>(unitKind, output, ExtentLayout::unitKind);
     writeLittleEndian<std::uint32_t>(flags, output, ExtentLayout::flags);
     writeLittleEndian<std::uint32_t>(2, output, ExtentLayout::keyDomain);
     writeLittleEndian<std::uint32_t>(codec, output, ExtentLayout::codec);
@@ -394,104 +328,162 @@ template<class Limits, class Allocator, class Values>
     return PreparedExactExtent<Allocator>{reference, std::move(extent)};
 }
 
-template<class Limits, class Allocator>
-[[nodiscard]] inline OrderedKeyValues<Allocator> decodeLeafPage(
-    ByteView payload,
+template<class Limits, class Allocator, class Entries>
+[[nodiscard]] inline std::uint64_t leafUsedLength(
+    const Entries& entries,
+    std::size_t begin,
+    std::size_t end) {
+    const auto prefixLength = commonPrefixLength(
+        *entries[begin].key, *entries[end - 1].key);
+    std::uint64_t used = PageLayout::bytes + prefixLength + (end - begin) * 8ULL;
+    for (auto index = begin; index != end; ++index) {
+        const auto& entry = entries[index];
+        used += 4ULL + entry.key->size() - prefixLength + 16ULL +
+            (entry.overflow.null() ? entry.value->size() : 32ULL);
+    }
+    return used;
+}
+
+template<class Limits, class Allocator, class Entries>
+[[nodiscard]] inline StoredBytes<Allocator> encodeLeafPage(
+    const Entries& entries,
+    std::size_t begin,
+    std::size_t end,
     const Allocator& allocator) {
-    if (payload.size() !=
-            std::max<std::uint64_t>(16U * 1024U, Limits::allocationQuantumBytes) -
-                ExtentLayout::bytes - authenticationTagBytes ||
-        !matches(payload, PageLayout::magic, "MIAREPG\0") ||
-        readLittleEndian<std::uint16_t>(payload, PageLayout::version) != 1 ||
-        readLittleEndian<std::uint16_t>(payload, PageLayout::type) != 1 ||
-        readLittleEndian<std::uint32_t>(payload, PageLayout::headerLength) !=
-            PageLayout::bytes ||
-        readLittleEndian<std::uint32_t>(payload, PageLayout::role) != 1 ||
-        readLittleEndian<std::uint32_t>(payload, PageLayout::level) != 0 ||
-        readLittleEndian<std::uint32_t>(payload, PageLayout::flags) != 0 ||
-        !allZero(payload, PageLayout::leftmostChild, PageLayout::bytes)) {
-        throwCorrupt("ordered leaf header is invalid");
-    }
-    const auto count = readLittleEndian<std::uint32_t>(payload, PageLayout::entryCount);
-    const auto prefixLength =
-        readLittleEndian<std::uint32_t>(payload, PageLayout::prefixLength);
-    const auto slotsOffset = readLittleEndian<std::uint32_t>(
-        payload, PageLayout::slotsOffset);
-    const auto entriesOffset = readLittleEndian<std::uint32_t>(
-        payload, PageLayout::entriesOffset);
-    const auto usedLength = readLittleEndian<std::uint32_t>(
-        payload, PageLayout::usedLength);
-    if (slotsOffset != PageLayout::bytes + prefixLength ||
-        entriesOffset != slotsOffset + static_cast<std::uint64_t>(count) * 8 ||
-        usedLength < entriesOffset || usedLength > payload.size() ||
-        !allZero(payload, usedLength, payload.size())) {
-        throwCorrupt("ordered leaf bounds are invalid");
-    }
-    const auto prefix = payload.subspan(PageLayout::bytes, prefixLength);
-    auto values = makeOrderedKeyValues(allocator);
     using ByteAllocator = typename std::allocator_traits<Allocator>::
         template rebind_alloc<std::byte>;
-    std::size_t expectedEntry = entriesOffset;
-    for (std::uint32_t index = 0; index != count; ++index) {
-        const auto slot = slotsOffset + index * 8U;
-        const auto entryOffset = readLittleEndian<std::uint32_t>(payload, slot);
-        const auto entryLength = readLittleEndian<std::uint32_t>(payload, slot + 4);
-        if (entryOffset != expectedEntry || entryLength < 20 ||
-            entryOffset > usedLength || entryLength > usedLength - entryOffset) {
-            throwCorrupt("ordered leaf slot is invalid");
-        }
-        const auto suffixLength =
-            readLittleEndian<std::uint32_t>(payload, entryOffset);
-        if (suffixLength > entryLength - 20) {
-            throwCorrupt("ordered leaf key suffix is invalid");
-        }
-        const auto representation = entryOffset + 4 + suffixLength;
-        if (payload[representation] != std::byte{0} ||
-            !allZero(payload, representation + 1, representation + 8)) {
-            throwCorrupt("ordered leaf value representation is invalid");
-        }
-        const auto valueLength =
-            readLittleEndian<std::uint64_t>(payload, representation + 8);
-        if (valueLength > Limits::maxInlineValueBytes ||
-            entryLength != 20ULL + suffixLength + valueLength) {
-            throwCorrupt("ordered leaf value length is invalid");
-        }
-        StoredBytes<Allocator> key{ByteAllocator{allocator}};
-        key.assign(prefix.begin(), prefix.end());
-        key.insert(
-            key.end(),
-            payload.begin() + entryOffset + 4,
-            payload.begin() + representation);
-        if (key.size() > Limits::maxKeyBytes ||
-            (index != 0 && !UnsignedBytesLess{}(values.rbegin()->first, key))) {
-            throwCorrupt("ordered leaf keys are not canonical");
-        }
-        StoredBytes<Allocator> value{ByteAllocator{allocator}};
-        value.assign(
-            payload.begin() + representation + 16,
-            payload.begin() + representation + 16 + valueLength);
-        values.emplace(std::move(key), std::move(value));
-        expectedEntry += entryLength;
+    constexpr auto payloadBytes = std::max<std::uint64_t>(
+        16U * 1024U, Limits::allocationQuantumBytes) -
+        ExtentLayout::bytes - authenticationTagBytes;
+    StoredBytes<Allocator> payload{ByteAllocator{allocator}};
+    payload.resize(payloadBytes);
+    const auto prefixLength = commonPrefixLength(
+        *entries[begin].key, *entries[end - 1].key);
+    const auto count = end - begin;
+    const auto used = leafUsedLength<Limits, Allocator>(entries, begin, end);
+    if (used > payload.size()) {
+        throw DatabaseError{Errc::ResourceLimit, "one key/value cannot fit in a leaf page"};
     }
-    if (expectedEntry != usedLength || values.empty() ||
-        commonPrefixLength(values) != prefixLength) {
-        throwCorrupt("ordered leaf image is noncanonical");
+    MutableByteView output{payload};
+    writeBytes(output, PageLayout::magic, "MIAREPG\0");
+    writeLittleEndian<std::uint16_t>(1, output, PageLayout::version);
+    writeLittleEndian<std::uint16_t>(1, output, PageLayout::type);
+    writeLittleEndian<std::uint32_t>(PageLayout::bytes, output, PageLayout::headerLength);
+    writeLittleEndian<std::uint32_t>(1, output, PageLayout::role);
+    writeLittleEndian<std::uint32_t>(0, output, PageLayout::level);
+    writeLittleEndian<std::uint32_t>(count, output, PageLayout::entryCount);
+    writeLittleEndian<std::uint32_t>(prefixLength, output, PageLayout::prefixLength);
+    const auto slotsOffset = PageLayout::bytes + prefixLength;
+    const auto entriesOffset = slotsOffset + count * 8U;
+    writeLittleEndian<std::uint32_t>(slotsOffset, output, PageLayout::slotsOffset);
+    writeLittleEndian<std::uint32_t>(entriesOffset, output, PageLayout::entriesOffset);
+    writeLittleEndian<std::uint32_t>(used, output, PageLayout::usedLength);
+    writeBytes(output, PageLayout::bytes, ByteView{*entries[begin].key}.first(prefixLength));
+    std::size_t slot = slotsOffset;
+    std::size_t position = entriesOffset;
+    for (auto index = begin; index != end; ++index) {
+        const auto& item = entries[index];
+        const auto suffixLength = item.key->size() - prefixLength;
+        const auto payloadLength = item.overflow.null() ? item.value->size() : 32U;
+        const auto entryLength = 4U + suffixLength + 16U + payloadLength;
+        writeLittleEndian<std::uint32_t>(position, output, slot);
+        writeLittleEndian<std::uint32_t>(entryLength, output, slot + 4);
+        writeLittleEndian<std::uint32_t>(suffixLength, output, position);
+        writeBytes(output, position + 4, ByteView{*item.key}.subspan(prefixLength));
+        const auto representation = position + 4 + suffixLength;
+        output[representation] = item.overflow.null() ? std::byte{0} : std::byte{1};
+        writeLittleEndian<std::uint64_t>(item.value->size(), output, representation + 8);
+        if (item.overflow.null()) {
+            writeBytes(output, representation + 16, *item.value);
+        } else {
+            writeBytes(output, representation + 16, encodeExtentReference(item.overflow));
+        }
+        slot += 8;
+        position += entryLength;
     }
-    return values;
+    return payload;
+}
+
+template<class Allocator, class Nodes>
+[[nodiscard]] inline std::uint64_t internalUsedLength(
+    const Nodes& nodes,
+    std::size_t begin,
+    std::size_t end) {
+    const auto prefixLength = end - begin == 1
+        ? 0
+        : commonPrefixLength(nodes[begin + 1].minimumKey, nodes[end - 1].minimumKey);
+    std::uint64_t used = PageLayout::bytes + prefixLength + (end - begin - 1) * 8ULL;
+    for (auto index = begin + 1; index != end; ++index) {
+        used += 4ULL + nodes[index].minimumKey.size() - prefixLength + 32ULL;
+    }
+    return used;
+}
+
+template<class Limits, class Allocator, class Nodes>
+[[nodiscard]] inline StoredBytes<Allocator> encodeInternalPage(
+    const Nodes& nodes,
+    std::size_t begin,
+    std::size_t end,
+    const Allocator& allocator) {
+    using ByteAllocator = typename std::allocator_traits<Allocator>::
+        template rebind_alloc<std::byte>;
+    constexpr auto payloadBytes = std::max<std::uint64_t>(
+        16U * 1024U, Limits::allocationQuantumBytes) -
+        ExtentLayout::bytes - authenticationTagBytes;
+    StoredBytes<Allocator> payload{ByteAllocator{allocator}};
+    payload.resize(payloadBytes);
+    const auto count = end - begin - 1;
+    const auto prefixLength = count == 0
+        ? 0
+        : commonPrefixLength(nodes[begin + 1].minimumKey, nodes[end - 1].minimumKey);
+    const auto used = internalUsedLength<Allocator>(nodes, begin, end);
+    if (used > payload.size()) {
+        throw DatabaseError{Errc::ResourceLimit, "one separator cannot fit in an internal page"};
+    }
+    MutableByteView output{payload};
+    writeBytes(output, PageLayout::magic, "MIAREPG\0");
+    writeLittleEndian<std::uint16_t>(1, output, PageLayout::version);
+    writeLittleEndian<std::uint16_t>(2, output, PageLayout::type);
+    writeLittleEndian<std::uint32_t>(PageLayout::bytes, output, PageLayout::headerLength);
+    writeLittleEndian<std::uint32_t>(1, output, PageLayout::role);
+    writeLittleEndian<std::uint32_t>(nodes[begin].level + 1, output, PageLayout::level);
+    writeLittleEndian<std::uint32_t>(count, output, PageLayout::entryCount);
+    writeLittleEndian<std::uint32_t>(prefixLength, output, PageLayout::prefixLength);
+    const auto slotsOffset = PageLayout::bytes + prefixLength;
+    const auto entriesOffset = slotsOffset + count * 8U;
+    writeLittleEndian<std::uint32_t>(slotsOffset, output, PageLayout::slotsOffset);
+    writeLittleEndian<std::uint32_t>(entriesOffset, output, PageLayout::entriesOffset);
+    writeLittleEndian<std::uint32_t>(used, output, PageLayout::usedLength);
+    writeBytes(output, PageLayout::leftmostChild, encodeExtentReference(nodes[begin].reference));
+    if (count != 0) {
+        writeBytes(output, PageLayout::bytes, ByteView{nodes[begin + 1].minimumKey}.first(prefixLength));
+    }
+    std::size_t slot = slotsOffset;
+    std::size_t position = entriesOffset;
+    for (auto index = begin + 1; index != end; ++index) {
+        const auto suffixLength = nodes[index].minimumKey.size() - prefixLength;
+        const auto entryLength = 4U + suffixLength + 32U;
+        writeLittleEndian<std::uint32_t>(position, output, slot);
+        writeLittleEndian<std::uint32_t>(entryLength, output, slot + 4);
+        writeLittleEndian<std::uint32_t>(suffixLength, output, position);
+        writeBytes(output, position + 4, ByteView{nodes[index].minimumKey}.subspan(prefixLength));
+        writeBytes(output, position + 4 + suffixLength, encodeExtentReference(nodes[index].reference));
+        slot += 8;
+        position += entryLength;
+    }
+    return payload;
 }
 
 template<class Limits, class Allocator>
-[[nodiscard]] inline OrderedKeyValues<Allocator> loadExactValues(
+[[nodiscard]] inline StoredBytes<Allocator> readAuthenticatedExtent(
     DurableFile& file,
+    const ExtentReference& reference,
+    std::uint16_t expectedKind,
+    std::optional<std::uint64_t> expectedDecodedLength,
     OpenedDatabase& opened,
     ProviderSet& providers,
     const Allocator& allocator) {
-    const auto reference = decodeExtentReference(opened.format.orderedRoot);
-    if (reference.null()) {
-        return makeOrderedKeyValues(allocator);
-    }
-    validateExtentReference<Limits>(
-        reference, opened.format.generation, opened.format.highWaterBytes);
+    validateExtentReference<Limits>(reference, opened.format.generation, opened.format.highWaterBytes);
     constexpr auto pageCeiling = std::max<std::uint64_t>(
         16U * 1024U, Limits::allocationQuantumBytes);
     constexpr auto uncompressedBlockCount =
@@ -499,9 +491,10 @@ template<class Limits, class Allocator>
     const auto minimalBlockCount =
         reference.encodedLength / Limits::allocationQuantumBytes +
         (reference.encodedLength % Limits::allocationQuantumBytes != 0);
-    if (reference.blockCount > uncompressedBlockCount ||
+    const bool page = expectedKind == 1 || expectedKind == 2;
+    if ((page && reference.blockCount > uncompressedBlockCount) ||
         reference.blockCount != minimalBlockCount) {
-        throwCorrupt("ordered leaf extent span is noncanonical");
+        throwCorrupt("authenticated extent span is noncanonical");
     }
     using ByteAllocator = typename std::allocator_traits<Allocator>::
         template rebind_alloc<std::byte>;
@@ -512,7 +505,7 @@ template<class Limits, class Allocator>
     const ByteView input{extent};
     if (!matches(input, ExtentLayout::magic, "MIAREXT\0") ||
         readLittleEndian<std::uint16_t>(input, ExtentLayout::version) != 1 ||
-        readLittleEndian<std::uint16_t>(input, ExtentLayout::unitKind) != 2 ||
+        readLittleEndian<std::uint16_t>(input, ExtentLayout::unitKind) != expectedKind ||
         readLittleEndian<std::uint32_t>(input, ExtentLayout::keyDomain) != 2 ||
         readLittleEndian<std::uint32_t>(input, ExtentLayout::preambleLength) !=
             ExtentLayout::bytes ||
@@ -528,7 +521,7 @@ template<class Limits, class Allocator>
         !allZero(input, ExtentLayout::owner, ExtentLayout::nonce) ||
         !allZero(input, ExtentLayout::reserved, ExtentLayout::bytes) ||
         !allZero(input, reference.encodedLength, extent.size())) {
-        throwCorrupt("ordered leaf extent is noncanonical");
+        throwCorrupt("authenticated extent is noncanonical");
     }
     const auto flags = readLittleEndian<std::uint32_t>(input, ExtentLayout::flags);
     const auto codec = readLittleEndian<std::uint32_t>(input, ExtentLayout::codec);
@@ -540,16 +533,26 @@ template<class Limits, class Allocator>
         readLittleEndian<std::uint64_t>(input, ExtentLayout::decodedLength);
     const auto expectedStoredLength = reference.encodedLength -
         ExtentLayout::bytes - authenticationTagBytes;
+    constexpr auto framingBytes =
+        ExtentLayout::bytes + authenticationTagBytes;
+    if (decodedLength > std::numeric_limits<std::uint64_t>::max() -
+            framingBytes - (Limits::allocationQuantumBytes - 1)) {
+        throwCorrupt("authenticated extent decoded length overflows");
+    }
+    const auto uncompressedBlocks =
+        (framingBytes + decodedLength +
+         Limits::allocationQuantumBytes - 1) /
+        Limits::allocationQuantumBytes;
     if (flags > 1 || codec != flags || codecProfile != flags ||
         storedLength != expectedStoredLength ||
-        decodedLength !=
-            pageCeiling - ExtentLayout::bytes - authenticationTagBytes ||
+        (expectedDecodedLength && decodedLength != *expectedDecodedLength) ||
+        (page && decodedLength != pageCeiling - ExtentLayout::bytes - authenticationTagBytes) ||
         (flags == 0 && storedLength != decodedLength) ||
         (flags == 1 &&
          (opened.format.compression != Compression::ZStd ||
           storedLength >= decodedLength ||
-          reference.blockCount >= uncompressedBlockCount))) {
-        throwCorrupt("ordered leaf extent representation is invalid");
+          reference.blockCount >= uncompressedBlocks))) {
+        throwCorrupt("authenticated extent representation is invalid");
     }
     StoredBytes<Allocator> stored{ByteAllocator{allocator}};
     stored.resize(storedLength);
@@ -563,7 +566,7 @@ template<class Limits, class Allocator>
             input.subspan(ExtentLayout::bytes + storedLength, authenticationTagBytes),
             associatedData,
             stored)) {
-        throwCorrupt("ordered leaf authentication failed");
+        throwCorrupt("authenticated extent authentication failed");
     }
     StoredBytes<Allocator> decoded{ByteAllocator{allocator}};
     decoded.resize(decodedLength);
@@ -572,7 +575,188 @@ template<class Limits, class Allocator>
     } else {
         decoded = std::move(stored);
     }
-    return decodeLeafPage<Limits>(decoded, allocator);
+    return decoded;
+}
+
+template<class Limits>
+inline void validateOrderedPageReference(
+    const ExtentReference& reference,
+    std::uint64_t generation,
+    std::uint64_t highWaterBytes) {
+    validateExtentReference<Limits>(reference, generation, highWaterBytes);
+    constexpr auto pageBlocks = std::max<std::uint64_t>(
+        16U * 1024U, Limits::allocationQuantumBytes) /
+        Limits::allocationQuantumBytes;
+    const auto minimalBlocks =
+        reference.encodedLength / Limits::allocationQuantumBytes +
+        (reference.encodedLength % Limits::allocationQuantumBytes != 0);
+    if (reference.blockCount > pageBlocks ||
+        reference.blockCount != minimalBlocks) {
+        throwCorrupt("ordered page extent span is noncanonical");
+    }
+}
+
+template<class Limits, class Allocator>
+inline StoredBytes<Allocator> loadOrderedPage(
+    DurableFile& file,
+    const ExtentReference& reference,
+    std::uint32_t expectedLevel,
+    OpenedDatabase& opened,
+    ProviderSet& providers,
+    const Allocator& allocator,
+    OrderedKeyValues<Allocator>& values) {
+    using ByteAllocator = typename std::allocator_traits<Allocator>::
+        template rebind_alloc<std::byte>;
+    validateOrderedPageReference<Limits>(
+        reference, opened.format.generation, opened.format.highWaterBytes);
+    std::array<std::byte, ExtentLayout::bytes> preamble{};
+    file.readExactAt(reference.blockIndex * Limits::allocationQuantumBytes, preamble);
+    const auto kind = readLittleEndian<std::uint16_t>(preamble, ExtentLayout::unitKind);
+    if (kind != 1 && kind != 2) {
+        throwCorrupt("ordered page role is invalid");
+    }
+    auto payload = readAuthenticatedExtent<Limits>(
+        file, reference, kind, std::nullopt, opened, providers, allocator);
+    const auto type = readLittleEndian<std::uint16_t>(payload, PageLayout::type);
+    const auto level = readLittleEndian<std::uint32_t>(payload, PageLayout::level);
+    if (!matches(payload, PageLayout::magic, "MIAREPG\0") ||
+        readLittleEndian<std::uint16_t>(payload, PageLayout::version) != 1 ||
+        (type != 1 && type != 2) || kind != (type == 1 ? 2 : 1) ||
+        readLittleEndian<std::uint32_t>(payload, PageLayout::headerLength) != PageLayout::bytes ||
+        readLittleEndian<std::uint32_t>(payload, PageLayout::role) != 1 ||
+        level != expectedLevel || (type == 1) != (level == 0) ||
+        readLittleEndian<std::uint32_t>(payload, PageLayout::flags) != 0 ||
+        !allZero(payload, PageLayout::reserved, PageLayout::bytes)) {
+        throwCorrupt("ordered page header is invalid");
+    }
+    const auto count = readLittleEndian<std::uint32_t>(payload, PageLayout::entryCount);
+    const auto prefixLength = readLittleEndian<std::uint32_t>(payload, PageLayout::prefixLength);
+    const auto slotsOffset = readLittleEndian<std::uint32_t>(payload, PageLayout::slotsOffset);
+    const auto entriesOffset = readLittleEndian<std::uint32_t>(payload, PageLayout::entriesOffset);
+    const auto usedLength = readLittleEndian<std::uint32_t>(payload, PageLayout::usedLength);
+    if ((type == 1 && count == 0) || slotsOffset != PageLayout::bytes + prefixLength ||
+        entriesOffset != slotsOffset + static_cast<std::uint64_t>(count) * 8 ||
+        usedLength < entriesOffset || usedLength > payload.size() ||
+        !allZero(payload, usedLength, payload.size()) ||
+        (type == 1 && !allZero(payload, PageLayout::leftmostChild, PageLayout::reserved))) {
+        throwCorrupt("ordered page bounds are invalid");
+    }
+    const auto prefix = ByteView{payload}.subspan(PageLayout::bytes, prefixLength);
+    std::size_t expectedEntry = entriesOffset;
+    StoredBytes<Allocator> firstKey{ByteAllocator{allocator}};
+    std::vector<std::pair<StoredBytes<Allocator>, ExtentReference>> children;
+    if (type == 2) {
+        children.emplace_back(
+            StoredBytes<Allocator>{ByteAllocator{allocator}},
+            decodeExtentReference(ByteView{payload}.subspan(PageLayout::leftmostChild, 32)));
+    }
+    StoredBytes<Allocator> previousKey{ByteAllocator{allocator}};
+    for (std::uint32_t index = 0; index != count; ++index) {
+        const auto slot = slotsOffset + index * 8U;
+        const auto entryOffset = readLittleEndian<std::uint32_t>(payload, slot);
+        const auto entryLength = readLittleEndian<std::uint32_t>(payload, slot + 4);
+        if (entryOffset != expectedEntry || entryLength < (type == 1 ? 20U : 36U) ||
+            entryOffset > usedLength || entryLength > usedLength - entryOffset) {
+            throwCorrupt("ordered page slot is invalid");
+        }
+        const auto suffixLength = readLittleEndian<std::uint32_t>(payload, entryOffset);
+        const auto fixedLength = type == 1 ? 20U : 36U;
+        if (suffixLength > entryLength - fixedLength) {
+            throwCorrupt("ordered page key suffix is invalid");
+        }
+        StoredBytes<Allocator> key{ByteAllocator{allocator}};
+        key.assign(prefix.begin(), prefix.end());
+        key.insert(key.end(), payload.begin() + entryOffset + 4,
+                   payload.begin() + entryOffset + 4 + suffixLength);
+        if (key.size() > Limits::maxKeyBytes ||
+            (index != 0 && !UnsignedBytesLess{}(previousKey, key))) {
+            throwCorrupt("ordered page keys are not canonical");
+        }
+        if (index == 0) {
+            firstKey = key;
+        }
+        previousKey = key;
+        if (type == 1) {
+            const auto representation = entryOffset + 4 + suffixLength;
+            if ((payload[representation] != std::byte{0} && payload[representation] != std::byte{1}) ||
+                !allZero(payload, representation + 1, representation + 8)) {
+                throwCorrupt("ordered leaf value representation is invalid");
+            }
+            const auto valueLength = readLittleEndian<std::uint64_t>(payload, representation + 8);
+            const bool overflow = payload[representation] == std::byte{1};
+            if (valueLength > Limits::maxValueBytes ||
+                overflow != (valueLength > Limits::maxInlineValueBytes) ||
+                entryLength != 20ULL + suffixLength + (overflow ? 32ULL : valueLength)) {
+                throwCorrupt("ordered leaf value length is invalid");
+            }
+            StoredBytes<Allocator> value{ByteAllocator{allocator}};
+            if (overflow) {
+                const auto overflowReference = decodeExtentReference(
+                    ByteView{payload}.subspan(representation + 16, 32));
+                value = readAuthenticatedExtent<Limits>(
+                    file, overflowReference, 11, valueLength,
+                    opened, providers, allocator);
+            } else {
+                value.assign(payload.begin() + representation + 16,
+                             payload.begin() + representation + 16 + valueLength);
+            }
+            if (!values.emplace(std::move(key), std::move(value)).second) {
+                throwCorrupt("ordered leaf key is duplicated");
+            }
+        } else {
+            children.emplace_back(
+                std::move(key),
+                decodeExtentReference(ByteView{payload}.subspan(
+                    entryOffset + 4 + suffixLength, 32)));
+        }
+        expectedEntry += entryLength;
+    }
+    if (expectedEntry != usedLength ||
+        commonPrefixLength(firstKey, previousKey) != prefixLength) {
+        throwCorrupt("ordered page image is noncanonical");
+    }
+    if (type == 1) {
+        return firstKey;
+    }
+    StoredBytes<Allocator> subtreeMinimum{ByteAllocator{allocator}};
+    for (std::size_t index = 0; index != children.size(); ++index) {
+        auto childMinimum = loadOrderedPage<Limits>(
+            file, children[index].second, level - 1,
+            opened, providers, allocator, values);
+        if (index == 0) {
+            subtreeMinimum = std::move(childMinimum);
+        } else if (childMinimum != children[index].first) {
+            throwCorrupt("ordered internal separator is not the right-subtree minimum");
+        }
+    }
+    return subtreeMinimum;
+}
+
+template<class Limits, class Allocator>
+[[nodiscard]] inline OrderedKeyValues<Allocator> loadExactValues(
+    DurableFile& file,
+    OpenedDatabase& opened,
+    ProviderSet& providers,
+    const Allocator& allocator) {
+    auto values = makeOrderedKeyValues(allocator);
+    const auto reference = decodeExtentReference(opened.format.orderedRoot);
+    if (reference.null()) {
+        return values;
+    }
+    validateOrderedPageReference<Limits>(
+        reference, opened.format.generation, opened.format.highWaterBytes);
+    std::array<std::byte, ExtentLayout::bytes> preamble{};
+    file.readExactAt(reference.blockIndex * Limits::allocationQuantumBytes, preamble);
+    const auto kind = readLittleEndian<std::uint16_t>(preamble, ExtentLayout::unitKind);
+    if (kind != 1 && kind != 2) {
+        throwCorrupt("ordered root role is invalid");
+    }
+    auto rootPayload = readAuthenticatedExtent<Limits>(
+        file, reference, kind, std::nullopt, opened, providers, allocator);
+    const auto level = readLittleEndian<std::uint32_t>(rootPayload, PageLayout::level);
+    (void)loadOrderedPage<Limits>(
+        file, reference, level, opened, providers, allocator, values);
+    return values;
 }
 
 struct PreparedPublication {
@@ -654,27 +838,247 @@ inline void commitExact(
         session.opened.format.highWaterBytes / Limits::allocationQuantumBytes;
     auto committedValues = makeOrderedKeyValues(session.allocator);
     committedValues = values;
-    std::optional<PreparedExactExtent<Allocator>> leaf;
+    using LeafEntry = PersistedLeafEntry<Allocator>;
+    using LeafEntryAllocator = typename std::allocator_traits<Allocator>::
+        template rebind_alloc<LeafEntry>;
+    using ExtentAllocator = typename std::allocator_traits<Allocator>::
+        template rebind_alloc<PreparedExactExtent<Allocator>>;
+    using NodeAllocator = typename std::allocator_traits<Allocator>::
+        template rebind_alloc<PreparedTreeNode<Allocator>>;
+    std::vector<LeafEntry, LeafEntryAllocator> entries{
+        LeafEntryAllocator{session.allocator}};
+    std::vector<PreparedExactExtent<Allocator>, ExtentAllocator> extents{
+        ExtentAllocator{session.allocator}};
+    std::vector<PreparedTreeNode<Allocator>, NodeAllocator> nodes{
+        NodeAllocator{session.allocator}};
     ExtentReference root;
-    std::uint64_t highWaterBytes = session.opened.format.highWaterBytes;
-    if (!values.empty()) {
-        leaf = prepareLeafExtent<Limits>(
-            values,
+    auto nextBlock = startBlock;
+    struct FreeRun {
+        std::uint64_t start;
+        std::uint64_t count;
+    };
+    using FreeRunAllocator = typename std::allocator_traits<Allocator>::
+        template rebind_alloc<FreeRun>;
+    std::vector<FreeRun, FreeRunAllocator> freeRuns{
+        FreeRunAllocator{session.allocator}};
+    const auto commonBlocks = commonRegionBytes / Limits::allocationQuantumBytes;
+    if (startBlock > commonBlocks) {
+        using ByteAllocator = typename std::allocator_traits<Allocator>::
+            template rebind_alloc<std::byte>;
+        StoredBytes<Allocator> occupied{ByteAllocator{session.allocator}};
+        occupied.resize(startBlock - commonBlocks);
+        std::array<std::byte, ExtentLayout::bytes> preamble{};
+        for (auto block = commonBlocks; block != startBlock; ++block) {
+            session.file->readExactAt(
+                block * Limits::allocationQuantumBytes, preamble);
+            const ByteView input{preamble};
+            if (!matches(input, ExtentLayout::magic, "MIAREXT\0") ||
+                readLittleEndian<std::uint16_t>(input, ExtentLayout::version) != 1 ||
+                readLittleEndian<std::uint64_t>(input, ExtentLayout::blockIndex) != block ||
+                readLittleEndian<std::uint64_t>(input, ExtentLayout::generation) !=
+                    session.opened.format.generation) {
+                continue;
+            }
+            const auto count = readLittleEndian<std::uint64_t>(
+                input, ExtentLayout::blockCount);
+            const auto encodedLength = readLittleEndian<std::uint64_t>(
+                input, ExtentLayout::encodedLength);
+            if (count == 0 || count > startBlock - block ||
+                encodedLength < ExtentLayout::bytes + authenticationTagBytes ||
+                count > std::numeric_limits<std::uint64_t>::max() /
+                    Limits::allocationQuantumBytes ||
+                encodedLength > count * Limits::allocationQuantumBytes) {
+                continue;
+            }
+            std::fill_n(
+                occupied.begin() + static_cast<std::ptrdiff_t>(block - commonBlocks),
+                static_cast<std::size_t>(count),
+                std::byte{1});
+        }
+        std::uint64_t block = commonBlocks;
+        while (block != startBlock) {
+            if (occupied[block - commonBlocks] != std::byte{0}) {
+                ++block;
+                continue;
+            }
+            const auto runStart = block;
+            while (block != startBlock &&
+                   occupied[block - commonBlocks] == std::byte{0}) {
+                ++block;
+            }
+            freeRuns.push_back(FreeRun{runStart, block - runStart});
+        }
+    }
+    auto allocateBlocks = [&](std::uint64_t count) {
+        for (auto& run : freeRuns) {
+            if (run.count >= count) {
+                const auto allocated = run.start;
+                run.start += count;
+                run.count -= count;
+                return allocated;
+            }
+        }
+        const auto allocated = nextBlock;
+        nextBlock += count;
+        return allocated;
+    };
+    auto prepareExtent = [&](ByteView decoded, std::uint16_t unitKind) {
+        auto prepared = prepareAuthenticatedExtent<Limits>(
+            decoded,
+            unitKind,
             generation,
-            startBlock,
+            nextBlock,
             session.opened,
             *session.providers,
             session.allocator);
-        if (leaf->bytes.size() > Limits::maxFileGrowthPerTransaction ||
-            leaf->bytes.size() > Limits::maxDatabaseBytes ||
-            session.opened.format.highWaterBytes >
-                Limits::maxDatabaseBytes - leaf->bytes.size()) {
-            throw DatabaseError{
-                Errc::ResourceLimit,
-                "commit would exceed the capacity profile"};
+        const auto allocated = allocateBlocks(prepared.reference.blockCount);
+        if (allocated != prepared.reference.blockIndex) {
+            prepared = prepareAuthenticatedExtent<Limits>(
+                decoded,
+                unitKind,
+                generation,
+                allocated,
+                session.opened,
+                *session.providers,
+                session.allocator);
         }
-        root = leaf->reference;
-        highWaterBytes += leaf->bytes.size();
+        return prepared;
+    };
+    if (!values.empty()) {
+        entries.reserve(values.size());
+        for (const auto& [key, value] : values) {
+            ExtentReference overflow;
+            if (value.size() > Limits::maxInlineValueBytes) {
+                auto prepared = prepareExtent(value, 11);
+                overflow = prepared.reference;
+                extents.push_back(std::move(prepared));
+            }
+            entries.push_back(LeafEntry{&key, &value, overflow});
+        }
+
+        constexpr auto pagePayloadBytes = std::max<std::uint64_t>(
+            16U * 1024U, Limits::allocationQuantumBytes) -
+            ExtentLayout::bytes - authenticationTagBytes;
+        using Range = std::pair<std::size_t, std::size_t>;
+        using RangeAllocator = typename std::allocator_traits<Allocator>::
+            template rebind_alloc<Range>;
+        std::vector<Range, RangeAllocator> ranges{
+            RangeAllocator{session.allocator}};
+        std::size_t begin = 0;
+        auto scan = begin + 1;
+        while (scan != entries.size()) {
+            if (leafUsedLength<Limits, Allocator>(
+                    entries, begin, scan + 1) <= pagePayloadBytes) {
+                ++scan;
+                continue;
+            }
+            std::size_t selected = 0;
+            std::uint64_t selectedDifference =
+                std::numeric_limits<std::uint64_t>::max();
+            for (auto boundary = begin + 1; boundary != scan + 1; ++boundary) {
+                const auto left = leafUsedLength<Limits, Allocator>(
+                    entries, begin, boundary);
+                const auto right = leafUsedLength<Limits, Allocator>(
+                    entries, boundary, scan + 1);
+                if (left > pagePayloadBytes || right > pagePayloadBytes) {
+                    continue;
+                }
+                const auto difference = left > right ? left - right : right - left;
+                if (difference < selectedDifference) {
+                    selected = boundary;
+                    selectedDifference = difference;
+                }
+            }
+            if (selected == 0) {
+                throw DatabaseError{
+                    Errc::ResourceLimit,
+                    "ordered leaf overflow has no valid split boundary"};
+            }
+            ranges.emplace_back(begin, selected);
+            begin = selected;
+            ++scan;
+        }
+        ranges.emplace_back(begin, entries.size());
+        for (const auto [rangeBegin, rangeEnd] : ranges) {
+            auto payload = encodeLeafPage<Limits>(
+                entries, rangeBegin, rangeEnd, session.allocator);
+            auto prepared = prepareExtent(payload, 2);
+            auto minimum = StoredBytes<Allocator>{
+                typename std::allocator_traits<Allocator>::
+                    template rebind_alloc<std::byte>{session.allocator}};
+            minimum = *entries[rangeBegin].key;
+            nodes.push_back(PreparedTreeNode<Allocator>{
+                prepared.reference, std::move(minimum), 0});
+            extents.push_back(std::move(prepared));
+        }
+
+        while (nodes.size() != 1) {
+            std::vector<PreparedTreeNode<Allocator>, NodeAllocator> parents{
+                NodeAllocator{session.allocator}};
+            ranges.clear();
+            begin = 0;
+            scan = begin + 1;
+            while (scan != nodes.size()) {
+                if (internalUsedLength<Allocator>(
+                        nodes, begin, scan + 1) <= pagePayloadBytes) {
+                    ++scan;
+                    continue;
+                }
+                std::size_t selected = 0;
+                std::uint64_t selectedDifference =
+                    std::numeric_limits<std::uint64_t>::max();
+                for (auto boundary = begin + 1;
+                     boundary != scan + 1;
+                     ++boundary) {
+                    const auto left = internalUsedLength<Allocator>(
+                        nodes, begin, boundary);
+                    const auto right = internalUsedLength<Allocator>(
+                        nodes, boundary, scan + 1);
+                    if (left > pagePayloadBytes || right > pagePayloadBytes) {
+                        continue;
+                    }
+                    const auto difference =
+                        left > right ? left - right : right - left;
+                    if (difference < selectedDifference) {
+                        selected = boundary;
+                        selectedDifference = difference;
+                    }
+                }
+                if (selected == 0) {
+                    throw DatabaseError{
+                        Errc::ResourceLimit,
+                        "ordered internal overflow has no valid split boundary"};
+                }
+                ranges.emplace_back(begin, selected);
+                begin = selected;
+                ++scan;
+            }
+            ranges.emplace_back(begin, nodes.size());
+            for (const auto [rangeBegin, rangeEnd] : ranges) {
+                auto payload = encodeInternalPage<Limits>(
+                    nodes, rangeBegin, rangeEnd, session.allocator);
+                auto prepared = prepareExtent(payload, 1);
+                auto minimum = StoredBytes<Allocator>{
+                    typename std::allocator_traits<Allocator>::
+                        template rebind_alloc<std::byte>{session.allocator}};
+                minimum = nodes[rangeBegin].minimumKey;
+                parents.push_back(PreparedTreeNode<Allocator>{
+                    prepared.reference,
+                    std::move(minimum),
+                    nodes[rangeBegin].level + 1});
+                extents.push_back(std::move(prepared));
+            }
+            nodes = std::move(parents);
+        }
+        root = nodes.front().reference;
+    }
+    const auto highWaterBytes = nextBlock * Limits::allocationQuantumBytes;
+    const auto growthBytes = highWaterBytes - session.opened.format.highWaterBytes;
+    if (growthBytes > Limits::maxFileGrowthPerTransaction ||
+        highWaterBytes > Limits::maxDatabaseBytes) {
+        throw DatabaseError{
+            Errc::ResourceLimit,
+            "commit would exceed the capacity profile"};
     }
     auto publication = prepareExactPublication<Limits>(
         session.opened,
@@ -684,10 +1088,10 @@ inline void commitExact(
 
     bool publicationStarted = false;
     try {
-        if (leaf) {
+        for (const auto& extent : extents) {
             session.file->writeExactAt(
-                root.blockIndex * Limits::allocationQuantumBytes,
-                leaf->bytes);
+                extent.reference.blockIndex * Limits::allocationQuantumBytes,
+                extent.bytes);
         }
         session.file->stableStorageBarrier();
         publicationStarted = true;

@@ -280,9 +280,7 @@ void rollbackAndValidationPreserveCommittedState(
         miare::DefaultLimits::maxInlineValueBytes + 1,
         std::byte{0x5a});
     invalid.put(bytes("later-overflow"), overflowValue);
-    expectDatabaseError(miare::Errc::ResourceLimit, [&] {
-        invalid.commit();
-    });
+    assert(invalid.get(bytes("later-overflow")));
     assert(invalid.active());
     invalid.rollback();
 
