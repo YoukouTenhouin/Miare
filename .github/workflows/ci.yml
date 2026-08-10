@@ -26,6 +26,58 @@ jobs:
       - name: Test
         run: ctest --test-dir build -C Release --output-on-failure
 
+  linux-sanitizers:
+    runs-on: ubuntu-latest
+    container: registry.opensuse.org/opensuse/tumbleweed:latest
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer:
+          - name: address-undefined
+            flags: -fsanitize=address,undefined -fno-omit-frame-pointer
+            qualification: 'OFF'
+          - name: thread
+            flags: -fsanitize=thread -fno-omit-frame-pointer
+            qualification: 'ON'
+
+    steps:
+      - name: Install build dependencies
+        run: >-
+          zypper --non-interactive install --no-recommends
+          git cmake gcc-c++ libsodium-devel libzstd-devel
+
+      - uses: actions/checkout@v4
+
+      - name: Configure ${{ matrix.sanitizer.name }}
+        run: >-
+          cmake -S . -B build
+          -DMIARE_BUILD_TESTS=ON
+          -DMIARE_BUILD_QUALIFICATION_TESTS=${{ matrix.sanitizer.qualification }}
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_CXX_FLAGS="${{ matrix.sanitizer.flags }}"
+          -DCMAKE_EXE_LINKER_FLAGS="${{ matrix.sanitizer.flags }}"
+
+      - name: Build ${{ matrix.sanitizer.name }}
+        run: cmake --build build --parallel
+
+      - name: Test address and undefined behavior sanitizers
+        if: matrix.sanitizer.name == 'address-undefined'
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Test bounded failure and shutdown races under ThreadSanitizer
+        if: matrix.sanitizer.name == 'thread'
+        run: >-
+          ctest --test-dir build
+          -R '^miare.exact_transaction$'
+          --output-on-failure
+
+      - name: Test 256-reader qualification under ThreadSanitizer
+        if: matrix.sanitizer.name == 'thread'
+        run: >-
+          ctest --test-dir build
+          -R '^miare\.concurrent_snapshot_qualification$'
+          --output-on-failure
+
   build:
     strategy:
       fail-fast: false
