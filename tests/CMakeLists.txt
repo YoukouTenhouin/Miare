@@ -35,6 +35,12 @@ target_link_libraries(
 add_test(NAME miare.exact_transaction COMMAND miare_exact_transaction_test)
 set_tests_properties(miare.exact_transaction PROPERTIES TIMEOUT 10)
 
+add_executable(miare_concurrent_snapshot_test concurrent_snapshot_test.cpp)
+target_link_libraries(
+    miare_concurrent_snapshot_test PRIVATE miare::miare Threads::Threads)
+add_test(NAME miare.concurrent_snapshot COMMAND miare_concurrent_snapshot_test)
+set_tests_properties(miare.concurrent_snapshot PROPERTIES TIMEOUT 30)
+
 add_executable(
     miare_ordered_keyspace_growth_test ordered_keyspace_growth_test.cpp)
 target_link_libraries(
@@ -67,6 +73,14 @@ if(MIARE_BUILD_QUALIFICATION_TESTS)
         PROPERTIES
             LABELS qualification
             TIMEOUT 21600)
+    add_test(
+        NAME miare.concurrent_snapshot_qualification
+        COMMAND miare_concurrent_snapshot_test --qualification)
+    set_tests_properties(
+        miare.concurrent_snapshot_qualification
+        PROPERTIES
+            LABELS qualification
+            TIMEOUT 86400)
 endif()
 add_test(
     NAME miare.exact_transaction_live_child_assertion
