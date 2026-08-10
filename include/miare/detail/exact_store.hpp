@@ -596,19 +596,29 @@ inline void validateOrderedPageReference(
     }
 }
 
+template<class Allocator>
+struct OrderedPageBounds {
+    StoredBytes<Allocator> minimum;
+    StoredBytes<Allocator> maximum;
+};
+
 template<class Limits, class Allocator>
-inline StoredBytes<Allocator> loadOrderedPage(
+inline OrderedPageBounds<Allocator> loadOrderedPage(
     DurableFile& file,
     const ExtentReference& reference,
     std::uint32_t expectedLevel,
     OpenedDatabase& opened,
     ProviderSet& providers,
     const Allocator& allocator,
-    OrderedKeyValues<Allocator>& values) {
+    OrderedKeyValues<Allocator>& values,
+    std::vector<ExtentReference>* reachable = nullptr) {
     using ByteAllocator = typename std::allocator_traits<Allocator>::
         template rebind_alloc<std::byte>;
     validateOrderedPageReference<Limits>(
         reference, opened.format.generation, opened.format.highWaterBytes);
+    if (reachable) {
+        reachable->push_back(reference);
+    }
     std::array<std::byte, ExtentLayout::bytes> preamble{};
     file.readExactAt(reference.blockIndex * Limits::allocationQuantumBytes, preamble);
     const auto kind = readLittleEndian<std::uint16_t>(preamble, ExtentLayout::unitKind);
@@ -693,6 +703,9 @@ inline StoredBytes<Allocator> loadOrderedPage(
             if (overflow) {
                 const auto overflowReference = decodeExtentReference(
                     ByteView{payload}.subspan(representation + 16, 32));
+                if (reachable) {
+                    reachable->push_back(overflowReference);
+                }
                 value = readAuthenticatedExtent<Limits>(
                     file, overflowReference, 11, valueLength,
                     opened, providers, allocator);
@@ -716,20 +729,30 @@ inline StoredBytes<Allocator> loadOrderedPage(
         throwCorrupt("ordered page image is noncanonical");
     }
     if (type == 1) {
-        return firstKey;
+        return OrderedPageBounds<Allocator>{
+            std::move(firstKey), std::move(previousKey)};
     }
     StoredBytes<Allocator> subtreeMinimum{ByteAllocator{allocator}};
+    StoredBytes<Allocator> subtreeMaximum{ByteAllocator{allocator}};
     for (std::size_t index = 0; index != children.size(); ++index) {
-        auto childMinimum = loadOrderedPage<Limits>(
+        auto childBounds = loadOrderedPage<Limits>(
             file, children[index].second, level - 1,
-            opened, providers, allocator, values);
+            opened, providers, allocator, values, reachable);
         if (index == 0) {
-            subtreeMinimum = std::move(childMinimum);
-        } else if (childMinimum != children[index].first) {
-            throwCorrupt("ordered internal separator is not the right-subtree minimum");
+            subtreeMinimum = std::move(childBounds.minimum);
+        } else {
+            if (childBounds.minimum != children[index].first) {
+                throwCorrupt(
+                    "ordered internal separator is not the right-subtree minimum");
+            }
+            if (!UnsignedBytesLess{}(subtreeMaximum, childBounds.minimum)) {
+                throwCorrupt("ordered subtrees overlap or are reordered");
+            }
         }
+        subtreeMaximum = std::move(childBounds.maximum);
     }
-    return subtreeMinimum;
+    return OrderedPageBounds<Allocator>{
+        std::move(subtreeMinimum), std::move(subtreeMaximum)};
 }
 
 template<class Limits, class Allocator>
@@ -737,7 +760,8 @@ template<class Limits, class Allocator>
     DurableFile& file,
     OpenedDatabase& opened,
     ProviderSet& providers,
-    const Allocator& allocator) {
+    const Allocator& allocator,
+    std::vector<ExtentReference>* reachable = nullptr) {
     auto values = makeOrderedKeyValues(allocator);
     const auto reference = decodeExtentReference(opened.format.orderedRoot);
     if (reference.null()) {
@@ -755,7 +779,7 @@ template<class Limits, class Allocator>
         file, reference, kind, std::nullopt, opened, providers, allocator);
     const auto level = readLittleEndian<std::uint32_t>(rootPayload, PageLayout::level);
     (void)loadOrderedPage<Limits>(
-        file, reference, level, opened, providers, allocator, values);
+        file, reference, level, opened, providers, allocator, values, reachable);
     return values;
 }
 
@@ -867,29 +891,16 @@ inline void commitExact(
             template rebind_alloc<std::byte>;
         StoredBytes<Allocator> occupied{ByteAllocator{session.allocator}};
         occupied.resize(startBlock - commonBlocks);
-        std::array<std::byte, ExtentLayout::bytes> preamble{};
-        for (auto block = commonBlocks; block != startBlock; ++block) {
-            session.file->readExactAt(
-                block * Limits::allocationQuantumBytes, preamble);
-            const ByteView input{preamble};
-            if (!matches(input, ExtentLayout::magic, "MIAREXT\0") ||
-                readLittleEndian<std::uint16_t>(input, ExtentLayout::version) != 1 ||
-                readLittleEndian<std::uint64_t>(input, ExtentLayout::blockIndex) != block ||
-                readLittleEndian<std::uint64_t>(input, ExtentLayout::generation) !=
-                    session.opened.format.generation) {
-                continue;
-            }
-            const auto count = readLittleEndian<std::uint64_t>(
-                input, ExtentLayout::blockCount);
-            const auto encodedLength = readLittleEndian<std::uint64_t>(
-                input, ExtentLayout::encodedLength);
-            if (count == 0 || count > startBlock - block ||
-                encodedLength < ExtentLayout::bytes + authenticationTagBytes ||
-                count > std::numeric_limits<std::uint64_t>::max() /
-                    Limits::allocationQuantumBytes ||
-                encodedLength > count * Limits::allocationQuantumBytes) {
-                continue;
-            }
+        std::vector<ExtentReference> reachable;
+        (void)loadExactValues<Limits>(
+            *session.file,
+            session.opened,
+            *session.providers,
+            session.allocator,
+            &reachable);
+        for (const auto& reference : reachable) {
+            const auto block = reference.blockIndex;
+            const auto count = reference.blockCount;
             std::fill_n(
                 occupied.begin() + static_cast<std::ptrdiff_t>(block - commonBlocks),
                 static_cast<std::size_t>(count),
