@@ -658,11 +658,27 @@ template<class Limits, class Allocator>
         16U * 1024U, Limits::allocationQuantumBytes);
     constexpr auto uncompressedBlockCount =
         pageCeiling / Limits::allocationQuantumBytes;
+    constexpr auto framingBytes =
+        ExtentLayout::bytes + authenticationTagBytes;
     const auto minimalBlockCount =
         reference.encodedLength / Limits::allocationQuantumBytes +
         (reference.encodedLength % Limits::allocationQuantumBytes != 0);
+    std::optional<std::uint64_t> expectedUncompressedBlockCount;
+    if (expectedDecodedLength) {
+        if (*expectedDecodedLength >
+            std::numeric_limits<std::uint64_t>::max() - framingBytes -
+                (Limits::allocationQuantumBytes - 1)) {
+            throwCorrupt("authenticated extent decoded length overflows");
+        }
+        expectedUncompressedBlockCount =
+            (framingBytes + *expectedDecodedLength +
+             Limits::allocationQuantumBytes - 1) /
+            Limits::allocationQuantumBytes;
+    }
     const bool page = expectedKind >= 1 && expectedKind <= 10;
     if ((page && reference.blockCount > uncompressedBlockCount) ||
+        (expectedUncompressedBlockCount &&
+         reference.blockCount > *expectedUncompressedBlockCount) ||
         reference.blockCount != minimalBlockCount) {
         throwCorrupt("authenticated extent span is noncanonical");
     }
@@ -703,8 +719,6 @@ template<class Limits, class Allocator>
         readLittleEndian<std::uint64_t>(input, ExtentLayout::decodedLength);
     const auto expectedStoredLength = reference.encodedLength -
         ExtentLayout::bytes - authenticationTagBytes;
-    constexpr auto framingBytes =
-        ExtentLayout::bytes + authenticationTagBytes;
     if (decodedLength > std::numeric_limits<std::uint64_t>::max() -
             framingBytes - (Limits::allocationQuantumBytes - 1)) {
         throwCorrupt("authenticated extent decoded length overflows");

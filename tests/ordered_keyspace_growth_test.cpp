@@ -670,6 +670,24 @@ void malformedTreeMetadataReturnsCorrupt() {
             providers,
             std::allocator<std::byte>{});
     });
+    constexpr auto quantum = miare::DefaultLimits::allocationQuantumBytes;
+    constexpr auto oversizedBlocks = 256ULL;
+    opened.format.highWaterBytes = miare::detail::commonRegionBytes +
+        oversizedBlocks * quantum;
+    expectDatabaseError(miare::Errc::Corrupt, [&] {
+        (void)miare::detail::readAuthenticatedExtent<miare::DefaultLimits>(
+            persisted,
+            miare::detail::ExtentReference{
+                miare::detail::commonRegionBytes / quantum,
+                oversizedBlocks,
+                oversizedBlocks * quantum,
+                1},
+            11,
+            1,
+            opened,
+            providers,
+            std::allocator<std::byte>{});
+    });
 
     std::vector<std::byte> allocatorLeaf(256);
     miare::MutableByteView leafOutput{allocatorLeaf};
