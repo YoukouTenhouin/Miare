@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <condition_variable>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
@@ -896,6 +897,23 @@ struct OrderedPageBounds {
     StoredBytes<Allocator> maximum;
 };
 
+template<class Allocator>
+struct MutableTreeValue {
+    StoredBytes<Allocator> key;
+    StoredBytes<Allocator> value;
+    ExtentReference overflow;
+};
+
+template<class Allocator>
+struct MutableTreeNode {
+    ExtentReference reference;
+    StoredBytes<Allocator> minimumKey;
+    std::uint32_t level = 0;
+    bool dirty = false;
+    std::vector<MutableTreeValue<Allocator>> values;
+    std::vector<MutableTreeNode<Allocator>> children;
+};
+
 template<class Limits, class Allocator>
 inline OrderedPageBounds<Allocator> loadOrderedPage(
     DurableFile& file,
@@ -905,7 +923,8 @@ inline OrderedPageBounds<Allocator> loadOrderedPage(
     ProviderSet& providers,
     const Allocator& allocator,
     OrderedKeyValues<Allocator>& values,
-    std::vector<ExtentReference>* reachable = nullptr) {
+    std::vector<ExtentReference>* reachable = nullptr,
+    MutableTreeNode<Allocator>* mutableNode = nullptr) {
     using ByteAllocator = typename std::allocator_traits<Allocator>::
         template rebind_alloc<std::byte>;
     validateOrderedPageReference<Limits>(
@@ -923,6 +942,10 @@ inline OrderedPageBounds<Allocator> loadOrderedPage(
         file, reference, kind, std::nullopt, opened, providers, allocator);
     const auto type = readLittleEndian<std::uint16_t>(payload, PageLayout::type);
     const auto level = readLittleEndian<std::uint32_t>(payload, PageLayout::level);
+    if (mutableNode) {
+        mutableNode->reference = reference;
+        mutableNode->level = level;
+    }
     if (!matches(payload, PageLayout::magic, "MIAREPG\0") ||
         readLittleEndian<std::uint16_t>(payload, PageLayout::version) != 1 ||
         (type != 1 && type != 2) || kind != (type == 1 ? 2 : 1) ||
@@ -994,8 +1017,9 @@ inline OrderedPageBounds<Allocator> loadOrderedPage(
                 throwCorrupt("ordered leaf value length is invalid");
             }
             StoredBytes<Allocator> value{ByteAllocator{allocator}};
+            ExtentReference overflowReference;
             if (overflow) {
-                const auto overflowReference = decodeExtentReference(
+                overflowReference = decodeExtentReference(
                     ByteView{payload}.subspan(representation + 16, 32));
                 if (reachable) {
                     reachable->push_back(overflowReference);
@@ -1006,6 +1030,10 @@ inline OrderedPageBounds<Allocator> loadOrderedPage(
             } else {
                 value.assign(payload.begin() + representation + 16,
                              payload.begin() + representation + 16 + valueLength);
+            }
+            if (mutableNode) {
+                mutableNode->values.push_back(MutableTreeValue<Allocator>{
+                    key, value, overflowReference});
             }
             if (!values.emplace(std::move(key), std::move(value)).second) {
                 throwCorrupt("ordered leaf key is duplicated");
@@ -1023,15 +1051,22 @@ inline OrderedPageBounds<Allocator> loadOrderedPage(
         throwCorrupt("ordered page image is noncanonical");
     }
     if (type == 1) {
+        if (mutableNode) {
+            mutableNode->minimumKey = firstKey;
+        }
         return OrderedPageBounds<Allocator>{
             std::move(firstKey), std::move(previousKey)};
     }
     StoredBytes<Allocator> subtreeMinimum{ByteAllocator{allocator}};
     StoredBytes<Allocator> subtreeMaximum{ByteAllocator{allocator}};
+    if (mutableNode) {
+        mutableNode->children.resize(children.size());
+    }
     for (std::size_t index = 0; index != children.size(); ++index) {
         auto childBounds = loadOrderedPage<Limits>(
             file, children[index].second, level - 1,
-            opened, providers, allocator, values, reachable);
+            opened, providers, allocator, values, reachable,
+            mutableNode ? &mutableNode->children[index] : nullptr);
         if (index == 0) {
             subtreeMinimum = std::move(childBounds.minimum);
         } else {
@@ -1045,6 +1080,9 @@ inline OrderedPageBounds<Allocator> loadOrderedPage(
         }
         subtreeMaximum = std::move(childBounds.maximum);
     }
+    if (mutableNode) {
+        mutableNode->minimumKey = subtreeMinimum;
+    }
     return OrderedPageBounds<Allocator>{
         std::move(subtreeMinimum), std::move(subtreeMaximum)};
 }
@@ -1055,7 +1093,8 @@ template<class Limits, class Allocator>
     OpenedDatabase& opened,
     ProviderSet& providers,
     const Allocator& allocator,
-    std::vector<ExtentReference>* reachable = nullptr) {
+    std::vector<ExtentReference>* reachable = nullptr,
+    MutableTreeNode<Allocator>* mutableRoot = nullptr) {
     auto values = makeOrderedKeyValues(allocator);
     const auto reference = decodeExtentReference(opened.format.orderedRoot);
     if (reference.null()) {
@@ -1073,8 +1112,95 @@ template<class Limits, class Allocator>
         file, reference, kind, std::nullopt, opened, providers, allocator);
     const auto level = readLittleEndian<std::uint32_t>(rootPayload, PageLayout::level);
     (void)loadOrderedPage<Limits>(
-        file, reference, level, opened, providers, allocator, values, reachable);
+        file, reference, level, opened, providers, allocator, values, reachable,
+        mutableRoot);
     return values;
+}
+
+template<class Allocator>
+[[nodiscard]] inline std::size_t mutableChildFor(
+    const MutableTreeNode<Allocator>& node,
+    ByteView key) {
+    std::size_t child = 0;
+    while (child + 1 != node.children.size() &&
+           !UnsignedBytesLess{}(key, node.children[child + 1].minimumKey)) {
+        ++child;
+    }
+    return child;
+}
+
+template<class Allocator>
+inline void putMutableTree(
+    MutableTreeNode<Allocator>& node,
+    ByteView key,
+    ByteView value,
+    const Allocator& allocator) {
+    using ByteAllocator = typename std::allocator_traits<Allocator>::
+        template rebind_alloc<std::byte>;
+    node.dirty = true;
+    if (node.level != 0) {
+        auto& child = node.children[mutableChildFor(node, key)];
+        putMutableTree(child, key, value, allocator);
+        node.minimumKey = node.children.front().minimumKey;
+        return;
+    }
+    const auto found = std::lower_bound(
+        node.values.begin(), node.values.end(), key,
+        [](const auto& entry, ByteView sought) {
+            return UnsignedBytesLess{}(entry.key, sought);
+        });
+    StoredBytes<Allocator> storedKey{ByteAllocator{allocator}};
+    StoredBytes<Allocator> storedValue{ByteAllocator{allocator}};
+    storedKey.assign(key.begin(), key.end());
+    storedValue.assign(value.begin(), value.end());
+    if (found != node.values.end() && !UnsignedBytesLess{}(key, found->key)) {
+        found->value = std::move(storedValue);
+        found->overflow = {};
+    } else {
+        node.values.insert(
+            found,
+            MutableTreeValue<Allocator>{
+                std::move(storedKey), std::move(storedValue), {}});
+    }
+    node.minimumKey = node.values.front().key;
+}
+
+template<class Allocator>
+[[nodiscard]] inline bool eraseMutableTree(
+    MutableTreeNode<Allocator>& node,
+    ByteView key) {
+    if (node.level == 0) {
+        const auto found = std::lower_bound(
+            node.values.begin(), node.values.end(), key,
+            [](const auto& entry, ByteView sought) {
+                return UnsignedBytesLess{}(entry.key, sought);
+            });
+        if (found == node.values.end() || UnsignedBytesLess{}(key, found->key)) {
+            return false;
+        }
+        node.values.erase(found);
+        node.dirty = true;
+        if (!node.values.empty()) {
+            node.minimumKey = node.values.front().key;
+        }
+        return true;
+    }
+    const auto childIndex = mutableChildFor(node, key);
+    if (!eraseMutableTree(node.children[childIndex], key)) {
+        return false;
+    }
+    node.dirty = true;
+    if (node.children[childIndex].level == 0 &&
+        node.children[childIndex].values.empty()) {
+        node.children.erase(node.children.begin() + childIndex);
+    } else if (node.children[childIndex].level != 0 &&
+               node.children[childIndex].children.empty()) {
+        node.children.erase(node.children.begin() + childIndex);
+    }
+    if (!node.children.empty()) {
+        node.minimumKey = node.children.front().minimumKey;
+    }
+    return true;
 }
 
 struct PreparedPublication {
@@ -1168,12 +1294,13 @@ inline void commitExact(
         template rebind_alloc<PreparedExactExtent<Allocator>>;
     using NodeAllocator = typename std::allocator_traits<Allocator>::
         template rebind_alloc<PreparedTreeNode<Allocator>>;
+    using NodeVector = std::vector<PreparedTreeNode<Allocator>, NodeAllocator>;
     std::vector<LeafEntry, LeafEntryAllocator> entries{
         LeafEntryAllocator{session.allocator}};
     std::vector<PreparedExactExtent<Allocator>, ExtentAllocator> extents{
         ExtentAllocator{session.allocator}};
-    std::vector<PreparedTreeNode<Allocator>, NodeAllocator> nodes{
-        NodeAllocator{session.allocator}};
+    NodeVector nodes{NodeAllocator{session.allocator}};
+    std::vector<ExtentReference> retainedReferences;
     ExtentReference root;
     ExtentReference allocatorRoot;
     auto nextBlock = startBlock;
@@ -1183,24 +1310,26 @@ inline void commitExact(
         RunAllocator{session.allocator}};
     std::vector<ExtentRun> retiredRuns;
     const auto commonBlocks = commonRegionBytes / Limits::allocationQuantumBytes;
+    std::vector<ExtentReference> reachable;
+    MutableTreeNode<Allocator> mutableRoot;
+    (void)loadExactValues<Limits>(
+        *session.file,
+        session.opened,
+        *session.providers,
+        session.allocator,
+        &reachable,
+        &mutableRoot);
+    loadAllocatorReferences<Limits>(
+        *session.file,
+        session.opened,
+        *session.providers,
+        session.allocator,
+        reachable);
     if (startBlock > commonBlocks) {
         using ByteAllocator = typename std::allocator_traits<Allocator>::
             template rebind_alloc<std::byte>;
         StoredBytes<Allocator> occupied{ByteAllocator{session.allocator}};
         occupied.resize(startBlock - commonBlocks);
-        std::vector<ExtentReference> reachable;
-        (void)loadExactValues<Limits>(
-            *session.file,
-            session.opened,
-            *session.providers,
-            session.allocator,
-            &reachable);
-        loadAllocatorReferences<Limits>(
-            *session.file,
-            session.opened,
-            *session.providers,
-            session.allocator,
-            reachable);
         std::sort(
             reachable.begin(),
             reachable.end(),
@@ -1271,100 +1400,47 @@ inline void commitExact(
         return prepared;
     };
     if (!values.empty()) {
-        entries.reserve(values.size());
-        for (const auto& [key, value] : values) {
-            ExtentReference overflow;
-            if (value.size() > Limits::maxInlineValueBytes) {
-                auto prepared = prepareExtent(value, 11);
-                overflow = prepared.reference;
-                extents.push_back(std::move(prepared));
+        if (mutableRoot.reference.null()) {
+            mutableRoot.level = 0;
+            mutableRoot.dirty = true;
+        }
+        for (const auto& [key, oldValue] : session.values) {
+            if (!values.contains(key)) {
+                (void)eraseMutableTree(mutableRoot, key);
             }
-            entries.push_back(LeafEntry{&key, &value, overflow});
+        }
+        for (const auto& [key, value] : values) {
+            const auto old = session.values.find(key);
+            if (old == session.values.end() || old->second != value) {
+                putMutableTree(mutableRoot, key, value, session.allocator);
+            }
+        }
+        while (mutableRoot.level != 0 && mutableRoot.children.size() == 1) {
+            mutableRoot = std::move(mutableRoot.children.front());
+            mutableRoot.dirty = true;
         }
 
         constexpr auto pagePayloadBytes = std::max<std::uint64_t>(
             16U * 1024U, Limits::allocationQuantumBytes) -
             ExtentLayout::bytes - authenticationTagBytes;
-        using Range = std::pair<std::size_t, std::size_t>;
-        using RangeAllocator = typename std::allocator_traits<Allocator>::
-            template rebind_alloc<Range>;
-        std::vector<Range, RangeAllocator> ranges{
-            RangeAllocator{session.allocator}};
-        std::size_t begin = 0;
-        auto scan = begin + 1;
-        while (scan != entries.size()) {
-            if (leafUsedLength<Limits, Allocator>(
-                    entries, begin, scan + 1) <= pagePayloadBytes) {
-                ++scan;
-                continue;
-            }
-            std::size_t selected = 0;
-            std::uint64_t selectedDifference =
-                std::numeric_limits<std::uint64_t>::max();
-            for (auto boundary = begin + 1; boundary != scan + 1; ++boundary) {
-                const auto left = leafUsedLength<Limits, Allocator>(
-                    entries, begin, boundary);
-                const auto right = leafUsedLength<Limits, Allocator>(
-                    entries, boundary, scan + 1);
-                if (left > pagePayloadBytes || right > pagePayloadBytes) {
-                    continue;
-                }
-                const auto difference = left > right ? left - right : right - left;
-                if (difference < selectedDifference) {
-                    selected = boundary;
-                    selectedDifference = difference;
-                }
-            }
-            if (selected == 0) {
-                throw DatabaseError{
-                    Errc::ResourceLimit,
-                    "ordered leaf overflow has no valid split boundary"};
-            }
-            ranges.emplace_back(begin, selected);
-            begin = selected;
-            ++scan;
-        }
-        ranges.emplace_back(begin, entries.size());
-        for (const auto [rangeBegin, rangeEnd] : ranges) {
-            auto payload = encodeLeafPage<Limits>(
-                entries, rangeBegin, rangeEnd, session.allocator);
-            auto prepared = prepareExtent(payload, 2);
-            auto minimum = StoredBytes<Allocator>{
-                typename std::allocator_traits<Allocator>::
-                    template rebind_alloc<std::byte>{session.allocator}};
-            minimum = *entries[rangeBegin].key;
-            nodes.push_back(PreparedTreeNode<Allocator>{
-                prepared.reference, std::move(minimum), 0});
-            extents.push_back(std::move(prepared));
-        }
-
-        while (nodes.size() != 1) {
-            std::vector<PreparedTreeNode<Allocator>, NodeAllocator> parents{
-                NodeAllocator{session.allocator}};
-            ranges.clear();
-            begin = 0;
-            scan = begin + 1;
-            while (scan != nodes.size()) {
-                if (internalUsedLength<Allocator>(
-                        nodes, begin, scan + 1) <= pagePayloadBytes) {
+        const auto balancedRanges = [&](std::size_t count, const auto& usedLength) {
+            std::vector<std::pair<std::size_t, std::size_t>> ranges;
+            std::size_t begin = 0;
+            auto scan = begin + 1;
+            while (scan != count) {
+                if (usedLength(begin, scan + 1) <= pagePayloadBytes) {
                     ++scan;
                     continue;
                 }
                 std::size_t selected = 0;
-                std::uint64_t selectedDifference =
-                    std::numeric_limits<std::uint64_t>::max();
-                for (auto boundary = begin + 1;
-                     boundary != scan + 1;
-                     ++boundary) {
-                    const auto left = internalUsedLength<Allocator>(
-                        nodes, begin, boundary);
-                    const auto right = internalUsedLength<Allocator>(
-                        nodes, boundary, scan + 1);
+                auto selectedDifference = std::numeric_limits<std::uint64_t>::max();
+                for (auto boundary = begin + 1; boundary != scan + 1; ++boundary) {
+                    const auto left = usedLength(begin, boundary);
+                    const auto right = usedLength(boundary, scan + 1);
                     if (left > pagePayloadBytes || right > pagePayloadBytes) {
                         continue;
                     }
-                    const auto difference =
-                        left > right ? left - right : right - left;
+                    const auto difference = left > right ? left - right : right - left;
                     if (difference < selectedDifference) {
                         selected = boundary;
                         selectedDifference = difference;
@@ -1373,30 +1449,140 @@ inline void commitExact(
                 if (selected == 0) {
                     throw DatabaseError{
                         Errc::ResourceLimit,
-                        "ordered internal overflow has no valid split boundary"};
+                        "ordered page overflow has no valid split boundary"};
                 }
                 ranges.emplace_back(begin, selected);
                 begin = selected;
                 ++scan;
             }
-            ranges.emplace_back(begin, nodes.size());
-            for (const auto [rangeBegin, rangeEnd] : ranges) {
+            ranges.emplace_back(begin, count);
+            return ranges;
+        };
+
+        std::function<NodeVector(MutableTreeNode<Allocator>&)> persistNode;
+        const auto retainSubtree = [&](const auto& self, const auto& node) -> void {
+            retainedReferences.push_back(node.reference);
+            if (node.level == 0) {
+                for (const auto& item : node.values) {
+                    if (!item.overflow.null()) {
+                        retainedReferences.push_back(item.overflow);
+                    }
+                }
+                return;
+            }
+            for (const auto& child : node.children) {
+                self(self, child);
+            }
+        };
+        persistNode = [&](MutableTreeNode<Allocator>& node) {
+            if (!node.dirty) {
+                retainSubtree(retainSubtree, node);
+                NodeVector clean{NodeAllocator{session.allocator}};
+                clean.push_back(PreparedTreeNode<Allocator>{
+                    node.reference, node.minimumKey, node.level});
+                return clean;
+            }
+            if (node.level == 0) {
+                std::vector<LeafEntry> leafEntries;
+                leafEntries.reserve(node.values.size());
+                for (auto& item : node.values) {
+                    if (item.value.size() > Limits::maxInlineValueBytes &&
+                        item.overflow.null()) {
+                        auto overflow = prepareExtent(item.value, 11);
+                        item.overflow = overflow.reference;
+                        extents.push_back(std::move(overflow));
+                    } else if (!item.overflow.null()) {
+                        retainedReferences.push_back(item.overflow);
+                    }
+                    leafEntries.push_back(LeafEntry{
+                        &item.key, &item.value, item.overflow});
+                }
+                const auto ranges = balancedRanges(
+                    leafEntries.size(), [&](std::size_t begin, std::size_t end) {
+                        return leafUsedLength<Limits, Allocator>(
+                            leafEntries, begin, end);
+                    });
+                NodeVector result{NodeAllocator{session.allocator}};
+                for (const auto [begin, end] : ranges) {
+                    auto payload = encodeLeafPage<Limits>(
+                        leafEntries, begin, end, session.allocator);
+                    auto prepared = prepareExtent(payload, 2);
+                    result.push_back(PreparedTreeNode<Allocator>{
+                        prepared.reference, *leafEntries[begin].key, 0});
+                    extents.push_back(std::move(prepared));
+                }
+                return result;
+            }
+            NodeVector persistedChildren{NodeAllocator{session.allocator}};
+            for (auto& child : node.children) {
+                auto replacements = persistNode(child);
+                persistedChildren.insert(
+                    persistedChildren.end(),
+                    std::make_move_iterator(replacements.begin()),
+                    std::make_move_iterator(replacements.end()));
+            }
+            const auto ranges = balancedRanges(
+                persistedChildren.size(), [&](std::size_t begin, std::size_t end) {
+                    return internalUsedLength<Allocator>(
+                        persistedChildren, begin, end);
+                });
+            NodeVector result{NodeAllocator{session.allocator}};
+            for (const auto [begin, end] : ranges) {
                 auto payload = encodeInternalPage<Limits>(
-                    nodes, rangeBegin, rangeEnd, session.allocator);
+                    persistedChildren, begin, end, session.allocator);
                 auto prepared = prepareExtent(payload, 1);
-                auto minimum = StoredBytes<Allocator>{
-                    typename std::allocator_traits<Allocator>::
-                        template rebind_alloc<std::byte>{session.allocator}};
-                minimum = nodes[rangeBegin].minimumKey;
+                result.push_back(PreparedTreeNode<Allocator>{
+                    prepared.reference,
+                    persistedChildren[begin].minimumKey,
+                    persistedChildren[begin].level + 1});
+                extents.push_back(std::move(prepared));
+            }
+            return result;
+        };
+        nodes = persistNode(mutableRoot);
+        while (nodes.size() != 1) {
+            const auto ranges = balancedRanges(
+                nodes.size(), [&](std::size_t begin, std::size_t end) {
+                    return internalUsedLength<Allocator>(nodes, begin, end);
+                });
+            NodeVector parents{NodeAllocator{session.allocator}};
+            for (const auto [begin, end] : ranges) {
+                auto payload = encodeInternalPage<Limits>(
+                    nodes, begin, end, session.allocator);
+                auto prepared = prepareExtent(payload, 1);
                 parents.push_back(PreparedTreeNode<Allocator>{
                     prepared.reference,
-                    std::move(minimum),
-                    nodes[rangeBegin].level + 1});
+                    nodes[begin].minimumKey,
+                    nodes[begin].level + 1});
                 extents.push_back(std::move(prepared));
             }
             nodes = std::move(parents);
         }
         root = nodes.front().reference;
+    }
+    for (const auto& retained : retainedReferences) {
+        std::vector<ExtentRun> remaining;
+        for (const auto& run : retiredRuns) {
+            const auto runEnd = run.start + run.count;
+            const auto retainedEnd = retained.blockIndex + retained.blockCount;
+            if (retainedEnd <= run.start || retained.blockIndex >= runEnd) {
+                remaining.push_back(run);
+                continue;
+            }
+            if (retained.blockIndex > run.start) {
+                remaining.push_back(ExtentRun{
+                    run.start,
+                    retained.blockIndex - run.start,
+                    run.retirementGeneration});
+            }
+            if (retainedEnd < runEnd) {
+                remaining.push_back(ExtentRun{
+                    retainedEnd,
+                    runEnd - retainedEnd,
+                    run.retirementGeneration});
+            }
+        }
+        retiredRuns = std::move(remaining);
     }
     const auto eraseEmptyRuns = [&] {
         freeRuns.erase(
@@ -1529,6 +1715,9 @@ inline void commitExact(
     std::uint64_t reachableBlocks = 1;
     for (const auto& extent : extents) {
         reachableBlocks += extent.reference.blockCount;
+    }
+    for (const auto& retained : retainedReferences) {
+        reachableBlocks += retained.blockCount;
     }
     writeLittleEndian<std::uint64_t>(
         reachableBlocks, allocatorOutput, AllocatorRootLayout::reachableBlocks);

@@ -8,8 +8,10 @@
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
+#include <iterator>
 #include <optional>
 #include <map>
+#include <set>
 #include <vector>
 
 namespace {
@@ -228,6 +230,107 @@ void postCreateGenerationsPublishAllocatorState() {
     requireCorruptImage(std::move(corrupted));
 }
 
+[[nodiscard]] std::set<std::uint64_t> orderedPageBlocks(
+    const std::vector<std::byte>& image,
+    std::uint64_t providerSeed) {
+    auto providers = deterministicProviders(providerSeed);
+    miare::testing::MemoryDurableFile file;
+    file.replaceStableBytes(image);
+    auto openedResult = miare::detail::openFormat<miare::DefaultLimits>(
+        file,
+        miare::EncryptionKeyView{encryptionKey},
+        providers);
+    require(openedResult.hasValue());
+    auto opened = std::move(openedResult).value();
+    std::vector<miare::detail::ExtentReference> reachable;
+    (void)miare::detail::loadExactValues<miare::DefaultLimits>(
+        file, opened, providers, std::allocator<std::byte>{}, &reachable);
+    std::set<std::uint64_t> pages;
+    std::array<std::byte, miare::detail::ExtentLayout::bytes> preamble{};
+    for (const auto& reference : reachable) {
+        file.readExactAt(
+            reference.blockIndex * miare::DefaultLimits::allocationQuantumBytes,
+            preamble);
+        const auto kind = miare::detail::readLittleEndian<std::uint16_t>(
+            preamble, miare::detail::ExtentLayout::unitKind);
+        if (kind == 1 || kind == 2) {
+            pages.insert(reference.blockIndex);
+        }
+    }
+    return pages;
+}
+
+[[nodiscard]] std::uint16_t orderedRootKind(
+    const std::vector<std::byte>& image,
+    std::uint64_t providerSeed) {
+    auto providers = deterministicProviders(providerSeed);
+    miare::testing::MemoryDurableFile file;
+    file.replaceStableBytes(image);
+    auto opened = miare::detail::openFormat<miare::DefaultLimits>(
+        file,
+        miare::EncryptionKeyView{encryptionKey},
+        providers);
+    require(opened.hasValue());
+    const auto root = miare::detail::decodeExtentReference(
+        opened.value().format.orderedRoot);
+    std::array<std::byte, miare::detail::ExtentLayout::bytes> preamble{};
+    file.readExactAt(
+        root.blockIndex * miare::DefaultLimits::allocationQuantumBytes,
+        preamble);
+    return miare::detail::readLittleEndian<std::uint16_t>(
+        preamble, miare::detail::ExtentLayout::unitKind);
+}
+
+void mutationsRewriteOnlyAffectedTreePaths() {
+    auto file = std::make_unique<miare::testing::MemoryDurableFile>();
+    auto* fileView = file.get();
+    miare::CreateOptions options;
+    options.compression = miare::Compression::None;
+    auto database = miare::testing::DatabaseAccess::create(
+        std::move(file),
+        miare::EncryptionKeyView{encryptionKey},
+        deterministicProviders(60),
+        options);
+    auto seed = database.beginWrite();
+    for (std::uint16_t index = 0; index != 120; ++index) {
+        seed.put(keyFor(index), valueFor(index));
+    }
+    seed.commit();
+    const auto initialPages = orderedPageBlocks(fileView->bytes(), 61);
+    require(initialPages.size() > 8);
+
+    auto overwrite = database.beginWrite();
+    const std::array replacement{std::byte{0x11}, std::byte{0x22}};
+    overwrite.put(keyFor(0), replacement);
+    overwrite.commit();
+    const auto overwrittenPages = orderedPageBlocks(fileView->bytes(), 62);
+    std::vector<std::uint64_t> retainedAfterOverwrite;
+    std::set_intersection(
+        initialPages.begin(), initialPages.end(),
+        overwrittenPages.begin(), overwrittenPages.end(),
+        std::back_inserter(retainedAfterOverwrite));
+    require(retainedAfterOverwrite.size() >= initialPages.size() - 4);
+
+    auto erase = database.beginWrite();
+    require(erase.erase(keyFor(1)));
+    erase.commit();
+    const auto deletedPages = orderedPageBlocks(fileView->bytes(), 63);
+    std::vector<std::uint64_t> retainedAfterDelete;
+    std::set_intersection(
+        overwrittenPages.begin(), overwrittenPages.end(),
+        deletedPages.begin(), deletedPages.end(),
+        std::back_inserter(retainedAfterDelete));
+    require(retainedAfterDelete.size() >= overwrittenPages.size() - 4);
+
+    auto collapse = database.beginWrite();
+    for (std::uint16_t index = 2; index != 120; ++index) {
+        require(collapse.erase(keyFor(index)));
+    }
+    collapse.commit();
+    require(orderedRootKind(fileView->bytes(), 64) == 2);
+    database.close();
+}
+
 void requireCorruptImage(std::vector<std::byte> image) {
     auto file = std::make_unique<miare::testing::MemoryDurableFile>();
     file->replaceStableBytes(std::move(image));
@@ -379,6 +482,7 @@ int main() {
     overflowValuesRemainAtomicAcrossReplacementAndDeletion();
     supersededStorageIsSafelyReused();
     postCreateGenerationsPublishAllocatorState();
+    mutationsRewriteOnlyAffectedTreePaths();
     authenticatedExtentBoundariesRejectPhysicalTampering();
     randomizedHistoriesMatchAnIndependentReferenceModel();
 }
