@@ -146,6 +146,28 @@ struct PageLayout {
     static constexpr std::size_t bytes = 96;
 };
 
+struct AllocatorRootLayout {
+    static constexpr std::size_t magic = 0;
+    static constexpr std::size_t version = 8;
+    static constexpr std::size_t flags = 10;
+    static constexpr std::size_t length = 12;
+    static constexpr std::size_t generation = 16;
+    static constexpr std::size_t highWaterBlocks = 24;
+    static constexpr std::size_t freeRoot = 32;
+    static constexpr std::size_t retiredRoot = 64;
+    static constexpr std::size_t reachableBlocks = 96;
+    static constexpr std::size_t freeBlocks = 104;
+    static constexpr std::size_t retiredBlocks = 112;
+    static constexpr std::size_t reserved = 120;
+    static constexpr std::size_t bytes = 160;
+};
+
+struct ExtentRun {
+    std::uint64_t start;
+    std::uint64_t count;
+    std::uint64_t retirementGeneration = 0;
+};
+
 [[nodiscard]] inline ExtentReference decodeExtentReference(ByteView bytes) {
     return ExtentReference{
         readLittleEndian<std::uint64_t>(bytes, 0),
@@ -204,6 +226,78 @@ inline void validateExtentReference(
     return length;
 }
 
+template<class Limits, class Allocator>
+[[nodiscard]] inline StoredBytes<Allocator> encodeAllocatorIndexLeaf(
+    const std::vector<ExtentRun>& runs,
+    bool retired,
+    const Allocator& allocator) {
+    using ByteAllocator = typename std::allocator_traits<Allocator>::
+        template rebind_alloc<std::byte>;
+    constexpr auto payloadBytes = std::max<std::uint64_t>(
+        16U * 1024U, Limits::allocationQuantumBytes) -
+        ExtentLayout::bytes - authenticationTagBytes;
+    StoredBytes<Allocator> payload{ByteAllocator{allocator}};
+    payload.resize(payloadBytes);
+    std::vector<std::array<std::byte, 16>> keys(runs.size());
+    const auto keyLength = retired ? 16U : 8U;
+    for (std::size_t index = 0; index != runs.size(); ++index) {
+        if (retired) {
+            writeLittleEndian<std::uint64_t>(
+                runs[index].retirementGeneration, keys[index], 0);
+            writeLittleEndian<std::uint64_t>(runs[index].start, keys[index], 8);
+        } else {
+            writeLittleEndian<std::uint64_t>(runs[index].start, keys[index], 0);
+        }
+    }
+    std::size_t prefixLength = keyLength;
+    for (std::size_t index = 1; index != keys.size(); ++index) {
+        prefixLength = std::min(
+            prefixLength,
+            commonPrefixLength(
+                ByteView{keys.front()}.first(prefixLength),
+                ByteView{keys[index]}.first(prefixLength)));
+    }
+    const auto slotsOffset = PageLayout::bytes + prefixLength;
+    const auto entriesOffset = slotsOffset + runs.size() * 8U;
+    const auto entryLength = 4U + keyLength - prefixLength + 8U;
+    const auto usedLength = entriesOffset + runs.size() * entryLength;
+    if (runs.empty() || usedLength > payload.size()) {
+        throw DatabaseError{
+            Errc::ResourceLimit,
+            "allocator index requires more than one metadata leaf"};
+    }
+    MutableByteView output{payload};
+    writeBytes(output, PageLayout::magic, "MIAREPG\0");
+    writeLittleEndian<std::uint16_t>(1, output, PageLayout::version);
+    writeLittleEndian<std::uint16_t>(1, output, PageLayout::type);
+    writeLittleEndian<std::uint32_t>(PageLayout::bytes, output, PageLayout::headerLength);
+    writeLittleEndian<std::uint32_t>(retired ? 5 : 4, output, PageLayout::role);
+    writeLittleEndian<std::uint32_t>(runs.size(), output, PageLayout::entryCount);
+    writeLittleEndian<std::uint32_t>(prefixLength, output, PageLayout::prefixLength);
+    writeLittleEndian<std::uint32_t>(slotsOffset, output, PageLayout::slotsOffset);
+    writeLittleEndian<std::uint32_t>(entriesOffset, output, PageLayout::entriesOffset);
+    writeLittleEndian<std::uint32_t>(usedLength, output, PageLayout::usedLength);
+    writeBytes(output, PageLayout::bytes, ByteView{keys.front()}.first(prefixLength));
+    std::size_t entryOffset = entriesOffset;
+    for (std::size_t index = 0; index != runs.size(); ++index) {
+        const auto slot = slotsOffset + index * 8U;
+        writeLittleEndian<std::uint32_t>(entryOffset, output, slot);
+        writeLittleEndian<std::uint32_t>(entryLength, output, slot + 4);
+        writeLittleEndian<std::uint32_t>(
+            keyLength - prefixLength, output, entryOffset);
+        writeBytes(
+            output,
+            entryOffset + 4,
+            ByteView{keys[index]}.subspan(prefixLength, keyLength - prefixLength));
+        writeLittleEndian<std::uint64_t>(
+            runs[index].count,
+            output,
+            entryOffset + 4 + keyLength - prefixLength);
+        entryOffset += entryLength;
+    }
+    return payload;
+}
+
 [[nodiscard]] inline std::array<std::byte, 240> extentAssociatedData(
     const OpenedDatabase& opened,
     ByteView preamble) {
@@ -255,7 +349,8 @@ template<class Limits, class Allocator>
     std::uint64_t blockIndex,
     OpenedDatabase& opened,
     ProviderSet& providers,
-    const Allocator& allocator) {
+    const Allocator& allocator,
+    bool compressionEligible = true) {
     using ByteAllocator = typename std::allocator_traits<Allocator>::
         template rebind_alloc<std::byte>;
     auto& crypto = ProviderAccess::crypto(providers);
@@ -263,7 +358,8 @@ template<class Limits, class Allocator>
     stored.assign(decoded.begin(), decoded.end());
     std::uint32_t flags = 0;
     std::uint32_t codec = 0;
-    if (opened.format.compression == Compression::ZStd && !decoded.empty()) {
+    if (compressionEligible && opened.format.compression == Compression::ZStd &&
+        !decoded.empty()) {
         auto& compression = ProviderAccess::compression(providers);
         StoredBytes<Allocator> candidate{ByteAllocator{allocator}};
         candidate.resize(compression.compressBound(decoded.size()));
@@ -482,7 +578,8 @@ template<class Limits, class Allocator>
     std::optional<std::uint64_t> expectedDecodedLength,
     OpenedDatabase& opened,
     ProviderSet& providers,
-    const Allocator& allocator) {
+    const Allocator& allocator,
+    bool compressionEligible = true) {
     validateExtentReference<Limits>(reference, opened.format.generation, opened.format.highWaterBytes);
     constexpr auto pageCeiling = std::max<std::uint64_t>(
         16U * 1024U, Limits::allocationQuantumBytes);
@@ -543,7 +640,8 @@ template<class Limits, class Allocator>
         (framingBytes + decodedLength +
          Limits::allocationQuantumBytes - 1) /
         Limits::allocationQuantumBytes;
-    if (flags > 1 || codec != flags || codecProfile != flags ||
+    if (flags > 1 || (!compressionEligible && flags != 0) ||
+        codec != flags || codecProfile != flags ||
         storedLength != expectedStoredLength ||
         (expectedDecodedLength && decodedLength != *expectedDecodedLength) ||
         (page && decodedLength != pageCeiling - ExtentLayout::bytes - authenticationTagBytes) ||
@@ -576,6 +674,202 @@ template<class Limits, class Allocator>
         decoded = std::move(stored);
     }
     return decoded;
+}
+
+template<class Allocator>
+[[nodiscard]] inline std::vector<ExtentRun> decodeAllocatorIndexLeaf(
+    ByteView payload,
+    bool retired) {
+    const auto expectedRole = retired ? 5U : 4U;
+    if (!matches(payload, PageLayout::magic, "MIAREPG\0") ||
+        readLittleEndian<std::uint16_t>(payload, PageLayout::version) != 1 ||
+        readLittleEndian<std::uint16_t>(payload, PageLayout::type) != 1 ||
+        readLittleEndian<std::uint32_t>(payload, PageLayout::headerLength) !=
+            PageLayout::bytes ||
+        readLittleEndian<std::uint32_t>(payload, PageLayout::role) != expectedRole ||
+        readLittleEndian<std::uint32_t>(payload, PageLayout::level) != 0 ||
+        readLittleEndian<std::uint32_t>(payload, PageLayout::flags) != 0 ||
+        !allZero(payload, PageLayout::leftmostChild, PageLayout::bytes)) {
+        throwCorrupt("allocator index header is invalid");
+    }
+    const auto count = readLittleEndian<std::uint32_t>(payload, PageLayout::entryCount);
+    const auto prefixLength = readLittleEndian<std::uint32_t>(payload, PageLayout::prefixLength);
+    const auto keyLength = retired ? 16U : 8U;
+    const auto slotsOffset = readLittleEndian<std::uint32_t>(payload, PageLayout::slotsOffset);
+    const auto entriesOffset = readLittleEndian<std::uint32_t>(payload, PageLayout::entriesOffset);
+    const auto usedLength = readLittleEndian<std::uint32_t>(payload, PageLayout::usedLength);
+    if (count == 0 || prefixLength > keyLength ||
+        slotsOffset != PageLayout::bytes + prefixLength ||
+        entriesOffset != slotsOffset + static_cast<std::uint64_t>(count) * 8 ||
+        usedLength < entriesOffset || usedLength > payload.size() ||
+        !allZero(payload, usedLength, payload.size())) {
+        throwCorrupt("allocator index bounds are invalid");
+    }
+    const auto prefix = payload.subspan(PageLayout::bytes, prefixLength);
+    std::vector<ExtentRun> runs;
+    runs.reserve(count);
+    std::array<std::byte, 16> firstKey{};
+    std::size_t canonicalPrefix = keyLength;
+    std::size_t expectedEntry = entriesOffset;
+    for (std::uint32_t index = 0; index != count; ++index) {
+        const auto slot = slotsOffset + index * 8U;
+        const auto entryOffset = readLittleEndian<std::uint32_t>(payload, slot);
+        const auto entryLength = readLittleEndian<std::uint32_t>(payload, slot + 4);
+        const auto suffixLength = readLittleEndian<std::uint32_t>(payload, entryOffset);
+        if (entryOffset != expectedEntry || suffixLength != keyLength - prefixLength ||
+            entryLength != 12U + suffixLength ||
+            entryOffset > usedLength || entryLength > usedLength - entryOffset) {
+            throwCorrupt("allocator index entry is invalid");
+        }
+        std::array<std::byte, 16> key{};
+        std::copy(prefix.begin(), prefix.end(), key.begin());
+        std::copy_n(
+            payload.begin() + entryOffset + 4,
+            suffixLength,
+            key.begin() + prefixLength);
+        const auto generation = retired
+            ? readLittleEndian<std::uint64_t>(key, 0)
+            : 0;
+        const auto start = readLittleEndian<std::uint64_t>(key, retired ? 8 : 0);
+        const auto blockCount = readLittleEndian<std::uint64_t>(
+            payload, entryOffset + 4 + suffixLength);
+        if (blockCount == 0 ||
+            (index != 0 &&
+             (generation < runs.back().retirementGeneration ||
+              (generation == runs.back().retirementGeneration &&
+               start <= runs.back().start + runs.back().count)))) {
+            throwCorrupt("allocator index runs are not canonical");
+        }
+        if (index == 0) {
+            firstKey = key;
+        } else {
+            canonicalPrefix = std::min(
+                canonicalPrefix,
+                commonPrefixLength(
+                    ByteView{firstKey}.first(canonicalPrefix),
+                    ByteView{key}.first(canonicalPrefix)));
+        }
+        runs.push_back(ExtentRun{start, blockCount, generation});
+        expectedEntry += entryLength;
+    }
+    if (expectedEntry != usedLength ||
+        canonicalPrefix != prefixLength) {
+        throwCorrupt("allocator index image is noncanonical");
+    }
+    return runs;
+}
+
+template<class Limits, class Allocator>
+inline void loadAllocatorReferences(
+    DurableFile& file,
+    OpenedDatabase& opened,
+    ProviderSet& providers,
+    const Allocator& allocator,
+    std::vector<ExtentReference>& reachable,
+    std::vector<ExtentRun>* loadedFreeRuns = nullptr,
+    std::vector<ExtentRun>* loadedRetiredRuns = nullptr) {
+    const auto root = decodeExtentReference(opened.format.allocatorRoot);
+    if (opened.format.generation == 1) {
+        if (!root.null()) {
+            throwCorrupt("initial database has allocator state");
+        }
+        return;
+    }
+    if (root.null()) {
+        throwCorrupt("committed generation has no allocator root");
+    }
+    auto payload = readAuthenticatedExtent<Limits>(
+        file, root, 14, AllocatorRootLayout::bytes,
+        opened, providers, allocator, false);
+    if (!matches(payload, AllocatorRootLayout::magic, "MIAREALC") ||
+        readLittleEndian<std::uint16_t>(payload, AllocatorRootLayout::version) != 1 ||
+        readLittleEndian<std::uint16_t>(payload, AllocatorRootLayout::flags) != 0 ||
+        readLittleEndian<std::uint32_t>(payload, AllocatorRootLayout::length) !=
+            AllocatorRootLayout::bytes ||
+        readLittleEndian<std::uint64_t>(payload, AllocatorRootLayout::generation) !=
+            opened.format.generation ||
+        readLittleEndian<std::uint64_t>(payload, AllocatorRootLayout::highWaterBlocks) !=
+            opened.format.highWaterBytes / Limits::allocationQuantumBytes ||
+        !allZero(payload, AllocatorRootLayout::reserved, AllocatorRootLayout::bytes)) {
+        throwCorrupt("allocator root is noncanonical");
+    }
+    reachable.push_back(root);
+    const auto addIndex = [&](std::size_t offset, std::uint16_t kind, bool retired) {
+        const auto reference = decodeExtentReference(ByteView{payload}.subspan(offset, 32));
+        if (reference.null()) {
+            return std::vector<ExtentRun>{};
+        }
+        const auto indexPayload = readAuthenticatedExtent<Limits>(
+            file, reference, kind, std::nullopt,
+            opened, providers, allocator);
+        reachable.push_back(reference);
+        return decodeAllocatorIndexLeaf<Allocator>(indexPayload, retired);
+    };
+    auto freeRuns = addIndex(AllocatorRootLayout::freeRoot, 8, false);
+    auto retiredRuns = addIndex(AllocatorRootLayout::retiredRoot, 10, true);
+    std::uint64_t freeBlocks = 0;
+    for (const auto& run : freeRuns) {
+        freeBlocks += run.count;
+    }
+    std::uint64_t retiredBlocks = 0;
+    for (const auto& run : retiredRuns) {
+        if (run.retirementGeneration == 0 ||
+            run.retirementGeneration > opened.format.generation) {
+            throwCorrupt("allocator retirement generation is invalid");
+        }
+        retiredBlocks += run.count;
+    }
+    std::uint64_t reachableBlocks = 0;
+    for (const auto& reference : reachable) {
+        reachableBlocks += reference.blockCount;
+    }
+    if (freeBlocks != readLittleEndian<std::uint64_t>(
+            payload, AllocatorRootLayout::freeBlocks) ||
+        retiredBlocks != readLittleEndian<std::uint64_t>(
+            payload, AllocatorRootLayout::retiredBlocks) ||
+        reachableBlocks != readLittleEndian<std::uint64_t>(
+            payload, AllocatorRootLayout::reachableBlocks) ||
+        reachableBlocks + freeBlocks + retiredBlocks !=
+            opened.format.highWaterBytes / Limits::allocationQuantumBytes -
+                commonRegionBytes / Limits::allocationQuantumBytes) {
+        throwCorrupt("allocator counters do not partition committed storage");
+    }
+    const auto commonBlocks = commonRegionBytes / Limits::allocationQuantumBytes;
+    const auto highWaterBlocks =
+        opened.format.highWaterBytes / Limits::allocationQuantumBytes;
+    std::vector<std::byte> partition(highWaterBlocks - commonBlocks);
+    const auto mark = [&](std::uint64_t start, std::uint64_t count) {
+        if (start < commonBlocks || count == 0 || start > highWaterBlocks ||
+            count > highWaterBlocks - start) {
+            throwCorrupt("allocator partition range is out of bounds");
+        }
+        for (auto block = start; block != start + count; ++block) {
+            auto& classification = partition[block - commonBlocks];
+            if (classification != std::byte{0}) {
+                throwCorrupt("allocator partition ranges overlap");
+            }
+            classification = std::byte{1};
+        }
+    };
+    for (const auto& reference : reachable) {
+        mark(reference.blockIndex, reference.blockCount);
+    }
+    for (const auto& run : freeRuns) {
+        mark(run.start, run.count);
+    }
+    for (const auto& run : retiredRuns) {
+        mark(run.start, run.count);
+    }
+    if (std::find(partition.begin(), partition.end(), std::byte{0}) !=
+        partition.end()) {
+        throwCorrupt("allocator partition leaves unclassified blocks");
+    }
+    if (loadedFreeRuns) {
+        *loadedFreeRuns = std::move(freeRuns);
+    }
+    if (loadedRetiredRuns) {
+        *loadedRetiredRuns = std::move(retiredRuns);
+    }
 }
 
 template<class Limits>
@@ -825,6 +1119,7 @@ template<class Limits>
 [[nodiscard]] inline PreparedPublication prepareExactPublication(
     OpenedDatabase& opened,
     const ExtentReference& orderedRoot,
+    const ExtentReference& allocatorRoot,
     std::uint64_t highWaterBytes,
     ProviderSet& providers) {
     const auto generation = opened.format.generation + 1;
@@ -841,6 +1136,10 @@ template<class Limits>
         PublicationLayout::predecessorGeneration);
     const auto rootBytes = encodeExtentReference(orderedRoot);
     writeBytes(plaintextOutput, PublicationLayout::orderedRoot, rootBytes);
+    writeBytes(
+        plaintextOutput,
+        PublicationLayout::allocatorRoot,
+        encodeExtentReference(allocatorRoot));
     writeLittleEndian<std::uint64_t>(
         highWaterBytes / Limits::allocationQuantumBytes,
         plaintextOutput,
@@ -876,15 +1175,13 @@ inline void commitExact(
     std::vector<PreparedTreeNode<Allocator>, NodeAllocator> nodes{
         NodeAllocator{session.allocator}};
     ExtentReference root;
+    ExtentReference allocatorRoot;
     auto nextBlock = startBlock;
-    struct FreeRun {
-        std::uint64_t start;
-        std::uint64_t count;
-    };
-    using FreeRunAllocator = typename std::allocator_traits<Allocator>::
-        template rebind_alloc<FreeRun>;
-    std::vector<FreeRun, FreeRunAllocator> freeRuns{
-        FreeRunAllocator{session.allocator}};
+    using RunAllocator = typename std::allocator_traits<Allocator>::
+        template rebind_alloc<ExtentRun>;
+    std::vector<ExtentRun, RunAllocator> freeRuns{
+        RunAllocator{session.allocator}};
+    std::vector<ExtentRun> retiredRuns;
     const auto commonBlocks = commonRegionBytes / Limits::allocationQuantumBytes;
     if (startBlock > commonBlocks) {
         using ByteAllocator = typename std::allocator_traits<Allocator>::
@@ -898,6 +1195,18 @@ inline void commitExact(
             *session.providers,
             session.allocator,
             &reachable);
+        loadAllocatorReferences<Limits>(
+            *session.file,
+            session.opened,
+            *session.providers,
+            session.allocator,
+            reachable);
+        std::sort(
+            reachable.begin(),
+            reachable.end(),
+            [](const auto& left, const auto& right) {
+                return left.blockIndex < right.blockIndex;
+            });
         for (const auto& reference : reachable) {
             const auto block = reference.blockIndex;
             const auto count = reference.blockCount;
@@ -905,6 +1214,12 @@ inline void commitExact(
                 occupied.begin() + static_cast<std::ptrdiff_t>(block - commonBlocks),
                 static_cast<std::size_t>(count),
                 std::byte{1});
+            if (!retiredRuns.empty() &&
+                retiredRuns.back().start + retiredRuns.back().count == block) {
+                retiredRuns.back().count += count;
+            } else {
+                retiredRuns.push_back(ExtentRun{block, count, generation});
+            }
         }
         std::uint64_t block = commonBlocks;
         while (block != startBlock) {
@@ -917,7 +1232,7 @@ inline void commitExact(
                    occupied[block - commonBlocks] == std::byte{0}) {
                 ++block;
             }
-            freeRuns.push_back(FreeRun{runStart, block - runStart});
+            freeRuns.push_back(ExtentRun{runStart, block - runStart});
         }
     }
     auto allocateBlocks = [&](std::uint64_t count) {
@@ -1083,6 +1398,155 @@ inline void commitExact(
         }
         root = nodes.front().reference;
     }
+    const auto eraseEmptyRuns = [&] {
+        freeRuns.erase(
+            std::remove_if(
+                freeRuns.begin(),
+                freeRuns.end(),
+                [](const auto& run) { return run.count == 0; }),
+            freeRuns.end());
+    };
+    ExtentReference freeRoot;
+    ExtentReference retiredRoot;
+    if (!retiredRuns.empty()) {
+        const auto payload = encodeAllocatorIndexLeaf<Limits>(
+            retiredRuns, true, session.allocator);
+        auto prepared = prepareExtent(payload, 10);
+        retiredRoot = prepared.reference;
+        extents.push_back(std::move(prepared));
+    }
+    const auto allocatorBlock = allocateBlocks(1);
+    eraseEmptyRuns();
+    if (!freeRuns.empty()) {
+        std::vector<ExtentRun> representedFreeRuns(
+            freeRuns.begin(), freeRuns.end());
+        auto payload = encodeAllocatorIndexLeaf<Limits>(
+            representedFreeRuns, false, session.allocator);
+        auto draft = prepareAuthenticatedExtent<Limits>(
+            payload,
+            8,
+            generation,
+            nextBlock,
+            session.opened,
+            *session.providers,
+            session.allocator);
+        const auto freePageBlock = allocateBlocks(draft.reference.blockCount);
+        eraseEmptyRuns();
+        representedFreeRuns.assign(freeRuns.begin(), freeRuns.end());
+        if (!representedFreeRuns.empty()) {
+            payload = encodeAllocatorIndexLeaf<Limits>(
+                representedFreeRuns, false, session.allocator);
+            auto prepared = prepareAuthenticatedExtent<Limits>(
+                payload,
+                8,
+                generation,
+                freePageBlock,
+                session.opened,
+                *session.providers,
+                session.allocator);
+            if (prepared.reference.blockCount != draft.reference.blockCount) {
+                throw DatabaseError{
+                    Errc::ResourceLimit,
+                    "allocator metadata reservation did not converge"};
+            }
+            freeRoot = prepared.reference;
+            extents.push_back(std::move(prepared));
+        } else {
+            for (auto run : std::vector<ExtentRun>(
+                     freeRuns.begin(), freeRuns.end())) {
+                run.retirementGeneration = generation;
+                retiredRuns.push_back(run);
+            }
+            ExtentRun consumed{
+                freePageBlock, draft.reference.blockCount, generation};
+            retiredRuns.push_back(consumed);
+            std::sort(
+                retiredRuns.begin(),
+                retiredRuns.end(),
+                [](const auto& left, const auto& right) {
+                    return left.start < right.start;
+                });
+            std::vector<ExtentRun> coalesced;
+            for (const auto& run : retiredRuns) {
+                if (!coalesced.empty() &&
+                    coalesced.back().start + coalesced.back().count == run.start) {
+                    coalesced.back().count += run.count;
+                } else {
+                    coalesced.push_back(run);
+                }
+            }
+            retiredRuns = std::move(coalesced);
+            const auto retiredPayload = encodeAllocatorIndexLeaf<Limits>(
+                retiredRuns, true, session.allocator);
+            auto replacement = prepareAuthenticatedExtent<Limits>(
+                retiredPayload,
+                10,
+                generation,
+                retiredRoot.blockIndex,
+                session.opened,
+                *session.providers,
+                session.allocator);
+            if (replacement.reference.blockCount != retiredRoot.blockCount) {
+                throw DatabaseError{
+                    Errc::ResourceLimit,
+                    "retired metadata reservation did not converge"};
+            }
+            const auto found = std::find_if(
+                extents.begin(), extents.end(), [&](const auto& extent) {
+                    return extent.reference.blockIndex == retiredRoot.blockIndex;
+                });
+            *found = std::move(replacement);
+        }
+    }
+    eraseEmptyRuns();
+    std::uint64_t freeBlocks = 0;
+    for (const auto& run : freeRuns) {
+        freeBlocks += run.count;
+    }
+    std::uint64_t retiredBlocks = 0;
+    for (const auto& run : retiredRuns) {
+        retiredBlocks += run.count;
+    }
+    std::array<std::byte, AllocatorRootLayout::bytes> allocatorPayload{};
+    MutableByteView allocatorOutput{allocatorPayload};
+    writeBytes(allocatorOutput, AllocatorRootLayout::magic, "MIAREALC");
+    writeLittleEndian<std::uint16_t>(
+        1, allocatorOutput, AllocatorRootLayout::version);
+    writeLittleEndian<std::uint32_t>(
+        AllocatorRootLayout::bytes, allocatorOutput, AllocatorRootLayout::length);
+    writeLittleEndian<std::uint64_t>(
+        generation, allocatorOutput, AllocatorRootLayout::generation);
+    writeLittleEndian<std::uint64_t>(
+        nextBlock, allocatorOutput, AllocatorRootLayout::highWaterBlocks);
+    writeBytes(
+        allocatorOutput,
+        AllocatorRootLayout::freeRoot,
+        encodeExtentReference(freeRoot));
+    writeBytes(
+        allocatorOutput,
+        AllocatorRootLayout::retiredRoot,
+        encodeExtentReference(retiredRoot));
+    std::uint64_t reachableBlocks = 1;
+    for (const auto& extent : extents) {
+        reachableBlocks += extent.reference.blockCount;
+    }
+    writeLittleEndian<std::uint64_t>(
+        reachableBlocks, allocatorOutput, AllocatorRootLayout::reachableBlocks);
+    writeLittleEndian<std::uint64_t>(
+        freeBlocks, allocatorOutput, AllocatorRootLayout::freeBlocks);
+    writeLittleEndian<std::uint64_t>(
+        retiredBlocks, allocatorOutput, AllocatorRootLayout::retiredBlocks);
+    auto preparedAllocator = prepareAuthenticatedExtent<Limits>(
+        allocatorPayload,
+        14,
+        generation,
+        allocatorBlock,
+        session.opened,
+        *session.providers,
+        session.allocator,
+        false);
+    allocatorRoot = preparedAllocator.reference;
+    extents.push_back(std::move(preparedAllocator));
     const auto highWaterBytes = nextBlock * Limits::allocationQuantumBytes;
     const auto growthBytes = highWaterBytes - session.opened.format.highWaterBytes;
     if (growthBytes > Limits::maxFileGrowthPerTransaction ||
@@ -1094,6 +1558,7 @@ inline void commitExact(
     auto publication = prepareExactPublication<Limits>(
         session.opened,
         root,
+        allocatorRoot,
         highWaterBytes,
         *session.providers);
 
@@ -1131,6 +1596,7 @@ inline void commitExact(
         session.opened.format.generation = generation;
         session.opened.format.highWaterBytes = highWaterBytes;
         session.opened.format.orderedRoot = encodeExtentReference(root);
+        session.opened.format.allocatorRoot = encodeExtentReference(allocatorRoot);
         session.values = std::move(committedValues);
     }
 }

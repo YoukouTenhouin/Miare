@@ -22,6 +22,8 @@ void require(bool condition) {
     }
 }
 
+void requireCorruptImage(std::vector<std::byte> image);
+
 [[nodiscard]] miare::ProviderSet deterministicProviders(std::uint64_t seed) {
     return miare::detail::ProviderAccess::make(
         std::make_unique<miare::testing::DeterministicCryptoProvider>(seed),
@@ -190,6 +192,42 @@ void supersededStorageIsSafelyReused() {
     reopened.close();
 }
 
+void postCreateGenerationsPublishAllocatorState() {
+    auto file = std::make_unique<miare::testing::MemoryDurableFile>();
+    auto* fileView = file.get();
+    auto database = miare::testing::DatabaseAccess::create(
+        std::move(file),
+        miare::EncryptionKeyView{encryptionKey},
+        deterministicProviders(50));
+    auto write = database.beginWrite();
+    write.put(keyFor(1), valueFor(1));
+    write.commit();
+    const auto image = fileView->bytes();
+    database.close();
+
+    auto providers = deterministicProviders(51);
+    miare::testing::MemoryDurableFile persisted;
+    persisted.replaceStableBytes(image);
+    auto opened = miare::detail::openFormat<miare::DefaultLimits>(
+        persisted,
+        miare::EncryptionKeyView{encryptionKey},
+        providers);
+    require(opened.hasValue());
+    require(!miare::detail::allZero(
+        opened.value().publication,
+        miare::detail::PublicationLayout::allocatorRoot,
+        miare::detail::PublicationLayout::highWaterBlocks));
+    const auto allocatorReference = miare::detail::decodeExtentReference(
+        miare::ByteView{opened.value().publication}.subspan(
+            miare::detail::PublicationLayout::allocatorRoot, 32));
+    auto corrupted = image;
+    corrupted[allocatorReference.blockIndex *
+                  miare::DefaultLimits::allocationQuantumBytes +
+              miare::detail::ExtentLayout::bytes] ^=
+        std::byte{1};
+    requireCorruptImage(std::move(corrupted));
+}
+
 void requireCorruptImage(std::vector<std::byte> image) {
     auto file = std::make_unique<miare::testing::MemoryDurableFile>();
     file->replaceStableBytes(std::move(image));
@@ -340,6 +378,7 @@ int main() {
     committedKeysSurviveMultipleTreeLevelsAndReopen();
     overflowValuesRemainAtomicAcrossReplacementAndDeletion();
     supersededStorageIsSafelyReused();
+    postCreateGenerationsPublishAllocatorState();
     authenticatedExtentBoundariesRejectPhysicalTampering();
     randomizedHistoriesMatchAnIndependentReferenceModel();
 }

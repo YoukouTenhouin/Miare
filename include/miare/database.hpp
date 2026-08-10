@@ -700,8 +700,11 @@ private:
                 AuthenticationFailed{});
         }
         auto openedDatabase = std::move(opened).value();
+        std::vector<detail::ExtentReference> reachable;
         auto values = detail::loadExactValues<Limits>(
-            *file, openedDatabase, providers, allocator);
+            *file, openedDatabase, providers, allocator, &reachable);
+        detail::loadAllocatorReferences<Limits>(
+            *file, openedDatabase, providers, allocator, reachable);
         return Result<ValidatedFile, AuthenticationFailed>::success(ValidatedFile{
             std::move(file),
             std::move(openedDatabase),
