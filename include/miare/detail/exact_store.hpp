@@ -247,38 +247,6 @@ inline void validateExtentReference(
     return length;
 }
 
-template<class Runs>
-[[nodiscard]] inline std::uint64_t allocatorIndexUsedLength(
-    const Runs& runs,
-    std::size_t begin,
-    std::size_t end,
-    bool retired) {
-    const auto keyLength = retired ? 16U : 8U;
-    const auto makeKey = [&](const ExtentRun& run) {
-        std::array<std::byte, 16> key{};
-        if (retired) {
-            writeLittleEndian<std::uint64_t>(run.retirementGeneration, key, 0);
-            writeLittleEndian<std::uint64_t>(run.start, key, 8);
-        } else {
-            writeLittleEndian<std::uint64_t>(run.start, key, 0);
-        }
-        return key;
-    };
-    const auto first = makeKey(runs[begin]);
-    std::size_t prefixLength = keyLength;
-    for (auto index = begin + 1; index != end; ++index) {
-        const auto key = makeKey(runs[index]);
-        prefixLength = std::min(
-            prefixLength,
-            commonPrefixLength(
-                ByteView{first}.first(prefixLength),
-                ByteView{key}.first(prefixLength)));
-    }
-    const auto count = end - begin;
-    return PageLayout::bytes + prefixLength + count * 8ULL +
-        count * (12ULL + keyLength - prefixLength);
-}
-
 [[nodiscard]] inline std::array<std::byte, 16> allocatorRunKey(
     const ExtentRun& run,
     bool retired) {
@@ -290,6 +258,28 @@ template<class Runs>
         writeLittleEndian<std::uint64_t>(run.start, key, 0);
     }
     return key;
+}
+
+template<class Runs>
+[[nodiscard]] inline std::uint64_t allocatorIndexUsedLength(
+    const Runs& runs,
+    std::size_t begin,
+    std::size_t end,
+    bool retired) {
+    const auto keyLength = retired ? 16U : 8U;
+    const auto first = allocatorRunKey(runs[begin], retired);
+    std::size_t prefixLength = keyLength;
+    for (auto index = begin + 1; index != end; ++index) {
+        const auto key = allocatorRunKey(runs[index], retired);
+        prefixLength = std::min(
+            prefixLength,
+            commonPrefixLength(
+                ByteView{first}.first(prefixLength),
+                ByteView{key}.first(prefixLength)));
+    }
+    const auto count = end - begin;
+    return PageLayout::bytes + prefixLength + count * 8ULL +
+        count * (12ULL + keyLength - prefixLength);
 }
 
 template<class Limits, class Allocator, class Runs>
