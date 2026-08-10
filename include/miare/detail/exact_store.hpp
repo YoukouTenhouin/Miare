@@ -1949,28 +1949,6 @@ inline void commitExact(
     ExtentReference retiredRoot;
     const auto allocatorBlock = allocateBlocks(1);
     eraseEmptyRuns();
-    const auto coalesceRetiredRuns = [&] {
-        std::sort(
-            retiredRuns.begin(),
-            retiredRuns.end(),
-            [](const auto& left, const auto& right) {
-                return left.retirementGeneration < right.retirementGeneration ||
-                    (left.retirementGeneration == right.retirementGeneration &&
-                     left.start < right.start);
-            });
-        ExtentRuns<Allocator> coalesced{RunAllocator{session.allocator}};
-        for (const auto& run : retiredRuns) {
-            if (!coalesced.empty() &&
-                coalesced.back().retirementGeneration ==
-                    run.retirementGeneration &&
-                coalesced.back().start + coalesced.back().count == run.start) {
-                coalesced.back().count += run.count;
-            } else {
-                coalesced.push_back(run);
-            }
-        }
-        retiredRuns = std::move(coalesced);
-    };
     constexpr auto metadataPageBlocks = std::max<std::uint64_t>(
         16U * 1024U, Limits::allocationQuantumBytes) /
         Limits::allocationQuantumBytes;
@@ -1979,6 +1957,9 @@ inline void commitExact(
             template rebind_alloc<ExtentReference>{session.allocator}};
     ExtentRuns<Allocator> representedFreeRuns{
         freeRuns.begin(), freeRuns.end(), RunAllocator{session.allocator}};
+    ExtentRuns<Allocator> previousRepresentedFreeRuns{
+        RunAllocator{session.allocator}};
+    bool hasPreviousRepresentation = false;
     const auto coalesceFreeRuns = [&](ExtentRuns<Allocator> runs) {
         std::sort(
             runs.begin(), runs.end(),
@@ -2070,23 +2051,7 @@ inline void commitExact(
             }
             eraseEmptyRuns();
             representedFreeRuns.assign(freeRuns.begin(), freeRuns.end());
-            continue;
-        }
-        if (reservation < metadataReservations.size()) {
-            for (auto index = reservation;
-                 index != metadataReservations.size();
-                 ++index) {
-                removeFreeRange(
-                    metadataReservations[index].blockIndex,
-                    metadataReservations[index].blockCount);
-                retiredRuns.push_back(ExtentRun{
-                    metadataReservations[index].blockIndex,
-                    metadataReservations[index].blockCount,
-                    generation});
-            }
-            metadataReservations.resize(reservation);
-            coalesceRetiredRuns();
-            representedFreeRuns.assign(freeRuns.begin(), freeRuns.end());
+            hasPreviousRepresentation = false;
             continue;
         }
         for (const auto& reserved : metadataReservations) {
@@ -2094,8 +2059,12 @@ inline void commitExact(
         }
         ExtentRuns<Allocator> finalFreeRuns{
             freeRuns.begin(), freeRuns.end(), RunAllocator{session.allocator}};
-        for (std::size_t index = 0; index != reservation; ++index) {
-            const auto usedBlocks = metadataExtents[index].reference.blockCount;
+        for (std::size_t index = 0;
+             index != metadataReservations.size();
+             ++index) {
+            const auto usedBlocks = index < reservation
+                ? metadataExtents[index].reference.blockCount
+                : 0;
             if (usedBlocks > metadataPageBlocks) {
                 throw DatabaseError{
                     Errc::ResourceLimit,
@@ -2109,6 +2078,19 @@ inline void commitExact(
         }
         finalFreeRuns = coalesceFreeRuns(std::move(finalFreeRuns));
         if (!sameRuns(finalFreeRuns, representedFreeRuns)) {
+            if (hasPreviousRepresentation &&
+                sameRuns(finalFreeRuns, previousRepresentedFreeRuns)) {
+                freeRuns = finalFreeRuns;
+                const auto blockIndex = allocateBlocks(metadataPageBlocks);
+                metadataReservations.push_back(ExtentReference{
+                    blockIndex, metadataPageBlocks, 0, generation});
+                eraseEmptyRuns();
+                representedFreeRuns.assign(freeRuns.begin(), freeRuns.end());
+                hasPreviousRepresentation = false;
+                continue;
+            }
+            previousRepresentedFreeRuns = representedFreeRuns;
+            hasPreviousRepresentation = true;
             freeRuns = finalFreeRuns;
             representedFreeRuns = std::move(finalFreeRuns);
             continue;
