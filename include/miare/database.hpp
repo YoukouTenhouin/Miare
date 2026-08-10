@@ -63,6 +63,7 @@ public:
             : session_(std::exchange(other.session_, nullptr)),
               lifetime_(std::move(other.lifetime_)),
               values_(std::move(other.values_)),
+              generation_(other.generation_),
               thread_(other.thread_),
               active_(std::exchange(other.active_, false)) {}
 
@@ -89,7 +90,8 @@ public:
             active_ = false;
             if (lifetime_ &&
                 !lifetime_->invalidated.load(std::memory_order_acquire)) {
-                releaseTransaction(*session_, *lifetime_, false);
+                releaseTransaction(
+                    *session_, *lifetime_, false, generation_);
             }
             session_ = nullptr;
             lifetime_.reset();
@@ -106,10 +108,12 @@ public:
         ReadTransaction(
             Session& session,
             std::shared_ptr<ChildLifetime> lifetime,
-            OrderedKeyValues values)
+            OrderedKeyValues values,
+            std::uint64_t generation)
             : session_(&session),
               lifetime_(std::move(lifetime)),
               values_(std::move(values)),
+              generation_(generation),
               thread_(std::this_thread::get_id()),
               active_(true) {}
 
@@ -129,6 +133,7 @@ public:
         Session* session_;
         std::shared_ptr<ChildLifetime> lifetime_;
         OrderedKeyValues values_;
+        std::uint64_t generation_;
         std::thread::id thread_;
         bool active_;
     };
@@ -414,9 +419,12 @@ public:
         }
         auto snapshot = detail::makeOrderedKeyValues(session.allocator);
         snapshot = session.values;
+        const auto generation = session.opened.format.generation;
+        session.activeReadGenerations.insert(generation);
         ++session.activeReaders;
         ++session.liveTransactions;
-        return ReadTransaction{session, lifetime_, std::move(snapshot)};
+        return ReadTransaction{
+            session, lifetime_, std::move(snapshot), generation};
     }
 
     [[nodiscard]] WriteTransaction beginWrite() {
@@ -603,7 +611,8 @@ private:
     static void releaseTransaction(
         Session& session,
         const ChildLifetime& lifetime,
-        bool writer) noexcept {
+        bool writer,
+        std::optional<std::uint64_t> readGeneration = std::nullopt) noexcept {
         try {
             std::lock_guard lock{session.mutex};
             if (lifetime.invalidated.load(std::memory_order_relaxed)) {
@@ -616,6 +625,11 @@ private:
                 session.writerAvailable.notify_all();
             } else {
                 --session.activeReaders;
+                const auto found = session.activeReadGenerations.find(
+                    *readGeneration);
+                if (found != session.activeReadGenerations.end()) {
+                    session.activeReadGenerations.erase(found);
+                }
             }
         } catch (...) {
         }
@@ -636,6 +650,7 @@ private:
             lifetime.invalidated.store(true, std::memory_order_release);
             session.liveTransactions = 0;
             session.activeReaders = 0;
+            session.activeReadGenerations.clear();
             session.waitingWriters = 0;
             session.writerActive = false;
             eraseSessionKeys(session);
@@ -700,7 +715,9 @@ private:
                 AuthenticationFailed{});
         }
         auto openedDatabase = std::move(opened).value();
-        std::vector<detail::ExtentReference> reachable;
+        detail::ExtentReferences<Allocator> reachable{
+            typename std::allocator_traits<Allocator>::
+                template rebind_alloc<detail::ExtentReference>{allocator}};
         auto values = detail::loadExactValues<Limits>(
             *file, openedDatabase, providers, allocator, &reachable);
         detail::loadAllocatorReferences<Limits>(

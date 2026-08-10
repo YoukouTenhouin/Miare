@@ -456,7 +456,9 @@ public:
                 AuthenticationFailed{});
         }
         auto openedDatabase = std::move(opened).value();
-        std::vector<detail::ExtentReference> reachable;
+        detail::ExtentReferences<Allocator> reachable{
+            typename std::allocator_traits<Allocator>::
+                template rebind_alloc<detail::ExtentReference>{allocator}};
         auto values = detail::loadExactValues<Limits>(
             *file, openedDatabase, providers, allocator, &reachable);
         detail::loadAllocatorReferences<Limits>(
