@@ -69,6 +69,9 @@ template<class Allocator>
     return OrderedKeyValues<Allocator>{UnsignedBytesLess{}, MapAllocator{allocator}};
 }
 
+template<class Allocator>
+struct MutableTreeNode;
+
 template<class Allocator, class Limits>
 struct DatabaseSession {
     DatabaseSession(
@@ -83,6 +86,10 @@ struct DatabaseSession {
           allocator(std::move(openedAllocator)),
           opened(std::move(openedDatabase)),
           values(std::move(openedValues)),
+          cursorTree(std::allocate_shared<MutableTreeNode<Allocator>>(
+              typename std::allocator_traits<Allocator>::
+                  template rebind_alloc<MutableTreeNode<Allocator>>{allocator},
+              allocator)),
           activeReadGenerations(
               std::less<std::uint64_t>{},
               typename std::allocator_traits<Allocator>::
@@ -95,6 +102,7 @@ struct DatabaseSession {
     OpenedDatabase opened;
     OrderedKeyValues<Allocator> values;
     bool valuesLoaded = false;
+    std::shared_ptr<MutableTreeNode<Allocator>> cursorTree;
     std::multiset<
         std::uint64_t,
         std::less<std::uint64_t>,
@@ -1354,6 +1362,36 @@ struct MutableTreeNode {
     StoredVector<MutableTreeNode<Allocator>, Allocator> children;
 };
 
+template<class Allocator>
+[[nodiscard]] inline MutableTreeNode<Allocator> cloneMutableTree(
+    const MutableTreeNode<Allocator>& source,
+    const Allocator& allocator) {
+    using ByteAllocator = typename std::allocator_traits<Allocator>::
+        template rebind_alloc<std::byte>;
+    MutableTreeNode<Allocator> clone{allocator};
+    clone.reference = source.reference;
+    clone.minimumKey.assign(
+        source.minimumKey.begin(), source.minimumKey.end());
+    clone.level = source.level;
+    clone.dirty = source.dirty;
+    clone.values.reserve(source.values.size());
+    for (const auto& sourceValue : source.values) {
+        StoredBytes<Allocator> key{ByteAllocator{allocator}};
+        StoredBytes<Allocator> value{ByteAllocator{allocator}};
+        key.assign(sourceValue.key.begin(), sourceValue.key.end());
+        value.assign(sourceValue.value.begin(), sourceValue.value.end());
+        clone.values.push_back(MutableTreeValue<Allocator>{
+            std::move(key),
+            std::move(value),
+            sourceValue.overflow});
+    }
+    clone.children.reserve(source.children.size());
+    for (const auto& sourceChild : source.children) {
+        clone.children.push_back(cloneMutableTree(sourceChild, allocator));
+    }
+    return clone;
+}
+
 template<class Limits, class Allocator>
 inline OrderedPageBounds<Allocator> loadOrderedPage(
     DurableFile& file,
@@ -1825,6 +1863,73 @@ template<class Allocator>
     return true;
 }
 
+template<class Limits, class Allocator>
+[[nodiscard]] inline MutableTreeNode<Allocator> buildMutableTree(
+    const OrderedKeyValues<Allocator>& values,
+    const Allocator& allocator) {
+    MutableTreeNode<Allocator> empty{allocator};
+    if (values.empty()) {
+        return empty;
+    }
+    using Entry = PersistedLeafEntry<Allocator>;
+    using EntryAllocator = typename std::allocator_traits<Allocator>::
+        template rebind_alloc<Entry>;
+    using Node = MutableTreeNode<Allocator>;
+    using NodeAllocator = typename std::allocator_traits<Allocator>::
+        template rebind_alloc<Node>;
+    constexpr auto pagePayloadBytes = std::max<std::uint64_t>(
+        16U * 1024U, Limits::allocationQuantumBytes) -
+        ExtentLayout::bytes - authenticationTagBytes;
+    StoredVector<Entry, Allocator> entries{EntryAllocator{allocator}};
+    entries.reserve(values.size());
+    for (const auto& [key, value] : values) {
+        const auto overflow = value.size() > Limits::maxInlineValueBytes
+            ? ExtentReference{1, 1, 1, 1}
+            : ExtentReference{};
+        entries.push_back(Entry{&key, &value, overflow});
+    }
+    auto ranges = balancedPageRanges(
+        entries.size(), pagePayloadBytes, allocator,
+        [&](std::size_t begin, std::size_t end) {
+            return leafUsedLength<Limits, Allocator>(entries, begin, end);
+        });
+    StoredVector<Node, Allocator> nodes{NodeAllocator{allocator}};
+    nodes.reserve(ranges.size());
+    for (const auto [begin, end] : ranges) {
+        nodes.emplace_back(allocator);
+        auto& leaf = nodes.back();
+        leaf.minimumKey = *entries[begin].key;
+        leaf.values.reserve(end - begin);
+        for (auto index = begin; index != end; ++index) {
+            leaf.values.push_back(MutableTreeValue<Allocator>{
+                *entries[index].key,
+                *entries[index].value,
+                {}});
+        }
+    }
+    while (nodes.size() != 1) {
+        ranges = balancedPageRanges(
+            nodes.size(), pagePayloadBytes, allocator,
+            [&](std::size_t begin, std::size_t end) {
+                return internalUsedLength<Allocator>(nodes, begin, end);
+            });
+        StoredVector<Node, Allocator> parents{NodeAllocator{allocator}};
+        parents.reserve(ranges.size());
+        for (const auto [begin, end] : ranges) {
+            parents.emplace_back(allocator);
+            auto& parent = parents.back();
+            parent.minimumKey = nodes[begin].minimumKey;
+            parent.level = nodes[begin].level + 1;
+            parent.children.reserve(end - begin);
+            for (auto index = begin; index != end; ++index) {
+                parent.children.push_back(std::move(nodes[index]));
+            }
+        }
+        nodes = std::move(parents);
+    }
+    return std::move(nodes.front());
+}
+
 struct PreparedPublication {
     PublicationSlot slot;
     PublicationPlaintext plaintext;
@@ -1909,6 +2014,11 @@ inline void commitExact(
         session.opened.format.highWaterBytes / Limits::allocationQuantumBytes;
     auto committedValues = makeOrderedKeyValues(session.allocator);
     committedValues = values;
+    using CursorTreeAllocator = typename std::allocator_traits<Allocator>::
+        template rebind_alloc<MutableTreeNode<Allocator>>;
+    auto committedCursorTree = std::allocate_shared<MutableTreeNode<Allocator>>(
+        CursorTreeAllocator{session.allocator},
+        buildMutableTree<Limits>(values, session.allocator));
     using LeafEntry = PersistedLeafEntry<Allocator>;
     using LeafEntryAllocator = typename std::allocator_traits<Allocator>::
         template rebind_alloc<LeafEntry>;
@@ -2450,6 +2560,7 @@ inline void commitExact(
         session.opened.format.orderedRoot = encodeExtentReference(root);
         session.opened.format.allocatorRoot = encodeExtentReference(allocatorRoot);
         session.values = std::move(committedValues);
+        session.cursorTree = std::move(committedCursorTree);
         session.valuesLoaded = true;
     }
 }
