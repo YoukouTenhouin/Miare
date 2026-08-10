@@ -1059,6 +1059,94 @@ inline void validateAllocatorPartition(
     }
 }
 
+template<class Allocator>
+inline void subtractRetainedReferences(
+    ExtentRuns<Allocator>& retiredRuns,
+    const ExtentReferences<Allocator>& retainedReferences,
+    const Allocator& allocator) {
+    using RunAllocator = typename std::allocator_traits<Allocator>::
+        template rebind_alloc<ExtentRun>;
+    ExtentRuns<Allocator> retainedRuns{RunAllocator{allocator}};
+    retainedRuns.reserve(retainedReferences.size());
+    for (const auto& reference : retainedReferences) {
+        retainedRuns.push_back(ExtentRun{
+            reference.blockIndex,
+            reference.blockCount});
+    }
+    std::sort(
+        retainedRuns.begin(), retainedRuns.end(),
+        [](const auto& left, const auto& right) {
+            return left.start < right.start;
+        });
+    ExtentRuns<Allocator> coalescedRetainedRuns{RunAllocator{allocator}};
+    for (const auto& run : retainedRuns) {
+        if (!coalescedRetainedRuns.empty() &&
+            run.start <= coalescedRetainedRuns.back().start +
+                coalescedRetainedRuns.back().count) {
+            const auto end = std::max(
+                coalescedRetainedRuns.back().start +
+                    coalescedRetainedRuns.back().count,
+                run.start + run.count);
+            coalescedRetainedRuns.back().count =
+                end - coalescedRetainedRuns.back().start;
+        } else {
+            coalescedRetainedRuns.push_back(run);
+        }
+    }
+
+    std::sort(
+        retiredRuns.begin(), retiredRuns.end(),
+        [](const auto& left, const auto& right) {
+            return left.start < right.start;
+        });
+    ExtentRuns<Allocator> remaining{RunAllocator{allocator}};
+    std::size_t retainedIndex = 0;
+    for (const auto& run : retiredRuns) {
+        const auto runEnd = run.start + run.count;
+        while (retainedIndex != coalescedRetainedRuns.size() &&
+               coalescedRetainedRuns[retainedIndex].start +
+                       coalescedRetainedRuns[retainedIndex].count <=
+                   run.start) {
+            ++retainedIndex;
+        }
+        auto cursor = run.start;
+        auto scan = retainedIndex;
+        while (scan != coalescedRetainedRuns.size() &&
+               coalescedRetainedRuns[scan].start < runEnd) {
+            const auto retainedStart = coalescedRetainedRuns[scan].start;
+            const auto retainedEnd = retainedStart +
+                coalescedRetainedRuns[scan].count;
+            if (retainedStart > cursor) {
+                remaining.push_back(ExtentRun{
+                    cursor,
+                    std::min(retainedStart, runEnd) - cursor,
+                    run.retirementGeneration});
+            }
+            cursor = std::max(cursor, std::min(retainedEnd, runEnd));
+            if (retainedEnd > runEnd) {
+                break;
+            }
+            ++scan;
+        }
+        if (cursor < runEnd) {
+            remaining.push_back(ExtentRun{
+                cursor,
+                runEnd - cursor,
+                run.retirementGeneration});
+        }
+        retainedIndex = scan;
+    }
+    std::sort(
+        remaining.begin(), remaining.end(),
+        [](const auto& left, const auto& right) {
+            if (left.retirementGeneration != right.retirementGeneration) {
+                return left.retirementGeneration < right.retirementGeneration;
+            }
+            return left.start < right.start;
+        });
+    retiredRuns = std::move(remaining);
+}
+
 template<class Limits, class Allocator>
 inline void loadAllocatorReferences(
     DurableFile& file,
@@ -1962,32 +2050,8 @@ inline void commitExact(
         }
         root = nodes.front().reference;
     }
-    for (const auto& retained : retainedReferences) {
-        ExtentRuns<Allocator> remaining{
-            typename std::allocator_traits<Allocator>::
-                template rebind_alloc<ExtentRun>{session.allocator}};
-        for (const auto& run : retiredRuns) {
-            const auto runEnd = run.start + run.count;
-            const auto retainedEnd = retained.blockIndex + retained.blockCount;
-            if (retainedEnd <= run.start || retained.blockIndex >= runEnd) {
-                remaining.push_back(run);
-                continue;
-            }
-            if (retained.blockIndex > run.start) {
-                remaining.push_back(ExtentRun{
-                    run.start,
-                    retained.blockIndex - run.start,
-                    run.retirementGeneration});
-            }
-            if (retainedEnd < runEnd) {
-                remaining.push_back(ExtentRun{
-                    retainedEnd,
-                    runEnd - retainedEnd,
-                    run.retirementGeneration});
-            }
-        }
-        retiredRuns = std::move(remaining);
-    }
+    subtractRetainedReferences(
+        retiredRuns, retainedReferences, session.allocator);
     const auto eraseEmptyRuns = [&] {
         freeRuns.erase(
             std::remove_if(

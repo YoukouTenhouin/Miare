@@ -285,6 +285,37 @@ void allocatorPartitionValidationScalesWithRunCount() {
     });
 }
 
+void retainedReferenceSubtractionScalesWithExtentCount() {
+    using Allocator = std::allocator<std::byte>;
+    constexpr std::uint64_t firstBlock = 100;
+    constexpr std::uint64_t retainedCount = 20'000;
+    Allocator allocator;
+    miare::detail::ExtentRuns<Allocator> retiredRuns;
+    retiredRuns.push_back(miare::detail::ExtentRun{
+        firstBlock,
+        retainedCount * 2,
+        7});
+    miare::detail::ExtentReferences<Allocator> retainedReferences;
+    retainedReferences.reserve(retainedCount);
+    for (auto index = retainedCount; index != 0; --index) {
+        retainedReferences.push_back(miare::detail::ExtentReference{
+            firstBlock + (index - 1) * 2,
+            1,
+            1,
+            1});
+    }
+
+    miare::detail::subtractRetainedReferences(
+        retiredRuns, retainedReferences, allocator);
+
+    assert(retiredRuns.size() == retainedCount);
+    for (std::uint64_t index = 0; index != retainedCount; ++index) {
+        assert(retiredRuns[index].start == firstBlock + index * 2 + 1);
+        assert(retiredRuns[index].count == 1);
+        assert(retiredRuns[index].retirementGeneration == 7);
+    }
+}
+
 struct AllocatorState {
     std::uint16_t freeRootKind = 0;
     std::uint16_t retiredRootKind = 0;
@@ -952,6 +983,7 @@ int main(int argc, char** argv) {
     supersededStorageIsSafelyReused();
     postCreateGenerationsPublishAllocatorState();
     allocatorPartitionValidationScalesWithRunCount();
+    retainedReferenceSubtractionScalesWithExtentCount();
     heldSnapshotsDelayRetiredExtentReuse();
     fragmentedAllocatorIndexesGrowBeyondOnePage();
     mutationsRewriteOnlyAffectedTreePaths();
