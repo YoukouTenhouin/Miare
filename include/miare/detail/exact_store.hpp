@@ -1798,7 +1798,8 @@ inline void commitExact(
             }
         }
         while (mutableRoot.level != 0 && mutableRoot.children.size() == 1) {
-            mutableRoot = std::move(mutableRoot.children.front());
+            auto collapsedRoot = std::move(mutableRoot.children.front());
+            mutableRoot = std::move(collapsedRoot);
             mutableRoot.dirty = true;
         }
 
