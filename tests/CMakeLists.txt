@@ -1,5 +1,9 @@
 find_package(Threads REQUIRED)
 
+add_compile_options(
+    $<$<CXX_COMPILER_ID:MSVC>:/UNDEBUG>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-UNDEBUG>)
+
 add_executable(miare_public_primitives_test public_primitives_test.cpp)
 target_link_libraries(miare_public_primitives_test PRIVATE miare::miare)
 add_test(NAME miare.public_primitives COMMAND miare_public_primitives_test)
