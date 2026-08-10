@@ -6,6 +6,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <iterator>
 #include <map>
 #include <memory>
@@ -20,6 +21,13 @@ constexpr std::array<std::byte, 32> encryptionKey{};
 
 void requireCorruptImage(std::vector<std::byte> image);
 [[nodiscard]] std::vector<std::byte> modeledKey(std::uint32_t identity);
+
+template<class Operation>
+void runTestCase(const char* name, Operation&& operation) {
+    std::fprintf(stderr, "running ordered-growth case: %s\n", name);
+    std::fflush(stderr);
+    operation();
+}
 
 [[nodiscard]] miare::ProviderSet deterministicProviders(std::uint64_t seed) {
     return miare::detail::ProviderAccess::make(
@@ -662,18 +670,34 @@ void randomizedHistoriesMatchAnIndependentReferenceModel(
 } // namespace
 
 int main(int argc, char** argv) {
-    committedKeysSurviveMultipleTreeLevelsAndReopen();
-    overflowValuesRemainAtomicAcrossReplacementAndDeletion();
-    supersededStorageIsSafelyReused();
-    postCreateGenerationsPublishAllocatorState();
-    heldSnapshotsDelayRetiredExtentReuse();
-    fragmentedAllocatorIndexesGrowBeyondOnePage();
-    mutationsRewriteOnlyAffectedTreePaths();
-    authenticatedExtentBoundariesRejectPhysicalTampering();
+    runTestCase("multi-level reopen", [] {
+        committedKeysSurviveMultipleTreeLevelsAndReopen();
+    });
+    runTestCase("overflow replacement", [] {
+        overflowValuesRemainAtomicAcrossReplacementAndDeletion();
+    });
+    runTestCase("storage reuse", [] { supersededStorageIsSafelyReused(); });
+    runTestCase("allocator publication", [] {
+        postCreateGenerationsPublishAllocatorState();
+    });
+    runTestCase("snapshot retirement", [] {
+        heldSnapshotsDelayRetiredExtentReuse();
+    });
+    runTestCase("fragmented allocator", [] {
+        fragmentedAllocatorIndexesGrowBeyondOnePage();
+    });
+    runTestCase("local copy on write", [] {
+        mutationsRewriteOnlyAffectedTreePaths();
+    });
+    runTestCase("physical tampering", [] {
+        authenticatedExtentBoundariesRejectPhysicalTampering();
+    });
     const bool fullQualification = argc == 2 &&
         std::string_view{argv[1]} == "--qualification";
-    randomizedHistoriesMatchAnIndependentReferenceModel(
-        fullQualification ? 1'000U : 32U,
-        fullQualification ? 10'000U : 512U,
-        fullQualification ? 100U : 9U);
+    runTestCase("randomized histories", [&] {
+        randomizedHistoriesMatchAnIndependentReferenceModel(
+            fullQualification ? 1'000U : 32U,
+            fullQualification ? 10'000U : 512U,
+            fullQualification ? 100U : 9U);
+    });
 }
