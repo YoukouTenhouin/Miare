@@ -86,6 +86,8 @@ struct PublicationLayout {
     static constexpr std::size_t capacityProfileDigest = 104;
     static constexpr std::size_t capacityProfile = 136;
     static constexpr std::size_t orderedRoot = 240;
+    static constexpr std::size_t blobRoot = 272;
+    static constexpr std::size_t allocatorRoot = 304;
     static constexpr std::size_t highWaterBlocks = 336;
     static constexpr std::size_t flags = 344;
     static constexpr std::size_t reserved = 352;
@@ -422,6 +424,7 @@ struct OpenedFormat {
     std::uint64_t highWaterBytes;
     std::uint64_t optionalFeatures;
     std::array<std::byte, 32> orderedRoot;
+    std::array<std::byte, 32> allocatorRoot;
 };
 
 struct OpenedDatabase {
@@ -613,13 +616,19 @@ template<class Limits>
         input.begin() + PublicationLayout::orderedRoot,
         orderedRoot.size(),
         orderedRoot.begin());
+    std::array<std::byte, 32> allocatorRoot{};
+    std::copy_n(
+        input.begin() + PublicationLayout::allocatorRoot,
+        allocatorRoot.size(),
+        allocatorRoot.begin());
     return OpenedFormat{
         compressionId == 0 ? Compression::None : Compression::ZStd,
         generation,
         highWaterBlocks * Limits::allocationQuantumBytes,
         readLittleEndian<std::uint64_t>(
             input, PublicationLayout::optionalFeatures),
-        orderedRoot};
+        orderedRoot,
+        allocatorRoot};
 }
 
 inline void validateCanonicalBootstrap(const Bootstrap& bootstrap) {

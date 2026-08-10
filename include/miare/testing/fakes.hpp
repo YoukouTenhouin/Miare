@@ -456,8 +456,11 @@ public:
                 AuthenticationFailed{});
         }
         auto openedDatabase = std::move(opened).value();
-        auto values = detail::loadExactValues<Limits>(
+        (void)detail::shallowValidateOrderedRoot<Limits>(
             *file, openedDatabase, providers, allocator);
+        (void)detail::shallowValidateAllocatorRoot<Limits>(
+            *file, openedDatabase, providers, allocator);
+        auto values = detail::makeOrderedKeyValues(allocator);
         std::unique_ptr<detail::DurableFile> durableFile = std::move(file);
         return Result<Database<Allocator, Limits>, AuthenticationFailed>::success(
             Database<Allocator, Limits>{

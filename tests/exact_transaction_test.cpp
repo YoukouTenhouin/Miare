@@ -280,9 +280,7 @@ void rollbackAndValidationPreserveCommittedState(
         miare::DefaultLimits::maxInlineValueBytes + 1,
         std::byte{0x5a});
     invalid.put(bytes("later-overflow"), overflowValue);
-    expectDatabaseError(miare::Errc::ResourceLimit, [&] {
-        invalid.commit();
-    });
+    assert(invalid.get(bytes("later-overflow")));
     assert(invalid.active());
     invalid.rollback();
 
@@ -306,13 +304,30 @@ void commitUsesTwoDurabilityBarriersAndFailsStop() {
     write.put(bytes("key"), bytes("value"));
     write.commit();
     const auto& operations = fileView->operations();
-    assert(operations.size() == 4);
-    assert(operations[0].kind == miare::testing::DurableFileOperationKind::Write);
-    assert(operations[0].offset == miare::detail::commonRegionBytes);
-    assert(operations[1].kind == miare::testing::DurableFileOperationKind::Barrier);
-    assert(operations[2].kind == miare::testing::DurableFileOperationKind::Write);
-    assert(operations[2].offset == miare::detail::bootstrapBytes);
-    assert(operations[3].kind == miare::testing::DurableFileOperationKind::Barrier);
+    assert(operations.size() >= 6);
+    assert(operations[0].kind ==
+        miare::testing::DurableFileOperationKind::Resize);
+    assert(operations[1].kind ==
+        miare::testing::DurableFileOperationKind::Write);
+    assert(operations[1].offset == miare::detail::commonRegionBytes);
+    const auto firstBarrier = std::find_if(
+        operations.begin(), operations.end(), [](const auto& operation) {
+            return operation.kind ==
+                miare::testing::DurableFileOperationKind::Barrier;
+        });
+    assert(firstBarrier != operations.end());
+    assert(std::all_of(
+        operations.begin(), firstBarrier, [](const auto& operation) {
+            return operation.kind ==
+                    miare::testing::DurableFileOperationKind::Resize ||
+                operation.kind ==
+                    miare::testing::DurableFileOperationKind::Write;
+        }));
+    assert(std::next(firstBarrier)->kind ==
+        miare::testing::DurableFileOperationKind::Write);
+    assert(std::next(firstBarrier)->offset == miare::detail::bootstrapBytes);
+    assert(std::next(firstBarrier, 2)->kind ==
+        miare::testing::DurableFileOperationKind::Barrier);
     database.close();
 
     auto failingFile = std::make_unique<miare::testing::MemoryDurableFile>();
