@@ -235,6 +235,56 @@ void postCreateGenerationsPublishAllocatorState() {
     requireCorruptImage(std::move(corrupted));
 }
 
+void allocatorPartitionValidationScalesWithRunCount() {
+    using Allocator = std::allocator<std::byte>;
+    constexpr auto commonBlocks = miare::detail::commonRegionBytes /
+        miare::DefaultLimits::allocationQuantumBytes;
+    constexpr std::uint64_t highWaterBlocks = 1ULL << 32U;
+    Allocator allocator;
+    miare::detail::ExtentReferences<Allocator> reachable;
+    reachable.push_back(miare::detail::ExtentReference{
+        commonBlocks, 2, 1, 1});
+    miare::detail::ExtentRuns<Allocator> freeRuns;
+    freeRuns.push_back(miare::detail::ExtentRun{
+        commonBlocks + 2,
+        highWaterBlocks / 2 - commonBlocks - 2});
+    miare::detail::ExtentRuns<Allocator> retiredRuns;
+    retiredRuns.push_back(miare::detail::ExtentRun{
+        highWaterBlocks / 2,
+        highWaterBlocks / 2,
+        1});
+    miare::detail::validateAllocatorPartition(
+        commonBlocks,
+        highWaterBlocks,
+        reachable,
+        freeRuns,
+        retiredRuns,
+        allocator);
+    --retiredRuns.front().start;
+    ++retiredRuns.front().count;
+    expectDatabaseError(miare::Errc::Corrupt, [&] {
+        miare::detail::validateAllocatorPartition(
+            commonBlocks,
+            highWaterBlocks,
+            reachable,
+            freeRuns,
+            retiredRuns,
+            allocator);
+    });
+    ++retiredRuns.front().start;
+    --retiredRuns.front().count;
+    --freeRuns.front().count;
+    expectDatabaseError(miare::Errc::Corrupt, [&] {
+        miare::detail::validateAllocatorPartition(
+            commonBlocks,
+            highWaterBlocks,
+            reachable,
+            freeRuns,
+            retiredRuns,
+            allocator);
+    });
+}
+
 struct AllocatorState {
     std::uint16_t freeRootKind = 0;
     std::uint16_t retiredRootKind = 0;
@@ -883,6 +933,7 @@ int main(int argc, char** argv) {
     overflowValuesRemainAtomicAcrossReplacementAndDeletion();
     supersededStorageIsSafelyReused();
     postCreateGenerationsPublishAllocatorState();
+    allocatorPartitionValidationScalesWithRunCount();
     heldSnapshotsDelayRetiredExtentReuse();
     fragmentedAllocatorIndexesGrowBeyondOnePage();
     mutationsRewriteOnlyAffectedTreePaths();

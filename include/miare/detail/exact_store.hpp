@@ -998,6 +998,53 @@ template<class Limits, class Allocator>
     return result;
 }
 
+template<class Allocator>
+inline void validateAllocatorPartition(
+    std::uint64_t commonBlocks,
+    std::uint64_t highWaterBlocks,
+    const ExtentReferences<Allocator>& reachable,
+    const ExtentRuns<Allocator>& freeRuns,
+    const ExtentRuns<Allocator>& retiredRuns,
+    const Allocator& allocator) {
+    using RunAllocator = typename std::allocator_traits<Allocator>::
+        template rebind_alloc<ExtentRun>;
+    ExtentRuns<Allocator> intervals{RunAllocator{allocator}};
+    const auto add = [&](std::uint64_t start, std::uint64_t count) {
+        if (start < commonBlocks || count == 0 || start > highWaterBlocks ||
+            count > highWaterBlocks - start) {
+            throwCorrupt("allocator partition range is out of bounds");
+        }
+        intervals.push_back(ExtentRun{start, count});
+    };
+    for (const auto& reference : reachable) {
+        add(reference.blockIndex, reference.blockCount);
+    }
+    for (const auto& run : freeRuns) {
+        add(run.start, run.count);
+    }
+    for (const auto& run : retiredRuns) {
+        add(run.start, run.count);
+    }
+    std::sort(
+        intervals.begin(), intervals.end(),
+        [](const auto& left, const auto& right) {
+            return left.start < right.start;
+        });
+    auto cursor = commonBlocks;
+    for (const auto& interval : intervals) {
+        if (interval.start < cursor) {
+            throwCorrupt("allocator partition ranges overlap");
+        }
+        if (interval.start != cursor) {
+            throwCorrupt("allocator partition leaves unclassified blocks");
+        }
+        cursor += interval.count;
+    }
+    if (cursor != highWaterBlocks) {
+        throwCorrupt("allocator partition leaves unclassified blocks");
+    }
+}
+
 template<class Limits, class Allocator>
 inline void loadAllocatorReferences(
     DurableFile& file,
@@ -1082,36 +1129,13 @@ inline void loadAllocatorReferences(
     const auto commonBlocks = commonRegionBytes / Limits::allocationQuantumBytes;
     const auto highWaterBlocks =
         opened.format.highWaterBytes / Limits::allocationQuantumBytes;
-    StoredBytes<Allocator> partition{
-        typename std::allocator_traits<Allocator>::
-            template rebind_alloc<std::byte>{allocator}};
-    partition.resize(highWaterBlocks - commonBlocks);
-    const auto mark = [&](std::uint64_t start, std::uint64_t count) {
-        if (start < commonBlocks || count == 0 || start > highWaterBlocks ||
-            count > highWaterBlocks - start) {
-            throwCorrupt("allocator partition range is out of bounds");
-        }
-        for (auto block = start; block != start + count; ++block) {
-            auto& classification = partition[block - commonBlocks];
-            if (classification != std::byte{0}) {
-                throwCorrupt("allocator partition ranges overlap");
-            }
-            classification = std::byte{1};
-        }
-    };
-    for (const auto& reference : reachable) {
-        mark(reference.blockIndex, reference.blockCount);
-    }
-    for (const auto& run : freeRuns) {
-        mark(run.start, run.count);
-    }
-    for (const auto& run : retiredRuns) {
-        mark(run.start, run.count);
-    }
-    if (std::find(partition.begin(), partition.end(), std::byte{0}) !=
-        partition.end()) {
-        throwCorrupt("allocator partition leaves unclassified blocks");
-    }
+    validateAllocatorPartition(
+        commonBlocks,
+        highWaterBlocks,
+        reachable,
+        freeRuns,
+        retiredRuns,
+        allocator);
     if (loadedFreeRuns) {
         *loadedFreeRuns = std::move(freeRuns);
     }
