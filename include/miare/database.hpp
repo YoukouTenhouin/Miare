@@ -224,6 +224,16 @@ public:
             }
             try {
                 detail::commitExact<Limits>(*session_, values_);
+            } catch (const DatabaseError& error) {
+                if (error.code() == Errc::Corrupt) {
+                    enterRecoveryAfterCorruption(*session_, *lifetime_);
+                }
+                if (session_->state.load(std::memory_order_acquire) ==
+                    DatabaseState::RecoveryRequired) {
+                    active_ = false;
+                    releaseTransaction(*session_, *lifetime_, true);
+                }
+                throw;
             } catch (...) {
                 if (session_->state.load(std::memory_order_acquire) ==
                     DatabaseState::RecoveryRequired) {
@@ -640,6 +650,29 @@ private:
         session.opened.keys.mainData.erase();
         session.opened.keys.recovery.erase();
         session.opened.keys.blob.erase();
+    }
+
+    static void enterRecoveryAfterCorruption(
+        Session& session,
+        ChildLifetime& lifetime) noexcept {
+        try {
+            std::lock_guard lock{session.mutex};
+            session.state.store(
+                DatabaseState::RecoveryRequired,
+                std::memory_order_release);
+            session.liveTransactions = 0;
+            session.activeReaders = 0;
+            session.activeReadGenerations.clear();
+            session.writerActive = false;
+            lifetime.invalidated.store(true, std::memory_order_release);
+            session.writerAvailable.notify_all();
+        } catch (...) {
+            session.state.store(
+                DatabaseState::RecoveryRequired,
+                std::memory_order_release);
+            lifetime.invalidated.store(true, std::memory_order_release);
+            session.writerAvailable.notify_all();
+        }
     }
 
     static void shutdownSession(

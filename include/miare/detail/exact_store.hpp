@@ -650,6 +650,9 @@ template<class Limits, class Allocator>
     ProviderSet& providers,
     const Allocator& allocator,
     bool compressionEligible = true) {
+    if (reference.null()) {
+        throwCorrupt("authenticated extent reference is null");
+    }
     validateExtentReference<Limits>(reference, opened.format.generation, opened.format.highWaterBytes);
     constexpr auto pageCeiling = std::max<std::uint64_t>(
         16U * 1024U, Limits::allocationQuantumBytes);
@@ -788,6 +791,9 @@ template<class Allocator>
         const auto slot = slotsOffset + index * 8U;
         const auto entryOffset = readLittleEndian<std::uint32_t>(payload, slot);
         const auto entryLength = readLittleEndian<std::uint32_t>(payload, slot + 4);
+        if (entryOffset > usedLength || usedLength - entryOffset < 4U) {
+            throwCorrupt("allocator index entry is out of bounds");
+        }
         const auto suffixLength = readLittleEndian<std::uint32_t>(payload, entryOffset);
         if (entryOffset != expectedEntry || suffixLength != keyLength - prefixLength ||
             entryLength != 12U + suffixLength ||
@@ -1368,6 +1374,12 @@ template<class Limits, class Allocator>
     }
     auto rootPayload = readAuthenticatedExtent<Limits>(
         file, reference, kind, std::nullopt, opened, providers, allocator);
+    if (readLittleEndian<std::uint16_t>(
+            rootPayload, PageLayout::type) == 2 &&
+        readLittleEndian<std::uint32_t>(
+            rootPayload, PageLayout::entryCount) == 0) {
+        throwCorrupt("ordered internal root has no separators");
+    }
     const auto level = readLittleEndian<std::uint32_t>(rootPayload, PageLayout::level);
     (void)loadOrderedPage<Limits>(
         file, reference, level, opened, providers, allocator, values, reachable,
