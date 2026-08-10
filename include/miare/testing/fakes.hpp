@@ -469,6 +469,7 @@ public:
                 std::move(allocator),
                 std::move(openedDatabase),
                 std::move(values),
+                64U * 1024U * 1024U,
                 256});
     }
 };

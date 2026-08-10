@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <condition_variable>
@@ -72,6 +73,11 @@ template<class Allocator>
 template<class Allocator>
 struct MutableTreeNode;
 
+struct ActiveReader {
+    std::uint64_t generation = 0;
+    std::chrono::steady_clock::time_point startedAt;
+};
+
 template<class Allocator, class Limits>
 struct DatabaseSession {
     DatabaseSession(
@@ -80,6 +86,7 @@ struct DatabaseSession {
         Allocator openedAllocator,
         OpenedDatabase openedDatabase,
         OrderedKeyValues<Allocator> openedValues,
+        std::size_t configuredCacheCapacityBytes,
         std::uint32_t configuredMaxReaders)
         : file(std::move(openedFile)),
           providers(std::move(openedProviders)),
@@ -90,10 +97,15 @@ struct DatabaseSession {
               typename std::allocator_traits<Allocator>::
                   template rebind_alloc<MutableTreeNode<Allocator>>{allocator},
               allocator)),
-          activeReadGenerations(
+          activeReaders(
               std::less<std::uint64_t>{},
-              typename std::allocator_traits<Allocator>::
-                  template rebind_alloc<std::uint64_t>{allocator}),
+              typename std::allocator_traits<Allocator>::template rebind_alloc<
+                  std::pair<const std::uint64_t, ActiveReader>>{allocator}),
+          retiredBlocksByGeneration(
+              std::less<std::uint64_t>{},
+              typename std::allocator_traits<Allocator>::template rebind_alloc<
+                  std::pair<const std::uint64_t, std::uint64_t>>{allocator}),
+          cacheCapacityBytes(configuredCacheCapacityBytes),
           maxReaders(configuredMaxReaders) {}
 
     std::unique_ptr<DurableFile> file;
@@ -103,21 +115,35 @@ struct DatabaseSession {
     OrderedKeyValues<Allocator> values;
     bool valuesLoaded = false;
     std::shared_ptr<MutableTreeNode<Allocator>> cursorTree;
-    std::multiset<
+    std::map<
+        std::uint64_t,
+        ActiveReader,
+        std::less<std::uint64_t>,
+        typename std::allocator_traits<Allocator>::template rebind_alloc<
+            std::pair<const std::uint64_t, ActiveReader>>> activeReaders;
+    std::map<
+        std::uint64_t,
         std::uint64_t,
         std::less<std::uint64_t>,
-        typename std::allocator_traits<Allocator>::
-            template rebind_alloc<std::uint64_t>> activeReadGenerations;
+        typename std::allocator_traits<Allocator>::template rebind_alloc<
+            std::pair<const std::uint64_t, std::uint64_t>>>
+        retiredBlocksByGeneration;
     std::mutex mutex;
     std::condition_variable writerAvailable;
     std::uint64_t nextWriterTicket = 0;
     std::uint64_t servingWriterTicket = 0;
     std::size_t waitingWriters = 0;
-    std::size_t activeReaders = 0;
     bool writerActive = false;
     std::size_t liveTransactions = 0;
+    std::uint64_t nextReaderIdentity = 0;
+    std::uint64_t liveBlocks =
+        commonRegionBytes / Limits::allocationQuantumBytes;
+    bool allocatorSnapshotLoaded = opened.format.generation == 1;
+    std::size_t cacheCapacityBytes;
     std::uint32_t maxReaders;
     std::atomic<DatabaseState> state{DatabaseState::Open};
+    std::atomic<RecoveryCause> recoveryCause{RecoveryCause::None};
+    std::atomic<std::uint64_t> capacityFailureCount{0};
 };
 
 struct ExtentReference {
@@ -130,6 +156,19 @@ struct ExtentReference {
         return blockIndex == 0 && blockCount == 0 && encodedLength == 0 &&
             creationGeneration == 0;
     }
+};
+
+template<class Allocator>
+struct AllocatorSnapshot {
+    using RetirementCounts = std::map<
+        std::uint64_t,
+        std::uint64_t,
+        std::less<std::uint64_t>,
+        typename std::allocator_traits<Allocator>::template rebind_alloc<
+            std::pair<const std::uint64_t, std::uint64_t>>>;
+
+    std::uint64_t liveBlocks = 0;
+    RetirementCounts retiredBlocksByGeneration;
 };
 
 struct ExtentLayout {
@@ -1310,6 +1349,65 @@ inline void loadAllocatorReferences(
     }
 }
 
+template<class Limits, class Allocator>
+[[nodiscard]] inline AllocatorSnapshot<Allocator> loadAllocatorSnapshot(
+    DurableFile& file,
+    OpenedDatabase& opened,
+    ProviderSet& providers,
+    const Allocator& allocator) {
+    using Snapshot = AllocatorSnapshot<Allocator>;
+    using RetirementAllocator = typename std::allocator_traits<Allocator>::
+        template rebind_alloc<std::pair<const std::uint64_t, std::uint64_t>>;
+    const auto commonBlocks = commonRegionBytes / Limits::allocationQuantumBytes;
+    Snapshot snapshot{
+        commonBlocks,
+        typename Snapshot::RetirementCounts{
+            std::less<std::uint64_t>{}, RetirementAllocator{allocator}}};
+    auto payloadResult = shallowValidateAllocatorRoot<Limits>(
+        file, opened, providers, allocator);
+    if (!payloadResult) {
+        return snapshot;
+    }
+
+    const auto& payload = *payloadResult;
+    const auto reachableBlocks = readLittleEndian<std::uint64_t>(
+        payload, AllocatorRootLayout::reachableBlocks);
+    snapshot.liveBlocks += reachableBlocks;
+    const auto retiredRoot = decodeExtentReference(
+        ByteView{payload}.subspan(AllocatorRootLayout::retiredRoot, 32));
+    if (retiredRoot.null()) {
+        return snapshot;
+    }
+
+    ExtentReferences<Allocator> indexReferences{
+        typename std::allocator_traits<Allocator>::
+            template rebind_alloc<ExtentReference>{allocator}};
+    const auto retiredRuns = loadAllocatorIndexPage<Limits>(
+        file,
+        retiredRoot,
+        true,
+        std::nullopt,
+        opened,
+        providers,
+        allocator,
+        indexReferences);
+    std::uint64_t retiredBlocks = 0;
+    for (const auto& run : retiredRuns) {
+        if (run.retirementGeneration == 0 ||
+            run.retirementGeneration > opened.format.generation ||
+            run.count > std::numeric_limits<std::uint64_t>::max() - retiredBlocks) {
+            throwCorrupt("allocator retirement diagnostics are invalid");
+        }
+        retiredBlocks += run.count;
+        snapshot.retiredBlocksByGeneration[run.retirementGeneration] += run.count;
+    }
+    if (retiredBlocks != readLittleEndian<std::uint64_t>(
+            payload, AllocatorRootLayout::retiredBlocks)) {
+        throwCorrupt("allocator retirement diagnostics contradict their counter");
+    }
+    return snapshot;
+}
+
 template<class Limits>
 inline void validateOrderedPageReference(
     const ExtentReference& reference,
@@ -2069,8 +2167,10 @@ inline void commitExact(
         std::numeric_limits<std::uint64_t>::max();
     {
         std::lock_guard lock{session.mutex};
-        if (!session.activeReadGenerations.empty()) {
-            oldestReaderGeneration = *session.activeReadGenerations.begin();
+        for (const auto& [identity, reader] : session.activeReaders) {
+            (void)identity;
+            oldestReaderGeneration = std::min(
+                oldestReaderGeneration, reader.generation);
         }
     }
     for (const auto& run : persistedRetiredRuns) {
@@ -2462,8 +2562,12 @@ inline void commitExact(
         freeBlocks += run.count;
     }
     std::uint64_t retiredBlocks = 0;
+    decltype(session.retiredBlocksByGeneration) committedRetirementCounts{
+        session.retiredBlocksByGeneration.key_comp(),
+        session.retiredBlocksByGeneration.get_allocator()};
     for (const auto& run : retiredRuns) {
         retiredBlocks += run.count;
+        committedRetirementCounts[run.retirementGeneration] += run.count;
     }
     std::array<std::byte, AllocatorRootLayout::bytes> allocatorPayload{};
     MutableByteView allocatorOutput{allocatorPayload};
@@ -2524,6 +2628,17 @@ inline void commitExact(
         *session.providers);
 
     bool publicationStarted = false;
+    const auto recordAbandonedTail = [&]() noexcept {
+        try {
+            const auto physicalBytes = session.file->size();
+            std::lock_guard lock{session.mutex};
+            session.opened.abandonedTailBytes =
+                physicalBytes > session.opened.format.highWaterBytes
+                ? physicalBytes - session.opened.format.highWaterBytes
+                : 0;
+        } catch (...) {
+        }
+    };
     try {
         session.file->resize(highWaterBytes);
         for (const auto& extent : extents) {
@@ -2538,6 +2653,12 @@ inline void commitExact(
             publication.slot);
         session.file->stableStorageBarrier();
     } catch (const DatabaseError& error) {
+        recordAbandonedTail();
+        session.recoveryCause.store(
+            publicationStarted
+                ? RecoveryCause::CommitOutcomeUnknown
+                : RecoveryCause::CommitKnownUnpublished,
+            std::memory_order_release);
         session.state.store(
             DatabaseState::RecoveryRequired, std::memory_order_release);
         throw DatabaseError{
@@ -2547,6 +2668,10 @@ inline void commitExact(
                 : "commit failed before publication",
             error.nativeCode()};
     } catch (...) {
+        recordAbandonedTail();
+        session.recoveryCause.store(
+            RecoveryCause::CommitOutcomeUnknown,
+            std::memory_order_release);
         session.state.store(
             DatabaseState::RecoveryRequired, std::memory_order_release);
         throw;
@@ -2559,9 +2684,16 @@ inline void commitExact(
         session.opened.format.highWaterBytes = highWaterBytes;
         session.opened.format.orderedRoot = encodeExtentReference(root);
         session.opened.format.allocatorRoot = encodeExtentReference(allocatorRoot);
+        session.opened.rejectedInactivePublication = false;
+        session.opened.abandonedTailBytes = 0;
         session.values = std::move(committedValues);
         session.cursorTree = std::move(committedCursorTree);
         session.valuesLoaded = true;
+        session.liveBlocks =
+            commonRegionBytes / Limits::allocationQuantumBytes + reachableBlocks;
+        session.retiredBlocksByGeneration = std::move(
+            committedRetirementCounts);
+        session.allocatorSnapshotLoaded = true;
     }
 }
 

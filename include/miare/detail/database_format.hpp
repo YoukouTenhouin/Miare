@@ -432,6 +432,8 @@ struct OpenedDatabase {
     SessionKeys keys;
     Bootstrap bootstrap;
     PublicationPlaintext publication;
+    bool rejectedInactivePublication = false;
+    std::uint64_t abandonedTailBytes = 0;
 };
 
 [[noreturn]] inline void throwCorrupt(const char* message) {
@@ -729,7 +731,9 @@ template<class Limits>
             *formats[selected],
             std::move(keys),
             bootstrap,
-            *plaintexts[selected]});
+            *plaintexts[selected],
+            !formats[1U - selected].has_value(),
+            physicalBytes - formats[selected]->highWaterBytes});
 }
 
 } // namespace miare::detail
