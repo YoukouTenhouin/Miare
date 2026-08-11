@@ -9,18 +9,28 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <cerrno>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdio>
 #include <filesystem>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <system_error>
 #include <thread>
 #include <utility>
 #include <vector>
+
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace miare {
 
@@ -93,6 +103,165 @@ private:
     // this pointer is never copied outside the sole Database owner.
     using SessionPtr = std::shared_ptr<Session>;
 
+    class BlobStagingFile : public detail::BlobStagingStorage {
+    public:
+        BlobStagingFile() : file_(std::tmpfile()) {
+            if (!file_) {
+                throw DatabaseError{
+                    Errc::Io,
+                    "could not create Blob staging storage",
+                    std::error_code{errno, std::generic_category()}};
+            }
+        }
+
+        BlobStagingFile(const BlobStagingFile&) = delete;
+        BlobStagingFile& operator=(const BlobStagingFile&) = delete;
+
+        ~BlobStagingFile() {
+            if (file_) {
+                std::fclose(file_);
+            }
+        }
+
+        void append(ByteView source) override {
+            if (source.empty()) {
+                return;
+            }
+            if (!seekToEnd() ||
+                std::fwrite(source.data(), 1, source.size(), file_) !=
+                source.size()) {
+                throw DatabaseError{
+                    Errc::Io,
+                    "could not write Blob staging storage",
+                    std::error_code{errno, std::generic_category()}};
+            }
+        }
+
+        void readExactAt(
+            std::uint64_t offset,
+            MutableByteView destination) override {
+            if (destination.empty()) {
+                return;
+            }
+            if (std::fflush(file_) != 0 || !seek(offset) ||
+                std::fread(destination.data(), 1, destination.size(), file_) !=
+                    destination.size()) {
+                throw DatabaseError{
+                    Errc::Io,
+                    "could not read Blob staging storage",
+                    std::error_code{errno, std::generic_category()}};
+            }
+        }
+
+        void truncate(std::uint64_t length) override {
+            if (std::fflush(file_) != 0 || !truncateFile(length)) {
+                throw DatabaseError{
+                    Errc::Io,
+                    "could not truncate Blob staging storage",
+                    std::error_code{errno, std::generic_category()}};
+            }
+        }
+
+    private:
+        [[nodiscard]] bool seekToEnd() noexcept {
+#ifdef _WIN32
+            return _fseeki64(file_, 0, SEEK_END) == 0;
+#else
+            return ::fseeko(file_, 0, SEEK_END) == 0;
+#endif
+        }
+
+        [[nodiscard]] bool truncateFile(std::uint64_t length) noexcept {
+#ifdef _WIN32
+            return length <= static_cast<std::uint64_t>(
+                       std::numeric_limits<__int64>::max()) &&
+                _chsize_s(_fileno(file_), static_cast<__int64>(length)) == 0;
+#else
+            return length <= static_cast<std::uint64_t>(
+                       std::numeric_limits<off_t>::max()) &&
+                ::ftruncate(fileno(file_), static_cast<off_t>(length)) == 0;
+#endif
+        }
+
+        [[nodiscard]] bool seek(std::uint64_t offset) noexcept {
+#ifdef _WIN32
+            if (offset > static_cast<std::uint64_t>(
+                    std::numeric_limits<__int64>::max())) {
+                return false;
+            }
+            return _fseeki64(file_, static_cast<__int64>(offset), SEEK_SET) == 0;
+#else
+            if (offset > static_cast<std::uint64_t>(
+                    std::numeric_limits<off_t>::max())) {
+                return false;
+            }
+            return ::fseeko(file_, static_cast<off_t>(offset), SEEK_SET) == 0;
+#endif
+        }
+
+        std::FILE* file_;
+    };
+
+    using BlobVersion = detail::BlobVersion<Allocator>;
+    using BlobVersionPtr = detail::BlobVersionPtr<Allocator>;
+    using BlobCatalog = detail::BlobCatalog<Allocator>;
+    using BlobIdSet = std::set<
+        BlobId,
+        std::less<BlobId>,
+        typename std::allocator_traits<Allocator>::template rebind_alloc<BlobId>>;
+
+    struct BlobReaderLifetime {
+        std::atomic<bool> invalidated{false};
+        std::atomic<std::uint32_t> liveReaders{0};
+    };
+
+    struct WriteBlobState {
+        explicit WriteBlobState(Session& owner)
+            : session(&owner),
+              blobs(
+                  std::less<BlobId>{},
+                  typename BlobCatalog::allocator_type{owner.allocator}),
+              generatedIds(
+                  std::less<BlobId>{},
+                  typename BlobIdSet::allocator_type{owner.allocator}),
+              openWriterIds(
+                  std::less<BlobId>{},
+                  typename BlobIdSet::allocator_type{owner.allocator}),
+              thread(std::this_thread::get_id()) {
+            blobs = owner.blobs;
+        }
+
+        Session* session;
+        BlobCatalog blobs;
+        BlobIdSet generatedIds;
+        BlobIdSet openWriterIds;
+        std::thread::id thread;
+        std::uint64_t mutations = 0;
+        std::uint64_t bytesWritten = 0;
+        std::uint32_t openWriters = 0;
+        std::atomic<bool> active{true};
+    };
+
+    [[nodiscard]] static BlobCatalog makeBlobCatalog(const Allocator& allocator) {
+        return detail::makeBlobCatalog(allocator);
+    }
+
+    [[nodiscard]] static std::shared_ptr<BlobReaderLifetime>
+    makeBlobReaderLifetime(const Allocator& allocator) {
+        using LifetimeAllocator = typename std::allocator_traits<Allocator>::
+            template rebind_alloc<BlobReaderLifetime>;
+        return std::allocate_shared<BlobReaderLifetime>(
+            LifetimeAllocator{allocator});
+    }
+
+    [[nodiscard]] static std::shared_ptr<WriteBlobState>
+    makeWriteBlobState(Session& session) {
+        using StateAllocator = typename std::allocator_traits<Allocator>::
+            template rebind_alloc<WriteBlobState>;
+        return std::allocate_shared<WriteBlobState>(
+            StateAllocator{session.allocator}, session);
+    }
+
 public:
     using OwnedBytes = std::vector<
         std::byte,
@@ -101,6 +270,254 @@ public:
 public:
     using ReadCursor = detail::OrderedCursor<Allocator, Limits, false>;
     using WriteCursor = detail::OrderedCursor<Allocator, Limits, true>;
+
+    class BlobReader {
+    public:
+        BlobReader(const BlobReader&) = delete;
+        BlobReader& operator=(const BlobReader&) = delete;
+
+        BlobReader(BlobReader&& other) noexcept
+            : session_(std::exchange(other.session_, nullptr)),
+              sessionLifetime_(std::move(other.sessionLifetime_)),
+              lifetime_(std::move(other.lifetime_)),
+              version_(std::move(other.version_)),
+              thread_(other.thread_),
+              position_(other.position_),
+              active_(std::exchange(other.active_, false)) {}
+
+        BlobReader& operator=(BlobReader&&) = delete;
+
+        ~BlobReader() { close(); }
+
+        [[nodiscard]] BlobId id() const {
+            requireFunctional();
+            return version_->id;
+        }
+
+        [[nodiscard]] std::uint64_t size() const {
+            requireFunctional();
+            return version_->size;
+        }
+
+        [[nodiscard]] std::uint64_t position() const {
+            requireFunctional();
+            return position_;
+        }
+
+        std::size_t read(MutableByteView destination) {
+            requireFunctional();
+            const auto available = version_->size - position_;
+            const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(
+                available, destination.size()));
+            if (count != 0) {
+                if (version_->staging) {
+                    version_->staging->readExactAt(
+                        position_, destination.first(count));
+                } else {
+                    try {
+                        detail::readBlobRange<Limits>(
+                            *session_,
+                            *version_,
+                            position_,
+                            destination.first(count));
+                    } catch (const DatabaseError& error) {
+                        if (error.code() == Errc::Corrupt) {
+                            Database::enterRecoveryAfterCorruption(
+                                *session_, *sessionLifetime_);
+                        }
+                        throw;
+                    }
+                }
+                position_ += count;
+            }
+            return count;
+        }
+
+        void seek(std::uint64_t absoluteOffset) {
+            requireFunctional();
+            if (absoluteOffset > version_->size) {
+                throw ContractError{
+                    Errc::InvalidArgument,
+                    "Blob seek exceeds its logical size"};
+            }
+            position_ = absoluteOffset;
+        }
+
+        void close() noexcept {
+            if (!active_) {
+                return;
+            }
+            active_ = false;
+            if (lifetime_ &&
+                !lifetime_->invalidated.load(std::memory_order_acquire)) {
+                lifetime_->liveReaders.fetch_sub(1, std::memory_order_relaxed);
+            }
+            version_.reset();
+            lifetime_.reset();
+            sessionLifetime_.reset();
+            session_ = nullptr;
+        }
+
+        [[nodiscard]] bool active() const noexcept {
+            return active_ && lifetime_ && sessionLifetime_ &&
+                !lifetime_->invalidated.load(std::memory_order_acquire) &&
+                !sessionLifetime_->invalidated.load(std::memory_order_acquire);
+        }
+
+    private:
+        friend class Database;
+        friend class ReadTransaction;
+        friend class WriteTransaction;
+
+        BlobReader(
+            Session& session,
+            std::shared_ptr<ChildLifetime> sessionLifetime,
+            std::shared_ptr<BlobReaderLifetime> lifetime,
+            BlobVersionPtr version,
+            std::thread::id thread)
+            : session_(&session),
+              sessionLifetime_(std::move(sessionLifetime)),
+              lifetime_(std::move(lifetime)),
+              version_(std::move(version)),
+              thread_(thread),
+              position_(0),
+              active_(true) {
+            lifetime_->liveReaders.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        void requireFunctional() const {
+            if (!active()) {
+                throw ContractError{Errc::InvalidState, "Blob reader is inactive"};
+            }
+            if (thread_ != std::this_thread::get_id()) {
+                throw ContractError{
+                    Errc::WrongThread,
+                    "Blob reader belongs to another thread"};
+            }
+        }
+
+        Session* session_;
+        std::shared_ptr<ChildLifetime> sessionLifetime_;
+        std::shared_ptr<BlobReaderLifetime> lifetime_;
+        BlobVersionPtr version_;
+        std::thread::id thread_;
+        std::uint64_t position_;
+        bool active_;
+    };
+
+    class BlobWriter {
+    public:
+        BlobWriter(const BlobWriter&) = delete;
+        BlobWriter& operator=(const BlobWriter&) = delete;
+
+        BlobWriter(BlobWriter&& other) noexcept
+            : state_(std::move(other.state_)),
+              staging_(std::move(other.staging_)),
+              id_(other.id_),
+              position_(other.position_),
+              active_(std::exchange(other.active_, false)) {}
+
+        BlobWriter& operator=(BlobWriter&&) = delete;
+
+        ~BlobWriter() { abort(); }
+
+        [[nodiscard]] BlobId id() const {
+            requireFunctional();
+            return id_;
+        }
+
+        [[nodiscard]] std::uint64_t position() const {
+            requireFunctional();
+            return position_;
+        }
+
+        void write(ByteView source) {
+            requireFunctional();
+            if (source.size() > Limits::maxBlobBytes - position_ ||
+                source.size() > Limits::maxBlobBytesPerTransaction -
+                    state_->bytesWritten) {
+                state_->session->capacityFailureCount.fetch_add(
+                    1, std::memory_order_relaxed);
+                throw DatabaseError{
+                    Errc::ResourceLimit,
+                    "Blob streaming exceeds the capacity profile"};
+            }
+            staging_->append(source);
+            position_ += source.size();
+            state_->bytesWritten += source.size();
+        }
+
+        void finish() {
+            requireFunctional();
+            using VersionAllocator = typename std::allocator_traits<Allocator>::
+                template rebind_alloc<BlobVersion>;
+            auto version = std::allocate_shared<BlobVersion>(
+                VersionAllocator{state_->session->allocator},
+                id_,
+                position_,
+                staging_,
+                state_->session->allocator);
+            state_->blobs.insert_or_assign(id_, std::move(version));
+            state_->openWriterIds.erase(id_);
+            --state_->openWriters;
+            active_ = false;
+            staging_.reset();
+            state_.reset();
+        }
+
+        void abort() noexcept {
+            if (!active_) {
+                return;
+            }
+            active_ = false;
+            if (state_ && state_->active.load(std::memory_order_acquire)) {
+                try {
+                    state_->openWriterIds.erase(id_);
+                    --state_->openWriters;
+                    --state_->mutations;
+                } catch (...) {
+                }
+            }
+            staging_.reset();
+            state_.reset();
+        }
+
+        [[nodiscard]] bool active() const noexcept {
+            return active_ && state_ &&
+                state_->active.load(std::memory_order_acquire);
+        }
+
+    private:
+        friend class Database;
+        friend class WriteTransaction;
+
+        BlobWriter(
+            std::shared_ptr<WriteBlobState> state,
+            std::shared_ptr<BlobStagingFile> staging,
+            BlobId id)
+            : state_(std::move(state)),
+              staging_(std::move(staging)),
+              id_(id),
+              position_(0),
+              active_(true) {}
+
+        void requireFunctional() const {
+            if (!active()) {
+                throw ContractError{Errc::InvalidState, "Blob writer is inactive"};
+            }
+            if (state_->thread != std::this_thread::get_id()) {
+                throw ContractError{
+                    Errc::WrongThread,
+                    "Blob writer belongs to another thread"};
+            }
+        }
+
+        std::shared_ptr<WriteBlobState> state_;
+        std::shared_ptr<BlobStagingFile> staging_;
+        BlobId id_;
+        std::uint64_t position_;
+        bool active_;
+    };
 
     class ReadTransaction {
     public:
@@ -113,6 +530,8 @@ public:
               values_(std::move(other.values_)),
               tree_(std::move(other.tree_)),
               cursorLifetime_(std::move(other.cursorLifetime_)),
+              blobs_(std::move(other.blobs_)),
+              blobReaderLifetime_(std::move(other.blobReaderLifetime_)),
               readerIdentity_(other.readerIdentity_),
               thread_(other.thread_),
               active_(std::exchange(other.active_, false)) {
@@ -127,6 +546,9 @@ public:
 #ifndef NDEBUG
             assert(!active_ || !cursorLifetime_ ||
                 cursorLifetime_->liveCursors == 0);
+            assert(!active_ || !blobReaderLifetime_ ||
+                blobReaderLifetime_->liveReaders.load(
+                    std::memory_order_relaxed) == 0);
 #endif
             end();
         }
@@ -149,12 +571,35 @@ public:
             return makeCursor<false>(*session_, cursorLifetime_, range);
         }
 
+        [[nodiscard]] std::optional<BlobReader> openBlob(BlobId id) {
+            requireFunctional();
+            const auto found = blobs_.find(id);
+            if (found == blobs_.end()) {
+                return std::nullopt;
+            }
+            if (blobReaderLifetime_->liveReaders.load(
+                    std::memory_order_relaxed) ==
+                Limits::maxBlobReadersPerTransaction) {
+                session_->capacityFailureCount.fetch_add(
+                    1, std::memory_order_relaxed);
+                throw DatabaseError{
+                    Errc::ResourceLimit,
+                    "transaction Blob-reader limit reached"};
+            }
+            return BlobReader{
+                *session_, lifetime_, blobReaderLifetime_, found->second, thread_};
+        }
+
         void end() noexcept {
             if (!active_) {
                 return;
             }
             active_ = false;
             detail::invalidateCursors(cursorLifetime_);
+            if (blobReaderLifetime_) {
+                blobReaderLifetime_->invalidated.store(
+                    true, std::memory_order_release);
+            }
             if (lifetime_ &&
                 !lifetime_->invalidated.load(std::memory_order_acquire)) {
                 releaseTransaction(
@@ -178,12 +623,16 @@ public:
             OrderedKeyValues values,
             MutableTree tree,
             std::shared_ptr<CursorLifetime> cursorLifetime,
+            BlobCatalog blobs,
+            std::shared_ptr<BlobReaderLifetime> blobReaderLifetime,
             std::uint64_t readerIdentity)
             : session_(&session),
               lifetime_(std::move(lifetime)),
               values_(std::move(values)),
               tree_(std::move(tree)),
               cursorLifetime_(std::move(cursorLifetime)),
+              blobs_(std::move(blobs)),
+              blobReaderLifetime_(std::move(blobReaderLifetime)),
               readerIdentity_(readerIdentity),
               thread_(std::this_thread::get_id()),
               active_(true) {
@@ -208,6 +657,8 @@ public:
         OrderedKeyValues values_;
         MutableTree tree_;
         std::shared_ptr<CursorLifetime> cursorLifetime_;
+        BlobCatalog blobs_;
+        std::shared_ptr<BlobReaderLifetime> blobReaderLifetime_;
         std::uint64_t readerIdentity_;
         std::thread::id thread_;
         bool active_;
@@ -224,6 +675,8 @@ public:
               values_(std::move(other.values_)),
               tree_(std::move(other.tree_)),
               cursorLifetime_(std::move(other.cursorLifetime_)),
+              blobState_(std::move(other.blobState_)),
+              blobReaderLifetime_(std::move(other.blobReaderLifetime_)),
               thread_(other.thread_),
               keyMutations_(other.keyMutations_),
               changed_(other.changed_),
@@ -240,6 +693,10 @@ public:
 #ifndef NDEBUG
             assert(!active_ || !cursorLifetime_ ||
                 cursorLifetime_->liveCursors == 0);
+            assert(!active_ || !blobReaderLifetime_ ||
+                blobReaderLifetime_->liveReaders.load(
+                    std::memory_order_relaxed) == 0);
+            assert(!active_ || !blobState_ || blobState_->openWriters == 0);
 #endif
             rollback();
         }
@@ -261,6 +718,102 @@ public:
             requireFunctional();
             ensureCursorTree();
             return makeCursor<true>(*session_, cursorLifetime_, range);
+        }
+
+        [[nodiscard]] std::optional<BlobReader> openBlob(BlobId id) {
+            requireFunctional();
+            const auto found = blobState_->blobs.find(id);
+            if (found == blobState_->blobs.end()) {
+                return std::nullopt;
+            }
+            if (blobReaderLifetime_->liveReaders.load(
+                    std::memory_order_relaxed) ==
+                Limits::maxBlobReadersPerTransaction) {
+                session_->capacityFailureCount.fetch_add(
+                    1, std::memory_order_relaxed);
+                throw DatabaseError{
+                    Errc::ResourceLimit,
+                    "transaction Blob-reader limit reached"};
+            }
+            return BlobReader{
+                *session_, lifetime_, blobReaderLifetime_, found->second, thread_};
+        }
+
+        [[nodiscard]] BlobWriter createBlob() {
+            requireFunctional();
+            requireBlobWriterCapacity();
+            std::array<std::byte, BlobId::encodedSize> randomBytes{};
+            std::optional<BlobId> selected;
+            for (unsigned attempt = 0; attempt != 256; ++attempt) {
+                detail::ProviderAccess::crypto(*session_->providers)
+                    .randomBytes(randomBytes);
+                const auto candidate = BlobId::fromBytes(randomBytes);
+                if (!blobState_->blobs.contains(candidate) &&
+                    !blobState_->generatedIds.contains(candidate)) {
+                    selected = candidate;
+                    break;
+                }
+            }
+            if (!selected) {
+                session_->capacityFailureCount.fetch_add(
+                    1, std::memory_order_relaxed);
+                throw DatabaseError{
+                    Errc::ResourceLimit,
+                    "could not reserve a fresh Blob identifier"};
+            }
+            using StagingAllocator = typename std::allocator_traits<Allocator>::
+                template rebind_alloc<BlobStagingFile>;
+            auto staging = std::allocate_shared<BlobStagingFile>(
+                StagingAllocator{session_->allocator});
+            blobState_->generatedIds.insert(*selected);
+            try {
+                blobState_->openWriterIds.insert(*selected);
+            } catch (...) {
+                blobState_->generatedIds.erase(*selected);
+                throw;
+            }
+            ++blobState_->mutations;
+            ++blobState_->openWriters;
+            return BlobWriter{blobState_, std::move(staging), *selected};
+        }
+
+        [[nodiscard]] std::optional<BlobWriter> replaceBlob(BlobId id) {
+            requireFunctional();
+            const auto found = blobState_->blobs.find(id);
+            if (found == blobState_->blobs.end()) {
+                return std::nullopt;
+            }
+            if (blobState_->openWriterIds.contains(id)) {
+                throw ContractError{
+                    Errc::InvalidState,
+                    "Blob already has an unfinished writer"};
+            }
+            requireBlobWriterCapacity();
+            using StagingAllocator = typename std::allocator_traits<Allocator>::
+                template rebind_alloc<BlobStagingFile>;
+            auto staging = std::allocate_shared<BlobStagingFile>(
+                StagingAllocator{session_->allocator});
+            blobState_->openWriterIds.insert(id);
+            ++blobState_->mutations;
+            ++blobState_->openWriters;
+            return BlobWriter{blobState_, std::move(staging), id};
+        }
+
+        [[nodiscard]] bool eraseBlob(BlobId id) {
+            requireFunctional();
+            if (blobState_->openWriterIds.contains(id)) {
+                throw ContractError{
+                    Errc::InvalidState,
+                    "cannot erase a Blob with an unfinished writer"};
+            }
+            const auto found = blobState_->blobs.find(id);
+            if (found == blobState_->blobs.end()) {
+                return false;
+            }
+            requireBlobMutationCapacity();
+            blobState_->blobs.erase(found);
+            ++blobState_->mutations;
+            return true;
         }
 
         void put(ByteView key, ByteView value) {
@@ -301,29 +854,48 @@ public:
 
         [[nodiscard]] WriteTransactionStats stats() const {
             requireFunctional();
-            const auto estimatedGrowth = changed_ && !values_.empty()
+            const auto keyGrowth = changed_ && !values_.empty()
                 ? std::max<std::uint64_t>(
                       16U * 1024U,
                       Limits::allocationQuantumBytes)
                 : 0;
+            const auto blobGrowth = blobState_->mutations == 0
+                ? 0
+                : std::max<std::uint64_t>(
+                      blobState_->bytesWritten,
+                      std::max<std::uint64_t>(
+                          16U * 1024U,
+                          Limits::allocationQuantumBytes));
+            const auto estimatedGrowth =
+                keyGrowth > std::numeric_limits<std::uint64_t>::max() -
+                        blobGrowth
+                ? std::numeric_limits<std::uint64_t>::max()
+                : keyGrowth + blobGrowth;
             return WriteTransactionStats{
                 keyMutations_,
-                0,
-                0,
+                blobState_->mutations,
+                blobState_->bytesWritten,
                 estimatedGrowth,
-                0};
+                blobState_->openWriters};
         }
 
         void commit() {
             requireFunctional();
-            if (!changed_) {
+            if (blobState_->openWriters != 0) {
+                throw ContractError{
+                    Errc::InvalidState,
+                    "commit requires every Blob writer to be finished or aborted"};
+            }
+            if (!changed_ && blobState_->mutations == 0) {
                 active_ = false;
                 detail::invalidateCursors(cursorLifetime_);
+                invalidateBlobHandles();
                 releaseTransaction(*session_, *lifetime_, true);
                 return;
             }
             try {
-                detail::commitExact<Limits>(*session_, values_);
+                detail::commitExact<Limits>(
+                    *session_, values_, blobState_->blobs);
             } catch (const DatabaseError& error) {
                 if (error.code() == Errc::ResourceLimit) {
                     session_->capacityFailureCount.fetch_add(
@@ -336,6 +908,7 @@ public:
                     DatabaseState::RecoveryRequired) {
                     active_ = false;
                     detail::invalidateCursors(cursorLifetime_);
+                    invalidateBlobHandles();
                     releaseTransaction(*session_, *lifetime_, true);
                 }
                 throw;
@@ -344,12 +917,14 @@ public:
                     DatabaseState::RecoveryRequired) {
                     active_ = false;
                     detail::invalidateCursors(cursorLifetime_);
+                    invalidateBlobHandles();
                     releaseTransaction(*session_, *lifetime_, true);
                 }
                 throw;
             }
             active_ = false;
             detail::invalidateCursors(cursorLifetime_);
+            invalidateBlobHandles();
             releaseTransaction(*session_, *lifetime_, true);
         }
 
@@ -359,6 +934,7 @@ public:
             }
             active_ = false;
             detail::invalidateCursors(cursorLifetime_);
+            invalidateBlobHandles();
             if (lifetime_ &&
                 !lifetime_->invalidated.load(std::memory_order_acquire)) {
                 releaseTransaction(*session_, *lifetime_, true);
@@ -386,6 +962,8 @@ public:
               values_(std::move(values)),
               tree_(std::move(tree)),
               cursorLifetime_(std::move(cursorLifetime)),
+              blobState_(makeWriteBlobState(session)),
+              blobReaderLifetime_(makeBlobReaderLifetime(session.allocator)),
               thread_(std::this_thread::get_id()),
               keyMutations_(0),
               changed_(false),
@@ -420,6 +998,39 @@ public:
             }
         }
 
+        void requireBlobWriterCapacity() const {
+            requireBlobMutationCapacity();
+            if (blobState_->openWriters ==
+                    Limits::maxOpenBlobWritersPerTransaction) {
+                session_->capacityFailureCount.fetch_add(
+                    1, std::memory_order_relaxed);
+                throw DatabaseError{
+                    Errc::ResourceLimit,
+                    "transaction Blob-writer limit reached"};
+            }
+        }
+
+        void requireBlobMutationCapacity() const {
+            if (blobState_->mutations ==
+                Limits::maxBlobMutationsPerTransaction) {
+                session_->capacityFailureCount.fetch_add(
+                    1, std::memory_order_relaxed);
+                throw DatabaseError{
+                    Errc::ResourceLimit,
+                    "transaction Blob-mutation limit reached"};
+            }
+        }
+
+        void invalidateBlobHandles() noexcept {
+            if (blobState_) {
+                blobState_->active.store(false, std::memory_order_release);
+            }
+            if (blobReaderLifetime_) {
+                blobReaderLifetime_->invalidated.store(
+                    true, std::memory_order_release);
+            }
+        }
+
         void ensureCursorTree() {
             if (treeCurrent_) {
                 return;
@@ -436,6 +1047,8 @@ public:
         OrderedKeyValues values_;
         MutableTree tree_;
         std::shared_ptr<CursorLifetime> cursorLifetime_;
+        std::shared_ptr<WriteBlobState> blobState_;
+        std::shared_ptr<BlobReaderLifetime> blobReaderLifetime_;
         std::thread::id thread_;
         std::uint64_t keyMutations_;
         bool changed_;
@@ -635,6 +1248,7 @@ public:
         std::lock_guard lock{session.mutex};
         requireOpen(session);
         ensureValuesLoaded(session, *lifetime_);
+        ensureBlobsLoaded(session, *lifetime_);
         if (session.activeReaders.size() == session.maxReaders ||
             session.nextReaderIdentity ==
                 std::numeric_limits<std::uint64_t>::max()) {
@@ -643,9 +1257,12 @@ public:
         }
         auto snapshot = detail::makeOrderedKeyValues(session.allocator);
         snapshot = session.values;
+        auto blobSnapshot = makeBlobCatalog(session.allocator);
+        blobSnapshot = session.blobs;
         auto tree = snapshotCursorTree(session);
         auto cursorLifetime = detail::makeOrderedCursorLifetime(
             tree, lifetime_, session.allocator);
+        auto blobReaderLifetime = makeBlobReaderLifetime(session.allocator);
         const auto generation = session.opened.format.generation;
         const auto startedAt = std::chrono::steady_clock::now();
         const auto readerIdentity = session.nextReaderIdentity++;
@@ -658,6 +1275,8 @@ public:
             std::move(snapshot),
             std::move(tree),
             std::move(cursorLifetime),
+            std::move(blobSnapshot),
+            std::move(blobReaderLifetime),
             readerIdentity};
     }
 
@@ -666,6 +1285,7 @@ public:
         std::unique_lock lock{session.mutex};
         requireOpen(session);
         ensureValuesLoaded(session, *lifetime_);
+        ensureBlobsLoaded(session, *lifetime_);
         ensureAllocatorSnapshotLoaded(session, *lifetime_);
         if (session.nextWriterTicket == std::numeric_limits<std::uint64_t>::max()) {
             session.capacityFailureCount.fetch_add(1, std::memory_order_relaxed);
@@ -716,6 +1336,7 @@ public:
         std::lock_guard lock{session.mutex};
         requireOpen(session);
         ensureValuesLoaded(session, *lifetime_);
+        ensureBlobsLoaded(session, *lifetime_);
         ensureAllocatorSnapshotLoaded(session, *lifetime_);
         if (session.writerActive || session.waitingWriters != 0) {
             return Result<WriteTransaction, WriterBusy>::failure(WriterBusy{});
@@ -983,6 +1604,27 @@ private:
         }
     }
 
+    static void ensureBlobsLoaded(
+        Session& session,
+        ChildLifetime& lifetime) {
+        if (session.blobsLoaded) {
+            return;
+        }
+        try {
+            session.blobs = detail::loadBlobCatalog<Limits>(
+                *session.file,
+                session.opened,
+                *session.providers,
+                session.allocator);
+            session.blobsLoaded = true;
+        } catch (const DatabaseError& error) {
+            if (error.code() == Errc::Corrupt) {
+                enterRecoveryAfterCorruptionLocked(session, lifetime);
+            }
+            throw;
+        }
+    }
+
     static void ensureAllocatorSnapshotLoaded(
         Session& session,
         ChildLifetime& lifetime) {
@@ -1080,6 +1722,8 @@ private:
         }
         auto openedDatabase = std::move(opened).value();
         (void)detail::shallowValidateOrderedRoot<Limits>(
+            *file, openedDatabase, providers, allocator);
+        (void)detail::loadBlobCatalog<Limits>(
             *file, openedDatabase, providers, allocator);
         (void)detail::shallowValidateAllocatorRoot<Limits>(
             *file, openedDatabase, providers, allocator);

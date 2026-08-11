@@ -24,6 +24,10 @@ add_executable(miare_backend_compression_test backend_compression_test.cpp)
 target_link_libraries(miare_backend_compression_test PRIVATE miare::miare)
 add_test(NAME miare.backend_compression COMMAND miare_backend_compression_test)
 
+add_executable(miare_blob_transaction_test blob_transaction_test.cpp)
+target_link_libraries(miare_blob_transaction_test PRIVATE miare::miare)
+add_test(NAME miare.blob_transaction COMMAND miare_blob_transaction_test)
+
 add_executable(miare_database_format_test database_format_test.cpp)
 target_link_libraries(miare_database_format_test PRIVATE miare::miare)
 add_test(NAME miare.database_format COMMAND miare_database_format_test)

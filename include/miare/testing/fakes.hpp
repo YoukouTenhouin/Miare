@@ -471,6 +471,8 @@ public:
         auto openedDatabase = std::move(opened).value();
         (void)detail::shallowValidateOrderedRoot<Limits>(
             *file, openedDatabase, providers, allocator);
+        (void)detail::loadBlobCatalog<Limits>(
+            *file, openedDatabase, providers, allocator);
         (void)detail::shallowValidateAllocatorRoot<Limits>(
             *file, openedDatabase, providers, allocator);
         auto values = detail::makeOrderedKeyValues(allocator);
