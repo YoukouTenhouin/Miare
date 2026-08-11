@@ -659,6 +659,51 @@ void stagingProviderFailurePreservesWriterContents() {
     database.close();
 }
 
+void stagingAllocatorCorruptionMakesChildrenTerminal() {
+    auto file = std::make_unique<miare::testing::MemoryDurableFile>();
+    auto* fileView = file.get();
+    auto database = miare::testing::DatabaseAccess::create<
+        std::allocator<std::byte>, SmallChunkLimits>(
+        std::move(file),
+        miare::EncryptionKeyView{encryptionKey},
+        deterministicProviders(17));
+    auto seed = database.beginWrite();
+    seed.put(bytes("seed"), bytes("value"));
+    seed.commit();
+
+    const miare::ByteView image{fileView->bytes()};
+    bool corrupted = false;
+    for (std::uint64_t offset = miare::detail::commonRegionBytes;
+         offset + miare::detail::ExtentLayout::bytes <= image.size();
+         offset += SmallChunkLimits::allocationQuantumBytes) {
+        if (std::equal(
+                bytes("MIAREXT").begin(),
+                bytes("MIAREXT").end(),
+                image.begin() + static_cast<std::ptrdiff_t>(offset)) &&
+            miare::detail::readLittleEndian<std::uint16_t>(
+                image,
+                offset + miare::detail::ExtentLayout::unitKind) == 14) {
+            fileView->corruptByte(
+                offset + miare::detail::ExtentLayout::nonce);
+            corrupted = true;
+            break;
+        }
+    }
+    assert(corrupted);
+
+    auto transaction = database.beginWrite();
+    auto writer = transaction.createBlob();
+    std::vector<std::byte> content(
+        SmallChunkLimits::blobChunkBytes, std::byte{0x29});
+    expectDatabaseError(miare::Errc::Corrupt, [&] {
+        writer.write(content);
+    });
+    assert(database.state() == miare::DatabaseState::RecoveryRequired);
+    assert(!writer.active());
+    assert(!transaction.active());
+    database.close();
+}
+
 } // namespace
 
 int main() {
@@ -675,4 +720,5 @@ int main() {
     failedCommitPublishesNeitherValueNorBlob();
     stagingIoFailurePreservesWriterContents();
     stagingProviderFailurePreservesWriterContents();
+    stagingAllocatorCorruptionMakesChildrenTerminal();
 }

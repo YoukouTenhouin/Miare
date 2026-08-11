@@ -285,6 +285,7 @@ public:
 
         BlobWriter(BlobWriter&& other) noexcept
             : state_(std::move(other.state_)),
+              sessionLifetime_(std::move(other.sessionLifetime_)),
               buffer_(std::move(other.buffer_)),
               stagedChunks_(std::move(other.stagedChunks_)),
               id_(other.id_),
@@ -330,12 +331,12 @@ public:
                     Limits::blobChunkBytes;
             stagedChunks_.reserve(stagedChunks_.size() + possibleChunks);
             prepared.reserve(possibleChunks);
-            if (possibleChunks != 0) {
-                detail::initializeBlobStagingAllocator<Limits>(*state_);
-                state_->stagingFreeRuns.reserve(
-                    state_->stagingFreeRuns.size() + possibleChunks);
-            }
             try {
+                if (possibleChunks != 0) {
+                    detail::initializeBlobStagingAllocator<Limits>(*state_);
+                    state_->stagingFreeRuns.reserve(
+                        state_->stagingFreeRuns.size() + possibleChunks);
+                }
                 std::size_t consumed = 0;
                 while (consumed != source.size()) {
                     const auto count = std::min<std::size_t>(
@@ -356,6 +357,11 @@ public:
                         working.clear();
                     }
                 }
+            } catch (const DatabaseError& error) {
+                detail::releaseBlobStagingReferences<Limits>(
+                    *state_, prepared);
+                handleCorruption(error);
+                throw;
             } catch (...) {
                 detail::releaseBlobStagingReferences<Limits>(
                     *state_, prepared);
@@ -410,6 +416,13 @@ public:
                         priorVersion->chunks.begin(),
                         priorVersion->chunks.end());
                 }
+            } catch (const DatabaseError& error) {
+                if (finalChunk) {
+                    detail::releaseBlobStagingReference<Limits>(
+                        *state_, *finalChunk);
+                }
+                handleCorruption(error);
+                throw;
             } catch (...) {
                 if (finalChunk) {
                     detail::releaseBlobStagingReference<Limits>(
@@ -421,6 +434,7 @@ public:
             --state_->openWriters;
             active_ = false;
             state_.reset();
+            sessionLifetime_.reset();
         }
 
         void abort() noexcept {
@@ -439,6 +453,7 @@ public:
                 }
             }
             state_.reset();
+            sessionLifetime_.reset();
         }
 
         [[nodiscard]] bool active() const noexcept {
@@ -452,8 +467,10 @@ public:
 
         BlobWriter(
             std::shared_ptr<WriteBlobState> state,
+            std::shared_ptr<ChildLifetime> sessionLifetime,
             BlobId id)
             : state_(std::move(state)),
+              sessionLifetime_(std::move(sessionLifetime)),
               buffer_(typename std::allocator_traits<Allocator>::
                   template rebind_alloc<std::byte>{state_->session->allocator}),
               stagedChunks_(
@@ -475,7 +492,19 @@ public:
             }
         }
 
+        void handleCorruption(const DatabaseError& error) noexcept {
+            if (error.code() != Errc::Corrupt || !state_ ||
+                !sessionLifetime_) {
+                return;
+            }
+            state_->active.store(false, std::memory_order_release);
+            state_->openWriters = 0;
+            Database::enterRecoveryAfterCorruption(
+                *state_->session, *sessionLifetime_);
+        }
+
         std::shared_ptr<WriteBlobState> state_;
+        std::shared_ptr<ChildLifetime> sessionLifetime_;
         StoredBytes buffer_;
         detail::ExtentReferences<Allocator> stagedChunks_;
         BlobId id_;
@@ -716,7 +745,7 @@ public:
             }
             ++blobState_->mutations;
             ++blobState_->openWriters;
-            return BlobWriter{blobState_, *selected};
+            return BlobWriter{blobState_, lifetime_, *selected};
         }
 
         [[nodiscard]] std::optional<BlobWriter> replaceBlob(BlobId id) {
@@ -734,7 +763,7 @@ public:
             blobState_->openWriterIds.insert(id);
             ++blobState_->mutations;
             ++blobState_->openWriters;
-            return BlobWriter{blobState_, id};
+            return BlobWriter{blobState_, lifetime_, id};
         }
 
         [[nodiscard]] bool eraseBlob(BlobId id) {
