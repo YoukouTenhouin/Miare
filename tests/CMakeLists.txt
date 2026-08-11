@@ -24,6 +24,11 @@ add_executable(miare_backend_compression_test backend_compression_test.cpp)
 target_link_libraries(miare_backend_compression_test PRIVATE miare::miare)
 add_test(NAME miare.backend_compression COMMAND miare_backend_compression_test)
 
+add_executable(miare_blob_transaction_test blob_transaction_test.cpp)
+target_link_libraries(
+    miare_blob_transaction_test PRIVATE miare::miare Threads::Threads)
+add_test(NAME miare.blob_transaction COMMAND miare_blob_transaction_test)
+
 add_executable(miare_database_format_test database_format_test.cpp)
 target_link_libraries(miare_database_format_test PRIVATE miare::miare)
 add_test(NAME miare.database_format COMMAND miare_database_format_test)
@@ -85,6 +90,16 @@ if(MIARE_BUILD_QUALIFICATION_TESTS)
         PROPERTIES
             LABELS qualification
             TIMEOUT 86400)
+    add_test(
+        NAME miare.concurrent_snapshot_thread_sanitizer_smoke
+        COMMAND
+            miare_concurrent_snapshot_test
+            --thread-sanitizer-smoke)
+    set_tests_properties(
+        miare.concurrent_snapshot_thread_sanitizer_smoke
+        PROPERTIES
+            LABELS qualification
+            TIMEOUT 600)
 endif()
 add_test(
     NAME miare.exact_transaction_live_child_assertion

@@ -5,8 +5,10 @@
 #include <miare/detail/providers.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <condition_variable>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -51,6 +53,15 @@ public:
     explicit DeterministicCryptoProvider(std::uint64_t seed) : state_(seed) {}
 
     void randomBytes(MutableByteView output) override {
+        {
+            std::unique_lock lock{randomMutex_};
+            if (blockRandom_) {
+                randomEntered_ = true;
+                randomCondition_.notify_all();
+                randomCondition_.wait(lock, [&] { return releaseRandom_; });
+                blockRandom_ = false;
+            }
+        }
         if (failRandom_) {
             failRandom_ = false;
             throw DatabaseError{Errc::ProviderUnavailable, "injected randomness failure"};
@@ -129,12 +140,32 @@ public:
         ProviderFailureInjection::failNextProviderOperation();
     }
     void corruptNextCiphertext() noexcept { corruptCiphertext_ = true; }
+    void blockNextRandom() {
+        std::lock_guard lock{randomMutex_};
+        blockRandom_ = true;
+        randomEntered_ = false;
+        releaseRandom_ = false;
+    }
+    void waitUntilRandomBlocked() {
+        std::unique_lock lock{randomMutex_};
+        randomCondition_.wait(lock, [&] { return randomEntered_; });
+    }
+    void releaseRandom() {
+        std::lock_guard lock{randomMutex_};
+        releaseRandom_ = true;
+        randomCondition_.notify_all();
+    }
 
 private:
     detail::SodiumCryptoProvider delegate_;
     std::uint64_t state_;
     bool failRandom_ = false;
     bool corruptCiphertext_ = false;
+    std::mutex randomMutex_;
+    std::condition_variable randomCondition_;
+    bool blockRandom_ = false;
+    bool randomEntered_ = false;
+    bool releaseRandom_ = false;
 };
 
 class FaultInjectingCompressionProvider final
@@ -151,6 +182,7 @@ public:
     [[nodiscard]] std::size_t compress(
         ByteView input,
         MutableByteView output) override {
+        compressionCalls_.fetch_add(1, std::memory_order_relaxed);
         failProviderIfRequested();
         if (reportExcessiveOutput_) {
             reportExcessiveOutput_ = false;
@@ -165,6 +197,7 @@ public:
     }
 
     void decompress(ByteView frame, MutableByteView output) override {
+        decompressionCalls_.fetch_add(1, std::memory_order_relaxed);
         failProviderIfRequested();
         delegate_.decompress(frame, output);
     }
@@ -177,9 +210,21 @@ public:
         requestMaximumOutputStorage_ = true;
     }
     void reportExcessiveOutput() noexcept { reportExcessiveOutput_ = true; }
+    void resetOperationCounts() noexcept {
+        compressionCalls_.store(0, std::memory_order_relaxed);
+        decompressionCalls_.store(0, std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::size_t compressionCalls() const noexcept {
+        return compressionCalls_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::size_t decompressionCalls() const noexcept {
+        return decompressionCalls_.load(std::memory_order_relaxed);
+    }
 
 private:
     detail::ZstdCompressionProvider delegate_;
+    std::atomic<std::size_t> compressionCalls_{0};
+    std::atomic<std::size_t> decompressionCalls_{0};
     bool corruptFrame_ = false;
     bool requestMaximumOutputStorage_ = false;
     bool reportExcessiveOutput_ = false;
@@ -188,10 +233,12 @@ private:
 class MemoryDurableFile final : public detail::DurableFile {
 public:
     [[nodiscard]] std::uint64_t size() const override {
+        std::lock_guard lock{mutex_};
         return bytes_.size();
     }
 
     void readExactAt(std::uint64_t offset, MutableByteView destination) override {
+        std::lock_guard lock{mutex_};
         auto& operation = beginOperation(
             DurableFileOperationKind::Read, offset, destination.size());
         if (failReadsAtOrAfter_ && offset >= *failReadsAtOrAfter_) {
@@ -210,6 +257,7 @@ public:
     }
 
     void writeExactAt(std::uint64_t offset, ByteView source) override {
+        std::lock_guard lock{mutex_};
         auto& operation = beginOperation(
             DurableFileOperationKind::Write, offset, source.size());
         if (offset > std::numeric_limits<std::size_t>::max() ||
@@ -236,6 +284,7 @@ public:
     }
 
     void resize(std::uint64_t length) override {
+        std::lock_guard lock{mutex_};
         auto& operation = beginOperation(
             DurableFileOperationKind::Resize, length, 0);
         if (failResize_) {
@@ -254,6 +303,7 @@ public:
     }
 
     void stableStorageBarrier() override {
+        std::lock_guard lock{mutex_};
         auto& operation = beginOperation(DurableFileOperationKind::Barrier, 0, 0);
         if (failBarrier_ || (failBarrierAfter_ && *failBarrierAfter_ == 0)) {
             failBarrier_ = false;
@@ -393,6 +443,7 @@ private:
     bool failBarrier_ = false;
     std::optional<std::size_t> failBarrierAfter_;
     bool failResize_ = false;
+    mutable std::mutex mutex_;
 };
 
 class DatabaseAccess {
@@ -404,9 +455,34 @@ public:
     }
 
     template<class Allocator, class Limits>
+    [[nodiscard]] static detail::ExtentReference blobRoot(
+        Database<Allocator, Limits>& database) {
+        std::lock_guard lock{database.session_->mutex};
+        return detail::decodeExtentReference(
+            database.session_->opened.format.blobRoot);
+    }
+
+    template<class Allocator, class Limits>
     static void forceRecoveryRequired(Database<Allocator, Limits>& database) {
         database.session_->state.store(
             DatabaseState::RecoveryRequired, std::memory_order_release);
+    }
+
+    template<class Allocator, class Limits>
+    static void forceConfirmedCorruption(
+        Database<Allocator, Limits>& database) {
+        Database<Allocator, Limits>::enterRecoveryAfterCorruption(
+            *database.session_, *database.lifetime_);
+    }
+
+    template<class Allocator, class Limits>
+    [[nodiscard]] static bool operationsAreQuiescent(
+        Database<Allocator, Limits>& database) {
+        if (!database.session_->operationMutex.try_lock()) {
+            return false;
+        }
+        database.session_->operationMutex.unlock();
+        return true;
     }
 
     template<class Allocator, class Limits>
@@ -471,6 +547,8 @@ public:
         auto openedDatabase = std::move(opened).value();
         (void)detail::shallowValidateOrderedRoot<Limits>(
             *file, openedDatabase, providers, allocator);
+        auto blobs = detail::loadBlobCatalog<Limits>(
+            *file, openedDatabase, providers, allocator);
         (void)detail::shallowValidateAllocatorRoot<Limits>(
             *file, openedDatabase, providers, allocator);
         auto values = detail::makeOrderedKeyValues(allocator);
@@ -482,6 +560,7 @@ public:
                 std::move(allocator),
                 std::move(openedDatabase),
                 std::move(values),
+                std::move(blobs),
                 64U * 1024U * 1024U,
                 256});
     }

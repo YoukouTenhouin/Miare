@@ -155,12 +155,101 @@ void readersRemainStableAcrossCommittedAndRolledBackWriters(
     database.close();
 }
 
+void blobReadersRemainStableAcrossReplacement(
+    unsigned readerCount,
+    unsigned writerIterations) {
+    auto file = std::make_unique<miare::testing::MemoryDurableFile>();
+    miare::CreateOptions options;
+    options.compression = miare::Compression::None;
+    auto database = miare::testing::DatabaseAccess::create(
+        std::move(file),
+        miare::EncryptionKeyView{encryptionKey},
+        deterministicProviders(2),
+        options);
+
+    auto initial = database.beginWrite();
+    auto initialWriter = initial.createBlob();
+    const auto id = initialWriter.id();
+    const auto zero = encoded(0);
+    initialWriter.write(zero);
+    initialWriter.finish();
+    initial.commit();
+
+    std::atomic<unsigned> readersReady{0};
+    std::atomic<bool> started{false};
+    std::atomic<bool> stop{false};
+    std::atomic<bool> failed{false};
+    std::vector<std::thread> readers;
+    readers.reserve(readerCount);
+    for (unsigned index = 0; index != readerCount; ++index) {
+        readers.emplace_back([&] {
+            readersReady.fetch_add(1, std::memory_order_release);
+            while (!started.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            while (!stop.load(std::memory_order_acquire)) {
+                auto snapshot = database.beginRead();
+                auto blob = snapshot.openBlob(id);
+                if (!blob) {
+                    failed.store(true, std::memory_order_release);
+                    snapshot.end();
+                    continue;
+                }
+                std::array<std::byte, sizeof(std::uint64_t)> first{};
+                std::array<std::byte, sizeof(std::uint64_t)> second{};
+                if (blob->read(first) != first.size()) {
+                    failed.store(true, std::memory_order_release);
+                }
+                blob->seek(0);
+                std::this_thread::yield();
+                if (blob->read(second) != second.size() || first != second) {
+                    failed.store(true, std::memory_order_release);
+                }
+                blob->close();
+                snapshot.end();
+            }
+        });
+    }
+
+    while (readersReady.load(std::memory_order_acquire) != readerCount) {
+        std::this_thread::yield();
+    }
+    started.store(true, std::memory_order_release);
+    for (std::uint64_t iteration = 1; iteration <= writerIterations; ++iteration) {
+        auto transaction = database.beginWrite();
+        auto replacement = transaction.replaceBlob(id);
+        assert(replacement);
+        const auto value = encoded(iteration);
+        replacement->write(value);
+        replacement->finish();
+        if (iteration % 5 == 0) {
+            transaction.rollback();
+        } else {
+            transaction.commit();
+        }
+    }
+    stop.store(true, std::memory_order_release);
+    for (auto& reader : readers) {
+        reader.join();
+    }
+    assert(!failed.load(std::memory_order_acquire));
+    database.close();
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     const bool qualification = argc == 2 &&
         std::string_view{argv[1]} == "--qualification";
+    const bool threadSanitizerSmoke = argc == 2 &&
+        std::string_view{argv[1]} == "--thread-sanitizer-smoke";
+    if (argc > 2 || (argc == 2 && !qualification && !threadSanitizerSmoke)) {
+        return 2;
+    }
     readersRemainStableAcrossCommittedAndRolledBackWriters(
-        qualification ? 256U : 8U,
+        qualification || threadSanitizerSmoke ? 256U : 8U,
         qualification ? 10'000U : 100U);
+    if (threadSanitizerSmoke) {
+        blobReadersRemainStableAcrossReplacement(256U, 32U);
+    }
 }

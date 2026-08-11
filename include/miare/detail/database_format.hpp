@@ -424,6 +424,7 @@ struct OpenedFormat {
     std::uint64_t highWaterBytes;
     std::uint64_t optionalFeatures;
     std::array<std::byte, 32> orderedRoot;
+    std::array<std::byte, 32> blobRoot;
     std::array<std::byte, 32> allocatorRoot;
 };
 
@@ -618,6 +619,11 @@ template<class Limits>
         input.begin() + PublicationLayout::orderedRoot,
         orderedRoot.size(),
         orderedRoot.begin());
+    std::array<std::byte, 32> blobRoot{};
+    std::copy_n(
+        input.begin() + PublicationLayout::blobRoot,
+        blobRoot.size(),
+        blobRoot.begin());
     std::array<std::byte, 32> allocatorRoot{};
     std::copy_n(
         input.begin() + PublicationLayout::allocatorRoot,
@@ -630,6 +636,7 @@ template<class Limits>
         readLittleEndian<std::uint64_t>(
             input, PublicationLayout::optionalFeatures),
         orderedRoot,
+        blobRoot,
         allocatorRoot};
 }
 
