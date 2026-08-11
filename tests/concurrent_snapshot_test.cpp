@@ -160,7 +160,12 @@ void readersRemainStableAcrossCommittedAndRolledBackWriters(
 int main(int argc, char** argv) {
     const bool qualification = argc == 2 &&
         std::string_view{argv[1]} == "--qualification";
+    const bool threadSanitizerSmoke = argc == 2 &&
+        std::string_view{argv[1]} == "--thread-sanitizer-smoke";
+    if (argc > 2 || (argc == 2 && !qualification && !threadSanitizerSmoke)) {
+        return 2;
+    }
     readersRemainStableAcrossCommittedAndRolledBackWriters(
-        qualification ? 256U : 8U,
+        qualification || threadSanitizerSmoke ? 256U : 8U,
         qualification ? 10'000U : 100U);
 }

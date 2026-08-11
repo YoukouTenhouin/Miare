@@ -71,11 +71,11 @@ jobs:
           -R '^miare.exact_transaction$'
           --output-on-failure
 
-      - name: Test 256-reader qualification under ThreadSanitizer
+      - name: Test 256-reader smoke workload under ThreadSanitizer
         if: matrix.sanitizer.name == 'thread'
         run: >-
           ctest --test-dir build
-          -R '^miare\.concurrent_snapshot_qualification$'
+          -R '^miare\.concurrent_snapshot_thread_sanitizer_smoke$'
           --output-on-failure
 
   build:

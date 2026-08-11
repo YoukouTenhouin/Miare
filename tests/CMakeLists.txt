@@ -89,6 +89,16 @@ if(MIARE_BUILD_QUALIFICATION_TESTS)
         PROPERTIES
             LABELS qualification
             TIMEOUT 86400)
+    add_test(
+        NAME miare.concurrent_snapshot_thread_sanitizer_smoke
+        COMMAND
+            miare_concurrent_snapshot_test
+            --thread-sanitizer-smoke)
+    set_tests_properties(
+        miare.concurrent_snapshot_thread_sanitizer_smoke
+        PROPERTIES
+            LABELS qualification
+            TIMEOUT 600)
 endif()
 add_test(
     NAME miare.exact_transaction_live_child_assertion
