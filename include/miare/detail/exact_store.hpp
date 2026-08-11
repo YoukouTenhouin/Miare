@@ -82,32 +82,22 @@ struct ExtentReference {
     }
 };
 
-class BlobStagingStorage {
-public:
-    virtual ~BlobStagingStorage() = default;
-    virtual void append(ByteView source) = 0;
-    virtual void readExactAt(
-        std::uint64_t offset,
-        MutableByteView destination) = 0;
-    virtual void truncate(std::uint64_t length) = 0;
-};
-
 template<class Allocator>
 struct BlobVersion {
     BlobVersion(
         BlobId blobId,
         std::uint64_t blobSize,
-        std::shared_ptr<BlobStagingStorage> staged,
-        const Allocator& allocator)
+        std::uint64_t contentGeneration,
+        StoredVector<ExtentReference, Allocator> chunkReferences,
+        std::uint64_t stagedHighWater)
         : id(blobId),
           size(blobSize),
-          staging(std::move(staged)),
-          chunks(
-              typename std::allocator_traits<Allocator>::template rebind_alloc<
-                  ExtentReference>{allocator}),
+          generation(contentGeneration),
+          chunks(std::move(chunkReferences)),
           reachable(
-              typename std::allocator_traits<Allocator>::template rebind_alloc<
-                  ExtentReference>{allocator}) {}
+              chunks.begin(), chunks.end(), chunks.get_allocator()),
+          stagedHighWaterBytes(stagedHighWater),
+          pending(true) {}
 
     BlobVersion(
         BlobId blobId,
@@ -132,7 +122,8 @@ struct BlobVersion {
     ExtentReference chunkRoot;
     StoredVector<ExtentReference, Allocator> chunks;
     StoredVector<ExtentReference, Allocator> reachable;
-    std::shared_ptr<BlobStagingStorage> staging;
+    std::uint64_t stagedHighWaterBytes = 0;
+    bool pending = false;
 };
 
 template<class Allocator>
@@ -333,6 +324,53 @@ using ExtentReferences = StoredVector<ExtentReference, Allocator>;
 template<class Allocator>
 using ExtentRuns = StoredVector<ExtentRun, Allocator>;
 
+template<class Allocator>
+using BlobIdSet = std::set<
+    BlobId,
+    std::less<BlobId>,
+    typename std::allocator_traits<Allocator>::template rebind_alloc<BlobId>>;
+
+struct BlobReaderLifetime {
+    std::atomic<bool> invalidated{false};
+    std::atomic<std::uint32_t> liveReaders{0};
+};
+
+template<class Allocator, class Limits>
+struct BlobWriteState {
+    explicit BlobWriteState(DatabaseSession<Allocator, Limits>& owner)
+        : session(&owner),
+          blobs(makeBlobCatalog(owner.allocator)),
+          generatedIds(
+              std::less<BlobId>{},
+              typename BlobIdSet<Allocator>::allocator_type{owner.allocator}),
+          openWriterIds(
+              std::less<BlobId>{},
+              typename BlobIdSet<Allocator>::allocator_type{owner.allocator}),
+          stagingFreeRuns(
+              typename std::allocator_traits<Allocator>::template rebind_alloc<
+                  ExtentRun>{owner.allocator}),
+          discardedStagedReferences(
+              typename std::allocator_traits<Allocator>::template rebind_alloc<
+                  ExtentReference>{owner.allocator}),
+          thread(std::this_thread::get_id()) {
+        blobs = owner.blobs;
+    }
+
+    DatabaseSession<Allocator, Limits>* session;
+    BlobCatalog<Allocator> blobs;
+    BlobIdSet<Allocator> generatedIds;
+    BlobIdSet<Allocator> openWriterIds;
+    ExtentRuns<Allocator> stagingFreeRuns;
+    ExtentReferences<Allocator> discardedStagedReferences;
+    std::uint64_t stagingNextBlock = 0;
+    std::thread::id thread;
+    std::uint64_t mutations = 0;
+    std::uint64_t bytesWritten = 0;
+    std::uint32_t openWriters = 0;
+    bool allocatorInitialized = false;
+    std::atomic<bool> active{true};
+};
+
 [[nodiscard]] inline ExtentReference decodeExtentReference(ByteView bytes) {
     return ExtentReference{
         readLittleEndian<std::uint64_t>(bytes, 0),
@@ -524,12 +562,6 @@ template<class Allocator>
 struct PreparedExactExtent {
     ExtentReference reference;
     StoredBytes<Allocator> bytes;
-};
-
-struct PreparedBlobWrite {
-    ExtentReference reference;
-    std::shared_ptr<BlobStagingStorage> staging;
-    std::uint64_t stagingOffset;
 };
 
 template<class Allocator>
@@ -930,11 +962,16 @@ template<class Limits, class Allocator>
     bool compressionEligible = true,
     std::uint32_t keyDomain = 2,
     std::uint64_t sequence = 0,
-    ByteView owner = {}) {
+    ByteView owner = {},
+    std::optional<std::uint64_t> validationGeneration = std::nullopt,
+    std::optional<std::uint64_t> validationHighWaterBytes = std::nullopt) {
     if (reference.null()) {
         throwCorrupt("authenticated extent reference is null");
     }
-    validateExtentReference<Limits>(reference, opened.format.generation, opened.format.highWaterBytes);
+    validateExtentReference<Limits>(
+        reference,
+        validationGeneration.value_or(opened.format.generation),
+        validationHighWaterBytes.value_or(opened.format.highWaterBytes));
     constexpr auto pageCeiling = std::max<std::uint64_t>(
         16U * 1024U, Limits::allocationQuantumBytes);
     constexpr auto uncompressedBlockCount =
@@ -2346,6 +2383,253 @@ template<class Limits, class Allocator>
     return blobs;
 }
 
+template<class Allocator>
+inline void coalesceBlobStagingFreeRuns(
+    ExtentRuns<Allocator>& runs,
+    const Allocator& allocator) {
+    using RunAllocator = typename std::allocator_traits<Allocator>::
+        template rebind_alloc<ExtentRun>;
+    std::sort(
+        runs.begin(), runs.end(),
+        [](const auto& left, const auto& right) {
+            return left.start < right.start;
+        });
+    ExtentRuns<Allocator> coalesced{RunAllocator{allocator}};
+    for (const auto& run : runs) {
+        if (run.count == 0) {
+            continue;
+        }
+        if (!coalesced.empty() &&
+            coalesced.back().start + coalesced.back().count == run.start) {
+            coalesced.back().count += run.count;
+        } else {
+            coalesced.push_back(run);
+        }
+    }
+    runs = std::move(coalesced);
+}
+
+template<class Allocator>
+inline void insertBlobStagingFreeRun(
+    ExtentRuns<Allocator>& runs,
+    ExtentRun inserted) {
+    auto position = std::lower_bound(
+        runs.begin(), runs.end(), inserted.start,
+        [](const auto& run, std::uint64_t start) {
+            return run.start < start;
+        });
+    if (position != runs.begin()) {
+        auto previous = position - 1;
+        if (previous->start + previous->count >= inserted.start) {
+            const auto end = std::max(
+                previous->start + previous->count,
+                inserted.start + inserted.count);
+            previous->count = end - previous->start;
+            position = previous;
+        } else {
+            position = runs.insert(position, inserted);
+        }
+    } else {
+        position = runs.insert(position, inserted);
+    }
+    while (position + 1 != runs.end() &&
+           position->start + position->count >= (position + 1)->start) {
+        const auto following = position + 1;
+        const auto end = std::max(
+            position->start + position->count,
+            following->start + following->count);
+        position->count = end - position->start;
+        runs.erase(following);
+    }
+}
+
+template<class Limits, class Allocator>
+inline void initializeBlobStagingAllocator(
+    BlobWriteState<Allocator, Limits>& state) {
+    if (state.allocatorInitialized) {
+        return;
+    }
+    auto& session = *state.session;
+    using ReferenceAllocator = typename std::allocator_traits<Allocator>::
+        template rebind_alloc<ExtentReference>;
+    using RunAllocator = typename std::allocator_traits<Allocator>::
+        template rebind_alloc<ExtentRun>;
+    ExtentReferences<Allocator> reachable{
+        ReferenceAllocator{session.allocator}};
+    ExtentRuns<Allocator> freeRuns{RunAllocator{session.allocator}};
+    ExtentRuns<Allocator> retiredRuns{RunAllocator{session.allocator}};
+    (void)loadExactValues<Limits>(
+        *session.file,
+        session.opened,
+        *session.providers,
+        session.allocator,
+        &reachable);
+    (void)loadBlobCatalog<Limits>(
+        *session.file,
+        session.opened,
+        *session.providers,
+        session.allocator,
+        &reachable);
+    loadAllocatorReferences<Limits>(
+        *session.file,
+        session.opened,
+        *session.providers,
+        session.allocator,
+        reachable,
+        &freeRuns,
+        &retiredRuns);
+    std::uint64_t oldestReaderGeneration =
+        std::numeric_limits<std::uint64_t>::max();
+    {
+        std::lock_guard lock{session.mutex};
+        for (const auto& [identity, reader] : session.activeReaders) {
+            (void)identity;
+            oldestReaderGeneration = std::min(
+                oldestReaderGeneration, reader.generation);
+        }
+    }
+    for (const auto& run : retiredRuns) {
+        if (oldestReaderGeneration >= run.retirementGeneration) {
+            freeRuns.push_back(ExtentRun{
+                run.start, run.count});
+        }
+    }
+    coalesceBlobStagingFreeRuns(
+        freeRuns, session.allocator);
+    state.stagingFreeRuns = std::move(freeRuns);
+    state.stagingNextBlock =
+        session.opened.format.highWaterBytes /
+        Limits::allocationQuantumBytes;
+    state.allocatorInitialized = true;
+}
+
+template<class Limits, class Allocator>
+inline void releaseBlobStagingReference(
+    BlobWriteState<Allocator, Limits>& state,
+    const ExtentReference& reference) {
+    state.stagingFreeRuns.reserve(state.stagingFreeRuns.size() + 1);
+    insertBlobStagingFreeRun<Allocator>(
+        state.stagingFreeRuns,
+        ExtentRun{reference.blockIndex, reference.blockCount});
+}
+
+template<class Limits, class Allocator, class References>
+inline void releaseBlobStagingReferences(
+    BlobWriteState<Allocator, Limits>& state,
+    const References& references) {
+    state.stagingFreeRuns.reserve(
+        state.stagingFreeRuns.size() + references.size());
+    for (const auto& reference : references) {
+        insertBlobStagingFreeRun<Allocator>(
+            state.stagingFreeRuns,
+            ExtentRun{reference.blockIndex, reference.blockCount});
+    }
+}
+
+template<class Limits, class Allocator>
+[[nodiscard]] inline ExtentReference stageBlobChunk(
+    BlobWriteState<Allocator, Limits>& state,
+    BlobId id,
+    std::uint64_t ordinal,
+    ByteView decoded) {
+    initializeBlobStagingAllocator<Limits>(state);
+    auto& session = *state.session;
+    const auto owner = id.toBytes();
+    const auto generation = session.opened.format.generation + 1;
+    auto prepared = prepareAuthenticatedExtent<Limits>(
+        decoded,
+        13,
+        generation,
+        state.stagingNextBlock,
+        session.opened,
+        *session.providers,
+        session.allocator,
+        true,
+        4,
+        ordinal,
+        owner);
+    state.stagingFreeRuns.reserve(state.stagingFreeRuns.size() + 1);
+    auto allocated = state.stagingNextBlock;
+    bool appended = true;
+    for (auto& run : state.stagingFreeRuns) {
+        if (run.count >= prepared.reference.blockCount) {
+            allocated = run.start;
+            run.start += prepared.reference.blockCount;
+            run.count -= prepared.reference.blockCount;
+            appended = false;
+            break;
+        }
+    }
+    if (appended) {
+        state.stagingNextBlock += prepared.reference.blockCount;
+    }
+    const ExtentReference reserved{
+        allocated,
+        prepared.reference.blockCount,
+        prepared.reference.encodedLength,
+        generation};
+    try {
+        if (allocated != prepared.reference.blockIndex) {
+            prepared = prepareAuthenticatedExtent<Limits>(
+                decoded,
+                13,
+                generation,
+                allocated,
+                session.opened,
+                *session.providers,
+                session.allocator,
+                true,
+                4,
+                ordinal,
+                owner);
+        }
+        if (allocated > std::numeric_limits<std::uint64_t>::max() -
+                prepared.reference.blockCount) {
+            throw DatabaseError{
+                Errc::ResourceLimit,
+                "Blob staging block range is not representable"};
+        }
+        const auto requiredBlocks =
+            allocated + prepared.reference.blockCount;
+        if (requiredBlocks > std::numeric_limits<std::uint64_t>::max() /
+                Limits::allocationQuantumBytes) {
+            throw DatabaseError{
+                Errc::ResourceLimit,
+                "Blob staging byte range is not representable"};
+        }
+        const auto requiredBytes =
+            requiredBlocks * Limits::allocationQuantumBytes;
+        if (requiredBytes > Limits::maxDatabaseBytes ||
+            (requiredBytes > session.opened.format.highWaterBytes &&
+             requiredBytes - session.opened.format.highWaterBytes >
+                 Limits::maxFileGrowthPerTransaction)) {
+            session.capacityFailureCount.fetch_add(
+                1, std::memory_order_relaxed);
+            throw DatabaseError{
+                Errc::ResourceLimit,
+                "Blob staging exceeds the database capacity profile"};
+        }
+        if (requiredBytes > session.file->size()) {
+            session.file->resize(requiredBytes);
+        }
+        session.file->writeExactAt(
+            allocated * Limits::allocationQuantumBytes,
+            prepared.bytes);
+        {
+            std::lock_guard lock{session.mutex};
+            const auto physicalBytes = session.file->size();
+            session.opened.abandonedTailBytes =
+                physicalBytes > session.opened.format.highWaterBytes
+                ? physicalBytes - session.opened.format.highWaterBytes
+                : 0;
+        }
+        return prepared.reference;
+    } catch (...) {
+        releaseBlobStagingReference<Limits>(state, reserved);
+        throw;
+    }
+}
+
 template<class Limits, class Allocator>
 inline void readBlobRange(
     DatabaseSession<Allocator, Limits>& session,
@@ -2379,7 +2663,13 @@ inline void readBlobRange(
             true,
             4,
             ordinal,
-            owner);
+            owner,
+            version.pending
+                ? std::optional<std::uint64_t>{version.generation}
+                : std::nullopt,
+            version.pending
+                ? std::optional<std::uint64_t>{version.stagedHighWaterBytes}
+                : std::nullopt);
         const auto count = std::min<std::size_t>(
             destination.size() - copied,
             chunk.size() - static_cast<std::size_t>(within));
@@ -2795,7 +3085,8 @@ template<class Limits, class Allocator>
 inline void commitExact(
     DatabaseSession<Allocator, Limits>& session,
     const OrderedKeyValues<Allocator>& values,
-    const BlobCatalog<Allocator>& blobs) {
+    const BlobCatalog<Allocator>& blobs,
+    const BlobWriteState<Allocator, Limits>& blobState) {
     const auto generation = session.opened.format.generation + 1;
     if (generation == 0) {
         throw DatabaseError{Errc::ResourceLimit, "database generation is exhausted"};
@@ -2819,10 +3110,6 @@ inline void commitExact(
     using NodeVector = std::vector<PreparedTreeNode<Allocator>, NodeAllocator>;
     std::vector<PreparedExactExtent<Allocator>, ExtentAllocator> extents{
         ExtentAllocator{session.allocator}};
-    using BlobWriteAllocator = typename std::allocator_traits<Allocator>::
-        template rebind_alloc<PreparedBlobWrite>;
-    StoredVector<PreparedBlobWrite, Allocator> preparedBlobWrites{
-        BlobWriteAllocator{session.allocator}};
     NodeVector nodes{NodeAllocator{session.allocator}};
     ExtentReferences<Allocator> retainedReferences{
         typename std::allocator_traits<Allocator>::
@@ -2899,6 +3186,53 @@ inline void commitExact(
         }
     }
     freeRuns = std::move(coalescedFreeRuns);
+    if (blobState.allocatorInitialized) {
+        nextBlock = std::max(nextBlock, blobState.stagingNextBlock);
+        for (const auto& run : blobState.stagingFreeRuns) {
+            const auto runEnd = run.start + run.count;
+            if (runEnd > startBlock) {
+                freeRuns.push_back(ExtentRun{
+                    std::max(run.start, startBlock),
+                    runEnd - std::max(run.start, startBlock)});
+            }
+        }
+        for (const auto& reference : blobState.discardedStagedReferences) {
+            if (reference.blockIndex >= startBlock) {
+                freeRuns.push_back(ExtentRun{
+                    reference.blockIndex, reference.blockCount});
+            }
+        }
+        const auto removeStagedRange = [&](const ExtentReference& reference) {
+            ExtentRuns<Allocator> remaining{RunAllocator{session.allocator}};
+            const auto start = reference.blockIndex;
+            const auto end = start + reference.blockCount;
+            for (const auto& run : freeRuns) {
+                const auto runEnd = run.start + run.count;
+                if (end <= run.start || start >= runEnd) {
+                    remaining.push_back(run);
+                    continue;
+                }
+                if (start > run.start) {
+                    remaining.push_back(ExtentRun{
+                        run.start, start - run.start});
+                }
+                if (end < runEnd) {
+                    remaining.push_back(ExtentRun{
+                        end, runEnd - end});
+                }
+            }
+            freeRuns = std::move(remaining);
+        };
+        for (const auto& [id, version] : blobs) {
+            (void)id;
+            if (version->pending) {
+                for (const auto& reference : version->chunks) {
+                    removeStagedRange(reference);
+                }
+            }
+        }
+        coalesceBlobStagingFreeRuns(freeRuns, session.allocator);
+    }
     std::sort(
         reachable.begin(), reachable.end(),
         [](const auto& left, const auto& right) {
@@ -3139,7 +3473,7 @@ inline void commitExact(
         const auto idBytes = id.toBytes();
         StoredBytes<Allocator> catalogKey{ByteAllocator{session.allocator}};
         catalogKey.assign(idBytes.begin(), idBytes.end());
-        if (!version->staging) {
+        if (!version->pending) {
             retainedReferences.insert(
                 retainedReferences.end(),
                 version->reachable.begin(),
@@ -3159,33 +3493,23 @@ inline void commitExact(
         const auto chunkCount = version->size == 0
             ? 0
             : 1 + (version->size - 1) / Limits::blobChunkBytes;
-        version->staging->truncate(version->size);
+        if (version->chunks.size() != chunkCount) {
+            throw ContractError{
+                Errc::InvalidState,
+                "finalized Blob has an incomplete staged chunk set"};
+        }
         chunkReferences.reserve(static_cast<std::size_t>(chunkCount));
         chunkEntries.reserve(static_cast<std::size_t>(chunkCount));
-        StoredBytes<Allocator> chunk{ByteAllocator{session.allocator}};
-        auto preparedOffset = version->size;
         for (std::uint64_t ordinal = 0; ordinal != chunkCount; ++ordinal) {
-            const auto chunkLength = static_cast<std::size_t>(
-                std::min<std::uint64_t>(
-                    Limits::blobChunkBytes,
-                    version->size - ordinal * Limits::blobChunkBytes));
-            chunk.resize(chunkLength);
-            version->staging->readExactAt(
-                ordinal * Limits::blobChunkBytes, chunk);
-            auto prepared = prepareOwnedExtent(
-                chunk, 13, true, ordinal, idBytes);
-            chunkReferences.push_back(prepared.reference);
-            versionReachable.push_back(prepared.reference);
+            const auto reference = version->chunks[ordinal];
+            chunkReferences.push_back(reference);
+            versionReachable.push_back(reference);
             StoredBytes<Allocator> ordinalKey{
                 ByteAllocator{session.allocator}};
             ordinalKey.resize(8);
             writeLittleEndian<std::uint64_t>(ordinal, ordinalKey, 0);
             chunkEntries.push_back(FixedEntry{
-                std::move(ordinalKey), prepared.reference});
-            version->staging->append(prepared.bytes);
-            preparedBlobWrites.push_back(PreparedBlobWrite{
-                prepared.reference, version->staging, preparedOffset});
-            preparedOffset += prepared.bytes.size();
+                std::move(ordinalKey), reference});
         }
         const auto chunkIndexBegin = extents.size();
         const auto prepareChunkIndex = [&](ByteView decoded, std::uint16_t kind) {
@@ -3464,8 +3788,13 @@ inline void commitExact(
     for (const auto& extent : extents) {
         reachableBlocks += extent.reference.blockCount;
     }
-    for (const auto& write : preparedBlobWrites) {
-        reachableBlocks += write.reference.blockCount;
+    for (const auto& [id, version] : blobs) {
+        (void)id;
+        if (version->pending) {
+            for (const auto& reference : version->chunks) {
+                reachableBlocks += reference.blockCount;
+            }
+        }
     }
     for (const auto& retained : retainedReferences) {
         reachableBlocks += retained.blockCount;
@@ -3521,17 +3850,6 @@ inline void commitExact(
             session.file->writeExactAt(
                 extent.reference.blockIndex * Limits::allocationQuantumBytes,
                 extent.bytes);
-        }
-        StoredBytes<Allocator> blobWriteBuffer{
-            ByteAllocator{session.allocator}};
-        for (const auto& write : preparedBlobWrites) {
-            blobWriteBuffer.resize(
-                write.reference.blockCount * Limits::allocationQuantumBytes);
-            write.staging->readExactAt(
-                write.stagingOffset, blobWriteBuffer);
-            session.file->writeExactAt(
-                write.reference.blockIndex * Limits::allocationQuantumBytes,
-                blobWriteBuffer);
         }
         session.file->stableStorageBarrier();
         publicationStarted = true;

@@ -581,6 +581,84 @@ void failedCommitPublishesNeitherValueNorBlob() {
     reopened.value().close();
 }
 
+void stagingIoFailurePreservesWriterContents() {
+    auto file = std::make_unique<miare::testing::MemoryDurableFile>();
+    auto* fileView = file.get();
+    auto database = miare::testing::DatabaseAccess::create<
+        std::allocator<std::byte>, SmallChunkLimits>(
+        std::move(file),
+        miare::EncryptionKeyView{encryptionKey},
+        deterministicProviders(15));
+    std::vector<std::byte> content(SmallChunkLimits::blobChunkBytes);
+    for (std::size_t index = 0; index != content.size(); ++index) {
+        content[index] = std::byte{static_cast<unsigned char>(index & 0xffU)};
+    }
+
+    auto transaction = database.beginWrite();
+    auto writer = transaction.createBlob();
+    const auto id = writer.id();
+    fileView->failNextResize();
+    expectDatabaseError(miare::Errc::Io, [&] {
+        writer.write(content);
+    });
+    assert(writer.position() == 0);
+    assert(transaction.stats().blobBytesWritten == 0);
+    writer.write(content);
+    assert(writer.position() == content.size());
+    writer.finish();
+    transaction.commit();
+
+    auto read = database.beginRead();
+    auto reader = read.openBlob(id);
+    assert(reader);
+    std::vector<std::byte> output(content.size());
+    assert(reader->read(output) == output.size());
+    assert(output == content);
+    reader->close();
+    read.end();
+    database.close();
+}
+
+void stagingProviderFailurePreservesWriterContents() {
+    auto file = std::make_unique<miare::testing::MemoryDurableFile>();
+    auto compression =
+        std::make_unique<miare::testing::FaultInjectingCompressionProvider>();
+    auto* compressionView = compression.get();
+    auto providers = miare::detail::ProviderAccess::make(
+        std::make_unique<miare::testing::DeterministicCryptoProvider>(16),
+        std::move(compression));
+    auto database = miare::testing::DatabaseAccess::create<
+        std::allocator<std::byte>, SmallChunkLimits>(
+        std::move(file),
+        miare::EncryptionKeyView{encryptionKey},
+        std::move(providers));
+    std::vector<std::byte> content(
+        SmallChunkLimits::blobChunkBytes, std::byte{0x5a});
+
+    auto transaction = database.beginWrite();
+    auto writer = transaction.createBlob();
+    const auto id = writer.id();
+    compressionView->failNextProviderOperation();
+    expectDatabaseError(miare::Errc::ProviderUnavailable, [&] {
+        writer.write(content);
+    });
+    assert(writer.position() == 0);
+    assert(transaction.stats().blobBytesWritten == 0);
+    writer.write(content);
+    writer.finish();
+    transaction.commit();
+
+    auto read = database.beginRead();
+    auto reader = read.openBlob(id);
+    assert(reader);
+    std::vector<std::byte> output(content.size());
+    assert(reader->read(output) == output.size());
+    assert(output == content);
+    reader->close();
+    read.end();
+    database.close();
+}
+
 } // namespace
 
 int main() {
@@ -595,4 +673,6 @@ int main() {
     tamperedChunkStopsTheSessionBeforePlaintextRelease();
     blobLimitsFailWithoutAdvancingStreamState();
     failedCommitPublishesNeitherValueNorBlob();
+    stagingIoFailurePreservesWriterContents();
+    stagingProviderFailurePreservesWriterContents();
 }
