@@ -467,8 +467,19 @@ template<class Limits, class Allocator>
         !decoded.empty()) {
         auto& compression = ProviderAccess::compression(providers);
         StoredBytes<Allocator> candidate{ByteAllocator{allocator}};
-        candidate.resize(compression.compressBound(decoded.size()));
+        const auto candidateBytes = compression.compressBound(decoded.size());
+        if (candidateBytes > ZSTD_compressBound(decoded.size())) {
+            throw DatabaseError{
+                Errc::ProviderUnavailable,
+                "compression provider requested excessive output storage"};
+        }
+        candidate.resize(candidateBytes);
         const auto compressedBytes = compression.compress(decoded, candidate);
+        if (compressedBytes > candidate.size()) {
+            throw DatabaseError{
+                Errc::ProviderUnavailable,
+                "compression provider exceeded its output bound"};
+        }
         candidate.resize(compressedBytes);
         const auto compressedBlocks =
             (ExtentLayout::bytes + compressedBytes + authenticationTagBytes +
@@ -479,6 +490,27 @@ template<class Limits, class Allocator>
              Limits::allocationQuantumBytes - 1) /
             Limits::allocationQuantumBytes;
         if (compressedBytes < decoded.size() && compressedBlocks < uncompressedBlocks) {
+            StoredBytes<Allocator> verified{ByteAllocator{allocator}};
+            verified.resize(decoded.size());
+            try {
+                compression.decompress(candidate, verified);
+            } catch (const ContractError&) {
+                throw DatabaseError{
+                    Errc::ProviderUnavailable,
+                    "compression provider produced an invalid frame"};
+            } catch (const DatabaseError& error) {
+                if (error.code() != Errc::Corrupt) {
+                    throw;
+                }
+                throw DatabaseError{
+                    Errc::ProviderUnavailable,
+                    "compression provider produced an invalid frame"};
+            }
+            if (!std::equal(decoded.begin(), decoded.end(), verified.begin())) {
+                throw DatabaseError{
+                    Errc::ProviderUnavailable,
+                    "compression provider failed to preserve the payload"};
+            }
             stored = std::move(candidate);
             flags = 1;
             codec = 1;

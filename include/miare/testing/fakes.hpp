@@ -142,6 +142,9 @@ class FaultInjectingCompressionProvider final
       private ProviderFailureInjection {
 public:
     [[nodiscard]] std::size_t compressBound(std::size_t inputBytes) const override {
+        if (requestMaximumOutputStorage_) {
+            return ZSTD_compressBound(detail::maxProviderUnitBytes);
+        }
         return delegate_.compressBound(inputBytes);
     }
 
@@ -149,6 +152,10 @@ public:
         ByteView input,
         MutableByteView output) override {
         failProviderIfRequested();
+        if (reportExcessiveOutput_) {
+            reportExcessiveOutput_ = false;
+            return output.size() + 1;
+        }
         const auto written = delegate_.compress(input, output);
         if (corruptFrame_ && written != 0) {
             output.front() ^= std::byte{1};
@@ -166,10 +173,16 @@ public:
         ProviderFailureInjection::failNextProviderOperation();
     }
     void corruptNextFrame() noexcept { corruptFrame_ = true; }
+    void requestMaximumOutputStorage() noexcept {
+        requestMaximumOutputStorage_ = true;
+    }
+    void reportExcessiveOutput() noexcept { reportExcessiveOutput_ = true; }
 
 private:
     detail::ZstdCompressionProvider delegate_;
     bool corruptFrame_ = false;
+    bool requestMaximumOutputStorage_ = false;
+    bool reportExcessiveOutput_ = false;
 };
 
 class MemoryDurableFile final : public detail::DurableFile {
