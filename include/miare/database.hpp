@@ -105,7 +105,7 @@ private:
 
     class BlobStagingFile : public detail::BlobStagingStorage {
     public:
-        BlobStagingFile() : file_(std::tmpfile()) {
+        BlobStagingFile() : file_(std::tmpfile()), length_(0) {
             if (!file_) {
                 throw DatabaseError{
                     Errc::Io,
@@ -127,14 +127,27 @@ private:
             if (source.empty()) {
                 return;
             }
-            if (!seekToEnd() ||
-                std::fwrite(source.data(), 1, source.size(), file_) !=
-                source.size()) {
+            const auto originalLength = length_;
+            std::clearerr(file_);
+            if (!seekToEnd()) {
                 throw DatabaseError{
                     Errc::Io,
                     "could not write Blob staging storage",
                     std::error_code{errno, std::generic_category()}};
             }
+            if (std::fwrite(source.data(), 1, source.size(), file_) !=
+                source.size()) {
+                const auto nativeError = std::error_code{
+                    errno, std::generic_category()};
+                std::clearerr(file_);
+                (void)std::fflush(file_);
+                (void)truncateFile(originalLength);
+                throw DatabaseError{
+                    Errc::Io,
+                    "could not write Blob staging storage",
+                    nativeError};
+            }
+            length_ += source.size();
         }
 
         void readExactAt(
@@ -143,6 +156,7 @@ private:
             if (destination.empty()) {
                 return;
             }
+            std::clearerr(file_);
             if (std::fflush(file_) != 0 || !seek(offset) ||
                 std::fread(destination.data(), 1, destination.size(), file_) !=
                     destination.size()) {
@@ -160,6 +174,7 @@ private:
                     "could not truncate Blob staging storage",
                     std::error_code{errno, std::generic_category()}};
             }
+            length_ = length;
         }
 
     private:
@@ -200,6 +215,7 @@ private:
         }
 
         std::FILE* file_;
+        std::uint64_t length_;
     };
 
     using BlobVersion = detail::BlobVersion<Allocator>;
