@@ -430,6 +430,8 @@ public:
                 }
                 throw;
             }
+            state_->abortableStagingReferences -=
+                stagedChunks_.size() + (finalChunk ? 1U : 0U);
             state_->openWriterIds.erase(id_);
             --state_->openWriters;
             active_ = false;
@@ -468,7 +470,8 @@ public:
         BlobWriter(
             std::shared_ptr<WriteBlobState> state,
             std::shared_ptr<ChildLifetime> sessionLifetime,
-            BlobId id)
+            BlobId id,
+            bool active = true)
             : state_(std::move(state)),
               sessionLifetime_(std::move(sessionLifetime)),
               buffer_(typename std::allocator_traits<Allocator>::
@@ -479,7 +482,7 @@ public:
                           state_->session->allocator}),
               id_(id),
               position_(0),
-              active_(true) {}
+              active_(active) {}
 
         void requireFunctional() const {
             if (!active()) {
@@ -736,6 +739,7 @@ public:
                     Errc::ResourceLimit,
                     "could not reserve a fresh Blob identifier"};
             }
+            BlobWriter writer{blobState_, lifetime_, *selected, false};
             blobState_->generatedIds.insert(*selected);
             try {
                 blobState_->openWriterIds.insert(*selected);
@@ -745,7 +749,8 @@ public:
             }
             ++blobState_->mutations;
             ++blobState_->openWriters;
-            return BlobWriter{blobState_, lifetime_, *selected};
+            writer.active_ = true;
+            return writer;
         }
 
         [[nodiscard]] std::optional<BlobWriter> replaceBlob(BlobId id) {
@@ -760,10 +765,12 @@ public:
                     "Blob already has an unfinished writer"};
             }
             requireBlobWriterCapacity();
+            BlobWriter writer{blobState_, lifetime_, id, false};
             blobState_->openWriterIds.insert(id);
             ++blobState_->mutations;
             ++blobState_->openWriters;
-            return BlobWriter{blobState_, lifetime_, id};
+            writer.active_ = true;
+            return writer;
         }
 
         [[nodiscard]] bool eraseBlob(BlobId id) {

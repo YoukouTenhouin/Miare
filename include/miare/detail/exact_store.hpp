@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cassert>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -367,6 +368,7 @@ struct BlobWriteState {
     std::thread::id thread;
     std::uint64_t mutations = 0;
     std::uint64_t bytesWritten = 0;
+    std::size_t abortableStagingReferences = 0;
     std::uint32_t openWriters = 0;
     bool allocatorInitialized = false;
     std::atomic<bool> active{true};
@@ -2252,6 +2254,10 @@ loadFixedTree(
         true, keyDomain, 0, owner);
     const auto level = readLittleEndian<std::uint32_t>(
         payload, PageLayout::level);
+    if (readLittleEndian<std::uint16_t>(payload, PageLayout::type) == 2 &&
+        readLittleEndian<std::uint32_t>(payload, PageLayout::entryCount) == 0) {
+        throwCorrupt("fixed-key root has only one child");
+    }
     (void)loadFixedTreePage<Limits>(
         file, root, level, role, keySize, internalKind, leafKind, keyDomain,
         owner, opened, providers, allocator, entries, reachable);
@@ -2507,23 +2513,21 @@ inline void initializeBlobStagingAllocator(
 template<class Limits, class Allocator>
 inline void releaseBlobStagingReference(
     BlobWriteState<Allocator, Limits>& state,
-    const ExtentReference& reference) {
-    state.stagingFreeRuns.reserve(state.stagingFreeRuns.size() + 1);
+    const ExtentReference& reference) noexcept {
+    assert(state.abortableStagingReferences != 0);
+    assert(state.stagingFreeRuns.capacity() > state.stagingFreeRuns.size());
     insertBlobStagingFreeRun<Allocator>(
         state.stagingFreeRuns,
         ExtentRun{reference.blockIndex, reference.blockCount});
+    --state.abortableStagingReferences;
 }
 
 template<class Limits, class Allocator, class References>
 inline void releaseBlobStagingReferences(
     BlobWriteState<Allocator, Limits>& state,
-    const References& references) {
-    state.stagingFreeRuns.reserve(
-        state.stagingFreeRuns.size() + references.size());
+    const References& references) noexcept {
     for (const auto& reference : references) {
-        insertBlobStagingFreeRun<Allocator>(
-            state.stagingFreeRuns,
-            ExtentRun{reference.blockIndex, reference.blockCount});
+        releaseBlobStagingReference<Limits>(state, reference);
     }
 }
 
@@ -2549,7 +2553,9 @@ template<class Limits, class Allocator>
         4,
         ordinal,
         owner);
-    state.stagingFreeRuns.reserve(state.stagingFreeRuns.size() + 1);
+    state.stagingFreeRuns.reserve(
+        state.stagingFreeRuns.size() +
+        state.abortableStagingReferences + 1);
     auto allocated = state.stagingNextBlock;
     bool appended = true;
     for (auto& run : state.stagingFreeRuns) {
@@ -2624,9 +2630,12 @@ template<class Limits, class Allocator>
                 ? physicalBytes - session.opened.format.highWaterBytes
                 : 0;
         }
+        ++state.abortableStagingReferences;
         return prepared.reference;
     } catch (...) {
-        releaseBlobStagingReference<Limits>(state, reserved);
+        insertBlobStagingFreeRun<Allocator>(
+            state.stagingFreeRuns,
+            ExtentRun{reserved.blockIndex, reserved.blockCount});
         throw;
     }
 }
@@ -2653,24 +2662,30 @@ inline void readBlobRange(
                 Errc::ResourceLimit,
                 "Blob chunk exceeds the configured cache capacity"};
         }
-        auto chunk = readAuthenticatedExtent<Limits>(
-            *session.file,
-            version.chunks[ordinal],
-            13,
-            expectedLength,
-            session.opened,
-            *session.providers,
-            session.allocator,
-            true,
-            4,
-            ordinal,
-            owner,
-            version.pending
-                ? std::optional<std::uint64_t>{version.generation}
-                : std::nullopt,
-            version.pending
-                ? std::optional<std::uint64_t>{version.stagedHighWaterBytes}
-                : std::nullopt);
+        StoredBytes<Allocator> chunk{
+            typename std::allocator_traits<Allocator>::template rebind_alloc<
+                std::byte>{session.allocator}};
+        {
+            std::lock_guard lock{session.mutex};
+            chunk = readAuthenticatedExtent<Limits>(
+                *session.file,
+                version.chunks[ordinal],
+                13,
+                expectedLength,
+                session.opened,
+                *session.providers,
+                session.allocator,
+                true,
+                4,
+                ordinal,
+                owner,
+                version.pending
+                    ? std::optional<std::uint64_t>{version.generation}
+                    : std::nullopt,
+                version.pending
+                    ? std::optional<std::uint64_t>{version.stagedHighWaterBytes}
+                    : std::nullopt);
+        }
         const auto count = std::min<std::size_t>(
             destination.size() - copied,
             chunk.size() - static_cast<std::size_t>(within));

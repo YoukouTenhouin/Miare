@@ -188,10 +188,12 @@ private:
 class MemoryDurableFile final : public detail::DurableFile {
 public:
     [[nodiscard]] std::uint64_t size() const override {
+        std::lock_guard lock{mutex_};
         return bytes_.size();
     }
 
     void readExactAt(std::uint64_t offset, MutableByteView destination) override {
+        std::lock_guard lock{mutex_};
         auto& operation = beginOperation(
             DurableFileOperationKind::Read, offset, destination.size());
         if (failReadsAtOrAfter_ && offset >= *failReadsAtOrAfter_) {
@@ -210,6 +212,7 @@ public:
     }
 
     void writeExactAt(std::uint64_t offset, ByteView source) override {
+        std::lock_guard lock{mutex_};
         auto& operation = beginOperation(
             DurableFileOperationKind::Write, offset, source.size());
         if (offset > std::numeric_limits<std::size_t>::max() ||
@@ -236,6 +239,7 @@ public:
     }
 
     void resize(std::uint64_t length) override {
+        std::lock_guard lock{mutex_};
         auto& operation = beginOperation(
             DurableFileOperationKind::Resize, length, 0);
         if (failResize_) {
@@ -254,6 +258,7 @@ public:
     }
 
     void stableStorageBarrier() override {
+        std::lock_guard lock{mutex_};
         auto& operation = beginOperation(DurableFileOperationKind::Barrier, 0, 0);
         if (failBarrier_ || (failBarrierAfter_ && *failBarrierAfter_ == 0)) {
             failBarrier_ = false;
@@ -393,6 +398,7 @@ private:
     bool failBarrier_ = false;
     std::optional<std::size_t> failBarrierAfter_;
     bool failResize_ = false;
+    mutable std::mutex mutex_;
 };
 
 class DatabaseAccess {

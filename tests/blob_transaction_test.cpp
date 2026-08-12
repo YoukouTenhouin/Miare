@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -39,6 +40,67 @@ struct TightBlobLimits : SmallChunkLimits {
     static constexpr std::uint64_t maxBlobMutationsPerTransaction = 2;
     static constexpr std::uint32_t maxBlobReadersPerTransaction = 1;
     static constexpr std::uint32_t maxOpenBlobWritersPerTransaction = 1;
+};
+
+struct FailingAllocatorState {
+    std::atomic<bool> failCopies{false};
+    std::atomic<bool> failAllocations{false};
+};
+
+template<class T>
+class FailingAllocator {
+public:
+    using value_type = T;
+
+    FailingAllocator()
+        : state(std::make_shared<FailingAllocatorState>()) {}
+
+    explicit FailingAllocator(std::shared_ptr<FailingAllocatorState> sharedState)
+        : state(std::move(sharedState)) {}
+
+    FailingAllocator(const FailingAllocator& other)
+        : state(other.state) {
+        failCopyIfRequested();
+    }
+
+    FailingAllocator(FailingAllocator&& other) noexcept
+        : state(other.state) {}
+
+    template<class U>
+    FailingAllocator(const FailingAllocator<U>& other)
+        : state(other.state) {
+        failCopyIfRequested();
+    }
+
+    [[nodiscard]] T* allocate(std::size_t count) {
+        if (state->failAllocations.load(std::memory_order_relaxed)) {
+            throw std::bad_alloc{};
+        }
+        return std::allocator<T>{}.allocate(count);
+    }
+
+    void deallocate(T* allocation, std::size_t count) noexcept {
+        std::allocator<T>{}.deallocate(allocation, count);
+    }
+
+    template<class U>
+    friend class FailingAllocator;
+
+    template<class U>
+    friend bool operator==(
+        const FailingAllocator& left,
+        const FailingAllocator<U>& right) noexcept {
+        return left.state == right.state;
+    }
+
+    std::shared_ptr<FailingAllocatorState> state;
+
+private:
+    void failCopyIfRequested() const {
+        if (state->failCopies.load(std::memory_order_relaxed)) {
+            throw std::bad_alloc{};
+        }
+    }
 };
 
 using SmallChunkDatabase = miare::Database<
@@ -704,6 +766,76 @@ void stagingAllocatorCorruptionMakesChildrenTerminal() {
     database.close();
 }
 
+void writerConstructionFailurePreservesTransactionContents() {
+    auto state = std::make_shared<FailingAllocatorState>();
+    FailingAllocator<std::byte> allocator{state};
+    auto file = std::make_unique<miare::testing::MemoryDurableFile>();
+    auto database = miare::testing::DatabaseAccess::create<
+        FailingAllocator<std::byte>, SmallChunkLimits>(
+        std::move(file),
+        miare::EncryptionKeyView{encryptionKey},
+        deterministicProviders(18),
+        {},
+        allocator);
+
+    auto transaction = database.beginWrite();
+    state->failCopies.store(true, std::memory_order_relaxed);
+    try {
+        (void)transaction.createBlob();
+        assert(false);
+    } catch (const std::bad_alloc&) {
+    }
+    state->failCopies.store(false, std::memory_order_relaxed);
+    assert(transaction.stats().blobMutations == 0);
+    assert(transaction.stats().openBlobWriters == 0);
+    auto writer = transaction.createBlob();
+    const auto id = writer.id();
+    writer.finish();
+    transaction.commit();
+
+    auto replacementTransaction = database.beginWrite();
+    state->failCopies.store(true, std::memory_order_relaxed);
+    try {
+        (void)replacementTransaction.replaceBlob(id);
+        assert(false);
+    } catch (const std::bad_alloc&) {
+    }
+    state->failCopies.store(false, std::memory_order_relaxed);
+    assert(replacementTransaction.stats().blobMutations == 0);
+    assert(replacementTransaction.stats().openBlobWriters == 0);
+    auto replacement = replacementTransaction.replaceBlob(id);
+    assert(replacement);
+    replacement->abort();
+    replacementTransaction.rollback();
+    database.close();
+}
+
+void abortUsesPreallocatedStagingBookkeeping() {
+    auto state = std::make_shared<FailingAllocatorState>();
+    FailingAllocator<std::byte> allocator{state};
+    auto file = std::make_unique<miare::testing::MemoryDurableFile>();
+    auto database = miare::testing::DatabaseAccess::create<
+        FailingAllocator<std::byte>, SmallChunkLimits>(
+        std::move(file),
+        miare::EncryptionKeyView{encryptionKey},
+        deterministicProviders(19),
+        {},
+        allocator);
+
+    auto transaction = database.beginWrite();
+    auto writer = transaction.createBlob();
+    std::vector<std::byte> chunk(
+        SmallChunkLimits::blobChunkBytes, std::byte{0x41});
+    writer.write(chunk);
+    state->failAllocations.store(true, std::memory_order_relaxed);
+    writer.abort();
+    assert(transaction.stats().blobMutations == 0);
+    assert(transaction.stats().openBlobWriters == 0);
+    state->failAllocations.store(false, std::memory_order_relaxed);
+    transaction.commit();
+    database.close();
+}
+
 } // namespace
 
 int main() {
@@ -721,4 +853,6 @@ int main() {
     stagingIoFailurePreservesWriterContents();
     stagingProviderFailurePreservesWriterContents();
     stagingAllocatorCorruptionMakesChildrenTerminal();
+    writerConstructionFailurePreservesTransactionContents();
+    abortUsesPreallocatedStagingBookkeeping();
 }
