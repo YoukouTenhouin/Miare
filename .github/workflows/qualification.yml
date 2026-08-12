@@ -235,3 +235,37 @@ jobs:
           ctest --test-dir qualification-build
           -L qualification
           --output-on-failure
+
+  bounded-fuzz-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install providers
+        run: >-
+          sudo apt-get update &&
+          sudo apt-get install -y clang-17 libsodium-dev libzstd-dev
+      - name: Configure fuzz targets
+        run: >-
+          cmake -S . -B fuzz-build
+          -DMIARE_BUILD_TESTS=OFF
+          -DMIARE_BUILD_FUZZERS=ON
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_CXX_COMPILER=clang++-17
+      - name: Build fuzz targets
+        run: cmake --build fuzz-build --parallel
+      - name: Replay and extend format corpus
+        run: >-
+          fuzz-build/fuzz/miare_format_fuzz
+          fuzz/corpus/format
+          -runs=10000
+          -max_len=16777216
+          -timeout=5
+      - name: Replay and extend public-history corpus
+        run: >-
+          fuzz-build/fuzz/miare_public_history_fuzz
+          fuzz/corpus/public_history
+          -runs=10000
+          -max_len=65536
+          -timeout=5

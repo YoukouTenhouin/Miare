@@ -7,6 +7,7 @@ option(
     MIARE_BUILD_QUALIFICATION_TESTS
     "Register long-running backend qualification tests"
     OFF)
+option(MIARE_BUILD_FUZZERS "Build bounded libFuzzer targets" OFF)
 
 add_library(miare INTERFACE)
 add_library(miare::miare ALIAS miare)
@@ -69,4 +70,13 @@ install(
 if(MIARE_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
+endif()
+
+if(MIARE_BUILD_FUZZERS)
+    if((NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND
+        NOT CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang") OR
+       NOT CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "GNU")
+        message(FATAL_ERROR "MIARE_BUILD_FUZZERS requires Clang libFuzzer")
+    endif()
+    add_subdirectory(fuzz)
 endif()
