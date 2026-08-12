@@ -91,6 +91,54 @@ void checkpointRespectsSnapshotsAndPersistsReclamation() {
     empty.close();
 }
 
+void interruptedCheckpointReopensThePredecessor() {
+    auto file = std::make_unique<miare::testing::MemoryDurableFile>();
+    auto* fileView = file.get();
+    auto database = miare::testing::DatabaseAccess::create(
+        std::move(file),
+        miare::EncryptionKeyView{encryptionKey},
+        deterministicProviders(11));
+    auto first = database.beginWrite();
+    first.put(bytes("key"), std::vector<std::byte>(8'193, std::byte{0x51}));
+    first.commit();
+    auto retained = database.beginRead();
+    auto second = database.beginWrite();
+    second.put(bytes("key"), bytes("predecessor"));
+    second.commit();
+    retained.end();
+
+    fileView->failNextBarrier();
+    try {
+        database.checkpoint();
+        assert(false);
+    } catch (const miare::DatabaseError& error) {
+        assert(error.code() == miare::Errc::Durability);
+    }
+    assert(database.state() == miare::DatabaseState::RecoveryRequired);
+    assert(database.diagnostics().recoveryCause ==
+        miare::RecoveryCause::MaintenancePersistenceFailed);
+    fileView->simulateCrash();
+    const auto recoveredBytes = fileView->bytes();
+    database.close();
+
+    auto recoveredFile =
+        std::make_unique<miare::testing::MemoryDurableFile>();
+    recoveredFile->replaceStableBytes(recoveredBytes);
+    auto recovered = miare::testing::DatabaseAccess::open(
+        std::move(recoveredFile),
+        miare::EncryptionKeyView{encryptionKey},
+        deterministicProviders(12));
+    assert(recovered);
+    assert(recovered.value().diagnostics().lastCommittedGeneration == 3);
+    auto read = recovered.value().beginRead();
+    const auto value = read.get(bytes("key"));
+    assert(value && std::equal(
+        value->begin(), value->end(),
+        bytes("predecessor").begin(), bytes("predecessor").end()));
+    read.end();
+    recovered.value().close();
+}
+
 void verificationIsBoundedAndFailsClosed() {
     auto file = std::make_unique<miare::testing::MemoryDurableFile>();
     auto* fileView = file.get();
@@ -207,13 +255,76 @@ void backupIsPortableAndExcludesAbandonedTail() {
         assert(error.code() == miare::Errc::Io);
     }
     assert(database.state() == miare::DatabaseState::Open);
+
+    {
+        auto damagedFile =
+            miare::detail::NativeDurableFile::openExisting(backupPath);
+        std::vector<std::byte> image(
+            static_cast<std::size_t>(damagedFile->size()));
+        damagedFile->readExactAt(0, image);
+        for (std::uint64_t offset = miare::detail::commonRegionBytes;
+             offset + miare::detail::ExtentLayout::bytes <= image.size();
+             offset += miare::DefaultLimits::allocationQuantumBytes) {
+            if (miare::detail::matches(
+                    image, offset, "MIAREXT\0")) {
+                auto damaged = image[offset + miare::detail::ExtentLayout::nonce];
+                damaged ^= std::byte{1};
+                damagedFile->writeExactAt(
+                    offset + miare::detail::ExtentLayout::nonce,
+                    miare::ByteView{&damaged, 1});
+                damagedFile->stableStorageBarrier();
+                break;
+            }
+        }
+    }
+    const auto damaged = miare::Database<>::verifyFile(
+        backupPath,
+        miare::EncryptionKeyView{encryptionKey},
+        deterministicProviders(8));
+    assert(damaged && !damaged.value().valid);
+    assert(damaged.value().findings.front().code ==
+        miare::VerificationFindingCode::ExtentAuthenticationFailed);
     database.close();
+}
+
+void closeCheckpointsEligibleRetirementsAndIsRetryable() {
+    auto file = std::make_unique<miare::testing::MemoryDurableFile>();
+    auto* fileView = file.get();
+    auto database = miare::testing::DatabaseAccess::create(
+        std::move(file),
+        miare::EncryptionKeyView{encryptionKey},
+        deterministicProviders(7));
+    auto first = database.beginWrite();
+    first.put(bytes("key"), std::vector<std::byte>(8'193, std::byte{0x41}));
+    first.commit();
+    auto retained = database.beginRead();
+    auto second = database.beginWrite();
+    second.put(bytes("key"), bytes("replacement"));
+    second.commit();
+    assert(database.diagnostics().snapshotRetainedBytes != 0);
+    retained.end();
+
+    fileView->failNextBarrier();
+    try {
+        database.close();
+        assert(false);
+    } catch (const miare::DatabaseError& error) {
+        assert(error.code() == miare::Errc::Durability);
+    }
+    assert(database.state() == miare::DatabaseState::RecoveryRequired);
+    assert(database.diagnostics().recoveryCause ==
+        miare::RecoveryCause::ClosePersistenceFailed);
+    fileView->clearFaults();
+    database.close();
+    assert(database.state() == miare::DatabaseState::Closed);
 }
 
 } // namespace
 
 int main() {
     checkpointRespectsSnapshotsAndPersistsReclamation();
+    interruptedCheckpointReopensThePredecessor();
     verificationIsBoundedAndFailsClosed();
     backupIsPortableAndExcludesAbandonedTail();
+    closeCheckpointsEligibleRetirementsAndIsRetryable();
 }

@@ -3457,7 +3457,7 @@ inline void commitExact(
     const OrderedKeyValues<Allocator>& values,
     const BlobCatalog<Allocator>& blobs,
     const BlobWriteState<Allocator, Limits>& blobState,
-    bool maintenance = false) {
+    std::optional<RecoveryCause> persistenceFailureCause = std::nullopt) {
     const auto generation = session.opened.format.generation + 1;
     if (generation == 0) {
         throw DatabaseError{Errc::ResourceLimit, "database generation is exhausted"};
@@ -4305,9 +4305,9 @@ inline void commitExact(
         session.file->stableStorageBarrier();
     } catch (const DatabaseError& error) {
         recordAbandonedTail();
-        if (maintenance) {
+        if (persistenceFailureCause) {
             session.recoveryCause.store(
-                RecoveryCause::MaintenancePersistenceFailed,
+                *persistenceFailureCause,
                 std::memory_order_release);
             session.state.store(
                 DatabaseState::RecoveryRequired, std::memory_order_release);
@@ -4329,8 +4329,8 @@ inline void commitExact(
     } catch (...) {
         recordAbandonedTail();
         session.recoveryCause.store(
-            maintenance
-                ? RecoveryCause::MaintenancePersistenceFailed
+            persistenceFailureCause
+                ? *persistenceFailureCause
                 : RecoveryCause::CommitOutcomeUnknown,
             std::memory_order_release);
         session.state.store(

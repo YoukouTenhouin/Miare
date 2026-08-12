@@ -437,6 +437,14 @@ struct OpenedDatabase {
     std::uint64_t abandonedTailBytes = 0;
 };
 
+struct SelectedPublication {
+    OpenedFormat format;
+    Bootstrap bootstrap;
+    PublicationPlaintext publication;
+    bool rejectedInactivePublication = false;
+    std::uint64_t abandonedTailBytes = 0;
+};
+
 [[noreturn]] inline void throwCorrupt(const char* message) {
     throw DatabaseError{Errc::Corrupt, message};
 }
@@ -667,22 +675,20 @@ inline void validateCanonicalBootstrap(const Bootstrap& bootstrap) {
 }
 
 template<class Limits>
-[[nodiscard]] inline Result<OpenedDatabase, AuthenticationFailed> openFormat(
+[[nodiscard]] inline Result<SelectedPublication, AuthenticationFailed>
+selectPublication(
     DurableFile& file,
-    EncryptionKeyView callerKey,
-    ProviderSet& providers) {
-    Bootstrap bootstrap{};
-    file.readExactAt(0, bootstrap);
+    const SessionKeys& keys,
+    ProviderSet& providers,
+    const Bootstrap* alreadyReadBootstrap = nullptr) {
+    Bootstrap bootstrap = alreadyReadBootstrap
+        ? *alreadyReadBootstrap
+        : Bootstrap{};
+    if (!alreadyReadBootstrap) {
+        file.readExactAt(0, bootstrap);
+    }
     validateVisibleBootstrapDispatch(bootstrap);
-    requireCallerKey(callerKey);
-
     auto& crypto = ProviderAccess::crypto(providers);
-    auto keys = deriveSessionKeys(
-        crypto,
-        callerKey,
-        ByteView{bootstrap}.subspan(
-            BootstrapLayout::databaseIdentity, databaseIdentityBytes),
-        ByteView{bootstrap}.subspan(BootstrapLayout::salt, kdfSaltBytes));
 
     std::array<PublicationSlot, 2> slots{};
     std::array<std::optional<PublicationPlaintext>, 2> plaintexts{};
@@ -697,7 +703,7 @@ template<class Limits>
         }
     }
     if (!plaintexts[0] && !plaintexts[1]) {
-        return Result<OpenedDatabase, AuthenticationFailed>::failure(
+        return Result<SelectedPublication, AuthenticationFailed>::failure(
             AuthenticationFailed{});
     }
     validateCanonicalBootstrap(bootstrap);
@@ -733,14 +739,47 @@ template<class Limits>
     if (physicalBytes < formats[selected]->highWaterBytes) {
         throwCorrupt("database file ends before its committed boundary");
     }
-    return Result<OpenedDatabase, AuthenticationFailed>::success(
-        OpenedDatabase{
+    return Result<SelectedPublication, AuthenticationFailed>::success(
+        SelectedPublication{
             *formats[selected],
-            std::move(keys),
             bootstrap,
             *plaintexts[selected],
             !formats[1U - selected].has_value(),
             physicalBytes - formats[selected]->highWaterBytes});
+}
+
+template<class Limits>
+[[nodiscard]] inline Result<OpenedDatabase, AuthenticationFailed> openFormat(
+    DurableFile& file,
+    EncryptionKeyView callerKey,
+    ProviderSet& providers) {
+    Bootstrap bootstrap{};
+    file.readExactAt(0, bootstrap);
+    validateVisibleBootstrapDispatch(bootstrap);
+    requireCallerKey(callerKey);
+
+    auto& crypto = ProviderAccess::crypto(providers);
+    auto keys = deriveSessionKeys(
+        crypto,
+        callerKey,
+        ByteView{bootstrap}.subspan(
+            BootstrapLayout::databaseIdentity, databaseIdentityBytes),
+        ByteView{bootstrap}.subspan(BootstrapLayout::salt, kdfSaltBytes));
+    auto selected = selectPublication<Limits>(
+        file, keys, providers, &bootstrap);
+    if (!selected) {
+        return Result<OpenedDatabase, AuthenticationFailed>::failure(
+            AuthenticationFailed{});
+    }
+    auto publication = std::move(selected).value();
+    return Result<OpenedDatabase, AuthenticationFailed>::success(
+        OpenedDatabase{
+            publication.format,
+            std::move(keys),
+            publication.bootstrap,
+            publication.publication,
+            publication.rejectedInactivePublication,
+            publication.abandonedTailBytes});
 }
 
 } // namespace miare::detail

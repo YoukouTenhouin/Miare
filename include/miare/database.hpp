@@ -1529,30 +1529,8 @@ public:
             ensureValuesLoaded(session);
             ensureBlobsLoaded(session);
             ensureAllocatorSnapshotLoaded(session);
-            bool eligibleRetirement = false;
-            {
-                std::lock_guard lock{session.mutex};
-                auto oldestReader = std::numeric_limits<std::uint64_t>::max();
-                for (const auto& [identity, reader] : session.activeReaders) {
-                    (void)identity;
-                    oldestReader = std::min(oldestReader, reader.generation);
-                }
-                eligibleRetirement = std::any_of(
-                    session.retiredBlocksByGeneration.begin(),
-                    session.retiredBlocksByGeneration.end(),
-                    [oldestReader](const auto& retirement) {
-                        return oldestReader >= retirement.first;
-                    });
-            }
-            if (eligibleRetirement) {
-                auto blobState = makeWriteBlobState(session);
-                detail::commitExact<Limits>(
-                    session,
-                    session.values,
-                    session.blobs,
-                    *blobState,
-                    true);
-            }
+            checkpointEligibleRetirements(
+                session, RecoveryCause::MaintenancePersistenceFailed);
             removeAbandonedTail(session, RecoveryCause::MaintenancePersistenceFailed);
         } catch (const DatabaseError& error) {
             releaseMaintenance(session);
@@ -1754,9 +1732,34 @@ public:
         }
         const auto recoveryCause = session.recoveryCause.load(
             std::memory_order_acquire);
-        if (expected == DatabaseState::Open ||
-            (expected == DatabaseState::RecoveryRequired &&
-             recoveryCause == RecoveryCause::ClosePersistenceFailed)) {
+        const bool resolveAndCheckpoint = expected == DatabaseState::Open ||
+            recoveryCause != RecoveryCause::ConfirmedCorruption;
+        if (resolveAndCheckpoint) {
+            try {
+                if (expected == DatabaseState::RecoveryRequired) {
+                    reselectSessionForClose(session);
+                }
+                ensureValuesLoaded(session);
+                ensureBlobsLoaded(session);
+                ensureAllocatorSnapshotLoaded(session);
+                checkpointEligibleRetirements(
+                    session, RecoveryCause::ClosePersistenceFailed);
+            } catch (const DatabaseError& error) {
+                if (session.state.load(std::memory_order_acquire) !=
+                    DatabaseState::RecoveryRequired) {
+                    session.state.store(
+                        error.code() == Errc::Corrupt
+                            ? DatabaseState::RecoveryRequired
+                            : expected,
+                        std::memory_order_release);
+                    if (error.code() == Errc::Corrupt) {
+                        session.recoveryCause.store(
+                            RecoveryCause::ConfirmedCorruption,
+                            std::memory_order_release);
+                    }
+                }
+                throw;
+            }
             consolidateAbandonedTailForClose(session, expected);
         }
         operation.unlock();
@@ -2010,6 +2013,63 @@ private:
         session.blobRetiredBlocksByGeneration = std::move(
             snapshot.blobRetiredBlocksByGeneration);
         session.allocatorSnapshotLoaded = true;
+    }
+
+    static void reselectSessionForClose(Session& session) {
+        auto selected = detail::selectPublication<Limits>(
+            *session.file, session.opened.keys, *session.providers);
+        if (!selected) {
+            detail::throwCorrupt(
+                "recovery close could not authenticate a committed publication");
+        }
+        auto publication = std::move(selected).value();
+        session.opened.format = publication.format;
+        session.opened.bootstrap = publication.bootstrap;
+        session.opened.publication = publication.publication;
+        session.opened.rejectedInactivePublication =
+            publication.rejectedInactivePublication;
+        session.opened.abandonedTailBytes = publication.abandonedTailBytes;
+        session.values = detail::makeOrderedKeyValues(session.allocator);
+        session.valuesLoaded = false;
+        session.blobs = detail::makeBlobCatalog(session.allocator);
+        session.blobsLoaded = false;
+        using TreeAllocator = typename std::allocator_traits<Allocator>::
+            template rebind_alloc<MutableTree>;
+        session.cursorTree = std::allocate_shared<MutableTree>(
+            TreeAllocator{session.allocator}, session.allocator);
+        session.retiredBlocksByGeneration.clear();
+        session.blobRetiredBlocksByGeneration.clear();
+        session.allocatorSnapshotLoaded = false;
+    }
+
+    static void checkpointEligibleRetirements(
+        Session& session,
+        RecoveryCause persistenceFailureCause) {
+        bool eligibleRetirement = false;
+        {
+            std::lock_guard lock{session.mutex};
+            auto oldestReader = std::numeric_limits<std::uint64_t>::max();
+            for (const auto& [identity, reader] : session.activeReaders) {
+                (void)identity;
+                oldestReader = std::min(oldestReader, reader.generation);
+            }
+            eligibleRetirement = std::any_of(
+                session.retiredBlocksByGeneration.begin(),
+                session.retiredBlocksByGeneration.end(),
+                [oldestReader](const auto& retirement) {
+                    return oldestReader >= retirement.first;
+                });
+        }
+        if (!eligibleRetirement) {
+            return;
+        }
+        auto blobState = makeWriteBlobState(session);
+        detail::commitExact<Limits>(
+            session,
+            session.values,
+            session.blobs,
+            *blobState,
+            persistenceFailureCause);
     }
 
     static void acquireMaintenance(Session& session) {
