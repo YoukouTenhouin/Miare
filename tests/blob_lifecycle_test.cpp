@@ -9,6 +9,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -100,9 +101,9 @@ void verifySnapshot(
     return selected->first;
 }
 
-void randomizedKeyAndBlobHistoriesMatchIndependentModel() {
-    constexpr std::uint64_t historyCount = 24;
-    constexpr std::uint64_t operationsPerHistory = 48;
+void randomizedKeyAndBlobHistoriesMatchIndependentModel(
+    std::uint64_t historyCount,
+    std::uint64_t operationsPerHistory) {
     for (std::uint64_t seed = 1; seed <= historyCount; ++seed) {
         RandomHistory random{seed};
         auto file = std::make_unique<miare::testing::MemoryDurableFile>();
@@ -253,7 +254,14 @@ void applicationReferencesDoNotControlBlobLifetime() {
 
 } // namespace
 
-int main() {
-    randomizedKeyAndBlobHistoriesMatchIndependentModel();
+int main(int argc, char** argv) {
+    const bool qualification = argc == 2 &&
+        std::string_view{argv[1]} == "--qualification";
+    if (argc > 2 || (argc == 2 && !qualification)) {
+        return 2;
+    }
+    randomizedKeyAndBlobHistoriesMatchIndependentModel(
+        qualification ? 1'000U : 24U,
+        qualification ? 10'000U : 48U);
     applicationReferencesDoNotControlBlobLifetime();
 }
