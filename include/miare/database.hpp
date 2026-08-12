@@ -139,6 +139,7 @@ public:
               sessionLifetime_(std::move(other.sessionLifetime_)),
               lifetime_(std::move(other.lifetime_)),
               version_(std::move(other.version_)),
+              decodedChunk_(std::move(other.decodedChunk_)),
               thread_(other.thread_),
               position_(other.position_),
               active_(std::exchange(other.active_, false)) {}
@@ -175,7 +176,8 @@ public:
                         *session_,
                         *version_,
                         position_,
-                        destination.first(count));
+                        destination.first(count),
+                        decodedChunk_);
                     position_ += count;
                 }
                 return count;
@@ -206,6 +208,9 @@ public:
             if (lifetime_ &&
                 !lifetime_->invalidated.load(std::memory_order_acquire)) {
                 lifetime_->liveReaders.fetch_sub(1, std::memory_order_relaxed);
+            }
+            if (session_) {
+                detail::releaseDecodedBlobChunk(*session_, decodedChunk_);
             }
             version_.reset();
             lifetime_.reset();
@@ -261,6 +266,7 @@ public:
         std::shared_ptr<ChildLifetime> sessionLifetime_;
         std::shared_ptr<BlobReaderLifetime> lifetime_;
         BlobVersionPtr version_;
+        std::optional<detail::DecodedBlobChunk<Allocator>> decodedChunk_;
         std::thread::id thread_;
         std::uint64_t position_;
         bool active_;
@@ -1267,6 +1273,11 @@ public:
         result.reclaimableBytes = reclaimableBlocks * quantum;
         result.snapshotRetainedBytes = snapshotRetainedBlocks * quantum;
         result.cacheCapacityBytes = session.cacheCapacityBytes;
+        result.cacheUsedBytes = session.cacheUsedBytes.load(
+            std::memory_order_relaxed);
+        result.cachePinnedBytes = result.cacheUsedBytes;
+        result.cacheEvictions = session.cacheEvictions.load(
+            std::memory_order_relaxed);
         result.activeReaders = static_cast<std::uint32_t>(
             session.activeReaders.size());
         result.oldestReaderGeneration = oldestReaderGeneration;

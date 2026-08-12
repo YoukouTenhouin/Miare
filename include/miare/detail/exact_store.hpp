@@ -229,6 +229,8 @@ struct DatabaseSession {
     bool allocatorSnapshotLoaded = opened.format.generation == 1;
     std::size_t cacheCapacityBytes;
     std::uint32_t maxReaders;
+    std::atomic<std::uint64_t> cacheUsedBytes{0};
+    std::atomic<std::uint64_t> cacheEvictions{0};
     std::atomic<DatabaseState> state{DatabaseState::Open};
     std::atomic<bool> confirmedCorruptionPending{false};
     std::atomic<RecoveryCause> recoveryCause{RecoveryCause::None};
@@ -340,6 +342,17 @@ using BlobIdSet = std::set<
 struct BlobReaderLifetime {
     std::atomic<bool> invalidated{false};
     std::atomic<std::uint32_t> liveReaders{0};
+};
+
+template<class Allocator>
+struct DecodedBlobChunk {
+    DecodedBlobChunk(
+        std::uint64_t chunkOrdinal,
+        StoredBytes<Allocator> chunkBytes)
+        : ordinal(chunkOrdinal), bytes(std::move(chunkBytes)) {}
+
+    std::uint64_t ordinal;
+    StoredBytes<Allocator> bytes;
 };
 
 template<class Allocator, class Limits>
@@ -2754,11 +2767,28 @@ template<class Limits, class Allocator>
 }
 
 template<class Limits, class Allocator>
+inline void releaseDecodedBlobChunk(
+    DatabaseSession<Allocator, Limits>& session,
+    std::optional<DecodedBlobChunk<Allocator>>& cached,
+    bool eviction = false) noexcept {
+    if (!cached) {
+        return;
+    }
+    session.cacheUsedBytes.fetch_sub(
+        cached->bytes.size(), std::memory_order_relaxed);
+    cached.reset();
+    if (eviction) {
+        session.cacheEvictions.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+template<class Limits, class Allocator>
 inline void readBlobRange(
     DatabaseSession<Allocator, Limits>& session,
     const BlobVersion<Allocator>& version,
     std::uint64_t offset,
-    MutableByteView destination) {
+    MutableByteView destination,
+    std::optional<DecodedBlobChunk<Allocator>>& cached) {
     const auto owner = version.id.toBytes();
     std::size_t copied = 0;
     while (copied != destination.size()) {
@@ -2768,41 +2798,62 @@ inline void readBlobRange(
         const auto expectedLength = ordinal + 1 == version.chunks.size()
             ? version.size - ordinal * Limits::blobChunkBytes
             : Limits::blobChunkBytes;
-        if (expectedLength > session.cacheCapacityBytes) {
-            session.capacityFailureCount.fetch_add(
-                1, std::memory_order_relaxed);
-            throw DatabaseError{
-                Errc::ResourceLimit,
-                "Blob chunk exceeds the configured cache capacity"};
-        }
         {
             std::lock_guard lock{session.mutex};
-            StoredBytes<Allocator> chunk{
-                typename std::allocator_traits<Allocator>::template rebind_alloc<
-                    std::byte>{session.allocator}};
-            chunk = readAuthenticatedExtent<Limits>(
-                *session.file,
-                version.chunks[ordinal],
-                13,
-                expectedLength,
-                session.opened,
-                *session.providers,
-                session.allocator,
-                true,
-                4,
-                ordinal,
-                owner,
-                version.pending
-                    ? std::optional<std::uint64_t>{version.generation}
-                    : std::nullopt,
-                version.pending
-                    ? std::optional<std::uint64_t>{version.stagedHighWaterBytes}
-                    : std::nullopt);
+            if (!cached || cached->ordinal != ordinal) {
+                releaseDecodedBlobChunk(session, cached, cached.has_value());
+                auto used = session.cacheUsedBytes.load(
+                    std::memory_order_relaxed);
+                const auto capacity = static_cast<std::uint64_t>(
+                    session.cacheCapacityBytes);
+                do {
+                    if (used > capacity || expectedLength > capacity - used) {
+                        session.capacityFailureCount.fetch_add(
+                            1, std::memory_order_relaxed);
+                        throw DatabaseError{
+                            Errc::ResourceLimit,
+                            "Blob chunk exceeds the available cache capacity"};
+                    }
+                } while (!session.cacheUsedBytes.compare_exchange_weak(
+                    used,
+                    used + expectedLength,
+                    std::memory_order_relaxed,
+                    std::memory_order_relaxed));
+                try {
+                    StoredBytes<Allocator> chunk{
+                        typename std::allocator_traits<Allocator>::
+                            template rebind_alloc<std::byte>{session.allocator}};
+                    chunk = readAuthenticatedExtent<Limits>(
+                        *session.file,
+                        version.chunks[ordinal],
+                        13,
+                        expectedLength,
+                        session.opened,
+                        *session.providers,
+                        session.allocator,
+                        true,
+                        4,
+                        ordinal,
+                        owner,
+                        version.pending
+                            ? std::optional<std::uint64_t>{version.generation}
+                            : std::nullopt,
+                        version.pending
+                            ? std::optional<std::uint64_t>{
+                                  version.stagedHighWaterBytes}
+                            : std::nullopt);
+                    cached.emplace(ordinal, std::move(chunk));
+                } catch (...) {
+                    session.cacheUsedBytes.fetch_sub(
+                        expectedLength, std::memory_order_relaxed);
+                    throw;
+                }
+            }
             const auto count = std::min<std::size_t>(
                 destination.size() - copied,
-                chunk.size() - static_cast<std::size_t>(within));
+                cached->bytes.size() - static_cast<std::size_t>(within));
             std::copy_n(
-                chunk.begin() + static_cast<std::ptrdiff_t>(within),
+                cached->bytes.begin() + static_cast<std::ptrdiff_t>(within),
                 count,
                 destination.begin() + static_cast<std::ptrdiff_t>(copied));
             copied += count;

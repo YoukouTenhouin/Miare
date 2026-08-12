@@ -847,6 +847,58 @@ void openRetainsValidatedBlobCatalog() {
     reopened.value().close();
 }
 
+void smallReadsReuseDecodedBlobChunks() {
+    auto file = std::make_unique<miare::testing::MemoryDurableFile>();
+    auto compression =
+        std::make_unique<miare::testing::FaultInjectingCompressionProvider>();
+    auto* compressionView = compression.get();
+    auto providers = miare::detail::ProviderAccess::make(
+        std::make_unique<miare::testing::DeterministicCryptoProvider>(57),
+        std::move(compression));
+    auto database = miare::testing::DatabaseAccess::create<
+        std::allocator<std::byte>, SmallChunkLimits>(
+        std::move(file),
+        miare::EncryptionKeyView{encryptionKey},
+        std::move(providers));
+    std::vector<std::byte> content(
+        SmallChunkLimits::blobChunkBytes * 2, std::byte{0x57});
+    auto transaction = database.beginWrite();
+    auto writer = transaction.createBlob();
+    const auto id = writer.id();
+    writer.write(content);
+    writer.finish();
+    transaction.commit();
+
+    compressionView->resetOperationCounts();
+    auto read = database.beginRead();
+    auto blob = read.openBlob(id);
+    assert(blob);
+    std::array<std::byte, 1> byte{};
+    assert(blob->read(byte) == 1);
+    assert(blob->read(byte) == 1);
+    assert(compressionView->decompressionCalls() == 1);
+    auto diagnostics = database.diagnostics();
+    assert(diagnostics.cacheUsedBytes == SmallChunkLimits::blobChunkBytes);
+    assert(diagnostics.cachePinnedBytes == SmallChunkLimits::blobChunkBytes);
+    assert(diagnostics.cacheEvictions == 0);
+
+    blob->seek(SmallChunkLimits::blobChunkBytes);
+    assert(blob->read(byte) == 1);
+    assert(compressionView->decompressionCalls() == 2);
+    diagnostics = database.diagnostics();
+    assert(diagnostics.cacheUsedBytes == SmallChunkLimits::blobChunkBytes);
+    assert(diagnostics.cachePinnedBytes == SmallChunkLimits::blobChunkBytes);
+    assert(diagnostics.cacheEvictions == 1);
+
+    blob->close();
+    diagnostics = database.diagnostics();
+    assert(diagnostics.cacheUsedBytes == 0);
+    assert(diagnostics.cachePinnedBytes == 0);
+    assert(diagnostics.cacheEvictions == 1);
+    read.end();
+    database.close();
+}
+
 void tamperedChunkStopsTheSessionBeforePlaintextRelease() {
     auto file = std::make_unique<miare::testing::MemoryDurableFile>();
     auto* fileView = file.get();
@@ -1468,6 +1520,7 @@ int main() {
     minimumChunkProfileInteroperatesAcrossReopen();
     numericChunkIndexPrefixIncludesInteriorKeys();
     openRetainsValidatedBlobCatalog();
+    smallReadsReuseDecodedBlobChunks();
     tamperedChunkStopsTheSessionBeforePlaintextRelease();
     confirmedCorruptionWaitsForInflightBlobRead();
     blobStagingAndCommitHoldInflightLeases();
