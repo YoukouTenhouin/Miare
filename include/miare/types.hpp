@@ -98,6 +98,8 @@ struct DiagnosticsSnapshot {
     bool rejectedInactivePublication = false;
     std::uint64_t abandonedTailBytes = 0;
     std::uint64_t capacityFailureCount = 0;
+    std::uint64_t blobReclaimableBytes = 0;
+    std::uint64_t blobSnapshotRetainedBytes = 0;
 };
 
 class EncryptionKeyView {
