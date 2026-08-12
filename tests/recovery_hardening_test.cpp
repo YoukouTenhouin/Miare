@@ -45,6 +45,15 @@ struct Fixture {
     miare::BlobId blobId;
 };
 
+struct ExtentLocation {
+    std::uint64_t offset;
+    std::uint64_t spanBytes;
+    std::uint64_t encodedLength;
+    std::uint64_t storedLength;
+    std::uint64_t sequence;
+    std::uint16_t kind;
+};
+
 [[nodiscard]] Fixture predecessorFixture() {
     auto file = std::make_unique<miare::testing::MemoryDurableFile>();
     auto* fileView = file.get();
@@ -544,6 +553,211 @@ void openFailureCategoriesRemainDistinctAndFailClosed() {
     }
 }
 
+[[nodiscard]] std::pair<Fixture, std::uint64_t> candidateFixture() {
+    auto fixture = predecessorFixture();
+    auto file = std::make_unique<miare::testing::MemoryDurableFile>();
+    auto* fileView = file.get();
+    file->replaceStableBytes(fixture.image);
+    auto opened = miare::testing::DatabaseAccess::open<
+        std::allocator<std::byte>, RecoveryLimits>(
+        std::move(file),
+        miare::EncryptionKeyView{encryptionKey},
+        deterministicProviders(2'100));
+    assert(opened);
+    auto database = std::move(opened).value();
+    fileView->clearOperations();
+    (void)applyCandidate(database, *fileView, fixture.blobId);
+    fixture.image = fileView->bytes();
+    const auto generation = database.diagnostics().lastCommittedGeneration;
+    database.close();
+    return {std::move(fixture), generation};
+}
+
+[[nodiscard]] std::vector<ExtentLocation> currentExtentRoles(
+    const std::vector<std::byte>& image,
+    std::uint64_t generation) {
+    std::vector<ExtentLocation> result;
+    std::array<bool, 15> seen{};
+    const miare::ByteView view{image};
+    for (std::uint64_t offset = miare::detail::commonRegionBytes;
+         offset + miare::detail::ExtentLayout::bytes <= image.size();
+         offset += RecoveryLimits::allocationQuantumBytes) {
+        if (!miare::detail::matches(
+                view, offset + miare::detail::ExtentLayout::magic,
+                "MIAREXT\0") ||
+            miare::detail::readLittleEndian<std::uint64_t>(
+                view,
+                offset + miare::detail::ExtentLayout::blockIndex) !=
+                offset / RecoveryLimits::allocationQuantumBytes ||
+            miare::detail::readLittleEndian<std::uint64_t>(
+                view,
+                offset + miare::detail::ExtentLayout::generation) !=
+                generation) {
+            continue;
+        }
+        const auto kind = miare::detail::readLittleEndian<std::uint16_t>(
+            view, offset + miare::detail::ExtentLayout::unitKind);
+        if (kind >= seen.size() || (seen[kind] && kind != 13)) {
+            continue;
+        }
+        seen[kind] = true;
+        const auto blockCount =
+            miare::detail::readLittleEndian<std::uint64_t>(
+                view,
+                offset + miare::detail::ExtentLayout::blockCount);
+        result.push_back(ExtentLocation{
+            offset,
+            blockCount * RecoveryLimits::allocationQuantumBytes,
+            miare::detail::readLittleEndian<std::uint64_t>(
+                view,
+                offset + miare::detail::ExtentLayout::encodedLength),
+            miare::detail::readLittleEndian<std::uint64_t>(
+                view,
+                offset + miare::detail::ExtentLayout::storedLength),
+            miare::detail::readLittleEndian<std::uint64_t>(
+                view,
+                offset + miare::detail::ExtentLayout::sequence),
+            kind});
+    }
+    return result;
+}
+
+void exerciseCorruptImage(
+    const std::vector<std::byte>& image,
+    const Fixture& fixture,
+    const ExtentLocation& target,
+    std::uint64_t providerSeed) {
+    auto file = std::make_unique<miare::testing::MemoryDurableFile>();
+    file->replaceStableBytes(image);
+    try {
+        auto opened = miare::testing::DatabaseAccess::open<
+            std::allocator<std::byte>, RecoveryLimits>(
+            std::move(file),
+            miare::EncryptionKeyView{encryptionKey},
+            deterministicProviders(providerSeed));
+        assert(opened);
+        auto database = std::move(opened).value();
+        try {
+            auto read = database.beginRead();
+            (void)read.get(bytes("state"));
+            (void)read.get(bytes("overflow"));
+            for (std::uint16_t index = 0; index != 96; ++index) {
+                const auto key = "tree-" + std::to_string(index);
+                (void)read.get(bytes(key));
+            }
+            auto blob = read.openBlob(fixture.blobId);
+            assert(blob);
+            if (target.kind == 13) {
+                const auto chunkLength = target.sequence == 0
+                    ? RecoveryLimits::blobChunkBytes
+                    : 17;
+                blob->seek(
+                    target.sequence * RecoveryLimits::blobChunkBytes);
+                std::vector<std::byte> output(
+                    static_cast<std::size_t>(chunkLength),
+                    std::byte{0xa5});
+                try {
+                    (void)blob->read(output);
+                    assert(false);
+                } catch (const miare::DatabaseError& error) {
+                    assert(error.code() == miare::Errc::Corrupt);
+                    assert(std::all_of(
+                        output.begin(), output.end(), [](std::byte byte) {
+                            return byte == std::byte{0xa5};
+                        }));
+                    throw;
+                }
+            }
+            std::vector<std::byte> blobContent(
+                RecoveryLimits::blobChunkBytes + 17);
+            (void)blob->read(blobContent);
+            blob->close();
+            read.end();
+            auto write = database.beginWrite();
+            write.put(bytes("probe"), bytes("allocator"));
+            write.commit();
+            assert(false);
+        } catch (const miare::DatabaseError& error) {
+            assert(error.code() == miare::Errc::Corrupt);
+            assert(database.state() == miare::DatabaseState::RecoveryRequired);
+        }
+        database.close();
+    } catch (const miare::DatabaseError& error) {
+        assert(error.code() == miare::Errc::Corrupt);
+    }
+}
+
+void authenticatedExtentDamageNeverReleasesUntrustedState() {
+    auto [fixture, generation] = candidateFixture();
+    const auto roles = currentExtentRoles(fixture.image, generation);
+    assert(!roles.empty());
+    constexpr std::array<std::uint16_t, 9> requiredRoles{
+        1, 2, 4, 6, 10, 11, 12, 13, 14};
+    for (const auto required : requiredRoles) {
+        assert(std::any_of(
+            roles.begin(), roles.end(), [required](const auto& role) {
+                return role.kind == required;
+            }));
+    }
+    for (std::uint64_t sequence = 0; sequence != 2; ++sequence) {
+        assert(std::any_of(
+            roles.begin(), roles.end(), [sequence](const auto& role) {
+                return role.kind == 13 && role.sequence == sequence;
+            }));
+    }
+    std::uint64_t providerSeed = 2'200;
+    for (const auto& extent : roles) {
+        const std::array<std::uint64_t, 4> mutationOffsets{
+            extent.offset + miare::detail::ExtentLayout::nonce,
+            extent.offset + miare::detail::ExtentLayout::bytes,
+            extent.offset + miare::detail::ExtentLayout::bytes +
+                extent.storedLength,
+            extent.offset + extent.encodedLength};
+        for (std::size_t mutation = 0;
+             mutation != mutationOffsets.size();
+             ++mutation) {
+            if (mutation == 3 && extent.encodedLength == extent.spanBytes) {
+                continue;
+            }
+            auto damaged = fixture.image;
+            damaged[mutationOffsets[mutation]] ^= std::byte{1};
+            exerciseCorruptImage(
+                damaged, fixture, extent, providerSeed++);
+        }
+    }
+
+    const auto first = std::find_if(
+        roles.begin(), roles.end(), [&](const auto& candidate) {
+            return std::any_of(
+                std::next(&candidate), roles.data() + roles.size(),
+                [&](const auto& other) {
+                    return other.spanBytes == candidate.spanBytes;
+                });
+        });
+    assert(first != roles.end());
+    const auto second = std::find_if(
+        std::next(first), roles.end(), [&](const auto& candidate) {
+            return candidate.spanBytes == first->spanBytes;
+        });
+    assert(second != roles.end());
+
+    auto substituted = fixture.image;
+    std::copy_n(
+        fixture.image.begin() + static_cast<std::ptrdiff_t>(first->offset),
+        static_cast<std::size_t>(first->spanBytes),
+        substituted.begin() + static_cast<std::ptrdiff_t>(second->offset));
+    exerciseCorruptImage(
+        substituted, fixture, *second, providerSeed++);
+
+    auto reordered = fixture.image;
+    std::swap_ranges(
+        reordered.begin() + static_cast<std::ptrdiff_t>(first->offset),
+        reordered.begin() + static_cast<std::ptrdiff_t>(
+            first->offset + first->spanBytes),
+        reordered.begin() + static_cast<std::ptrdiff_t>(second->offset));
+    exerciseCorruptImage(reordered, fixture, *first, providerSeed++);
+}
+
 } // namespace
 
 int main() {
@@ -551,4 +765,5 @@ int main() {
     everyPublicationSectorSubsetSelectsOneCompleteGeneration();
     shortAndTornWritesCannotExposeMixedState();
     openFailureCategoriesRemainDistinctAndFailClosed();
+    authenticatedExtentDamageNeverReleasesUntrustedState();
 }
