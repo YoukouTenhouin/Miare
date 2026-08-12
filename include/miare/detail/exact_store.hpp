@@ -15,6 +15,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <set>
 #include <span>
 #include <thread>
@@ -213,6 +214,9 @@ struct DatabaseSession {
             std::pair<const std::uint64_t, std::uint64_t>>>
         retiredBlocksByGeneration;
     std::mutex mutex;
+    // File/provider operations take this shared and then mutex. Recovery and
+    // shutdown take it exclusively before clearing session resources.
+    std::shared_mutex operationMutex;
     std::condition_variable writerAvailable;
     std::uint64_t nextWriterTicket = 0;
     std::uint64_t servingWriterTicket = 0;
@@ -226,6 +230,7 @@ struct DatabaseSession {
     std::size_t cacheCapacityBytes;
     std::uint32_t maxReaders;
     std::atomic<DatabaseState> state{DatabaseState::Open};
+    std::atomic<bool> confirmedCorruptionPending{false};
     std::atomic<RecoveryCause> recoveryCause{RecoveryCause::None};
     std::atomic<std::uint64_t> capacityFailureCount{0};
 };

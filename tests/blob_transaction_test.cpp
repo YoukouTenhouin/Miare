@@ -7,8 +7,11 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <condition_variable>
 #include <limits>
 #include <memory>
+#include <mutex>
+#include <thread>
 #include <type_traits>
 #include <vector>
 
@@ -41,6 +44,69 @@ struct TightBlobLimits : SmallChunkLimits {
     static constexpr std::uint64_t maxBlobMutationsPerTransaction = 2;
     static constexpr std::uint32_t maxBlobReadersPerTransaction = 1;
     static constexpr std::uint32_t maxOpenBlobWritersPerTransaction = 1;
+};
+
+class BlockingCompressionProvider final
+    : public miare::detail::CompressionProvider {
+public:
+    [[nodiscard]] std::size_t compressBound(
+        std::size_t inputBytes) const override {
+        return delegate_.compressBound(inputBytes);
+    }
+
+    [[nodiscard]] std::size_t compress(
+        miare::ByteView input,
+        miare::MutableByteView output) override {
+        waitIfArmed(true);
+        return delegate_.compress(input, output);
+    }
+
+    void decompress(
+        miare::ByteView frame,
+        miare::MutableByteView output) override {
+        waitIfArmed(false);
+        delegate_.decompress(frame, output);
+    }
+
+    void armCompression() {
+        std::lock_guard lock{mutex_};
+        compressionArmed_ = true;
+    }
+
+    void armDecompression() {
+        std::lock_guard lock{mutex_};
+        decompressionArmed_ = true;
+    }
+
+    void waitUntilEntered() {
+        std::unique_lock lock{mutex_};
+        condition_.wait(lock, [&] { return entered_; });
+    }
+
+    void release() {
+        std::lock_guard lock{mutex_};
+        released_ = true;
+        condition_.notify_all();
+    }
+
+private:
+    void waitIfArmed(bool compression) {
+        std::unique_lock lock{mutex_};
+        if (!(compression ? compressionArmed_ : decompressionArmed_)) {
+            return;
+        }
+        entered_ = true;
+        condition_.notify_all();
+        condition_.wait(lock, [&] { return released_; });
+    }
+
+    miare::detail::ZstdCompressionProvider delegate_;
+    std::mutex mutex_;
+    std::condition_variable condition_;
+    bool entered_ = false;
+    bool released_ = false;
+    bool compressionArmed_ = false;
+    bool decompressionArmed_ = false;
 };
 
 struct FailingAllocatorState {
@@ -796,6 +862,140 @@ void tamperedChunkStopsTheSessionBeforePlaintextRelease() {
     pending.rollback();
 }
 
+void confirmedCorruptionWaitsForInflightBlobRead() {
+    auto file = std::make_unique<miare::testing::MemoryDurableFile>();
+    auto compression = std::make_unique<BlockingCompressionProvider>();
+    auto* compressionView = compression.get();
+    auto providers = miare::detail::ProviderAccess::make(
+        std::make_unique<miare::testing::DeterministicCryptoProvider>(51),
+        std::move(compression));
+    auto database = miare::testing::DatabaseAccess::create<
+        std::allocator<std::byte>, SmallChunkLimits>(
+        std::move(file),
+        miare::EncryptionKeyView{encryptionKey},
+        std::move(providers));
+    std::vector<std::byte> content(
+        SmallChunkLimits::blobChunkBytes, std::byte{0x51});
+    auto transaction = database.beginWrite();
+    auto writer = transaction.createBlob();
+    const auto id = writer.id();
+    writer.write(content);
+    writer.finish();
+    transaction.commit();
+    compressionView->armDecompression();
+
+    std::atomic<bool> readSucceeded{false};
+    std::thread reader([&] {
+        auto read = database.beginRead();
+        auto blob = read.openBlob(id);
+        assert(blob);
+        std::vector<std::byte> output(content.size());
+        const auto count = blob->read(output);
+        readSucceeded.store(
+            count == output.size() && output == content,
+            std::memory_order_release);
+        blob->close();
+        read.end();
+    });
+    compressionView->waitUntilEntered();
+    assert(!miare::testing::DatabaseAccess::operationsAreQuiescent(database));
+
+    std::atomic<bool> recoveryStarted{false};
+    std::thread recovery([&] {
+        recoveryStarted.store(true, std::memory_order_release);
+        miare::testing::DatabaseAccess::forceConfirmedCorruption(database);
+    });
+    while (!recoveryStarted.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    assert(database.state() == miare::DatabaseState::Open);
+    compressionView->release();
+    reader.join();
+    recovery.join();
+
+    assert(readSucceeded.load(std::memory_order_acquire));
+    assert(database.state() == miare::DatabaseState::RecoveryRequired);
+    database.close();
+}
+
+void blobStagingAndCommitHoldInflightLeases() {
+    {
+        auto file = std::make_unique<miare::testing::MemoryDurableFile>();
+        auto compression = std::make_unique<BlockingCompressionProvider>();
+        auto* compressionView = compression.get();
+        auto providers = miare::detail::ProviderAccess::make(
+            std::make_unique<miare::testing::DeterministicCryptoProvider>(52),
+            std::move(compression));
+        auto database = miare::testing::DatabaseAccess::create<
+            std::allocator<std::byte>, SmallChunkLimits>(
+            std::move(file),
+            miare::EncryptionKeyView{encryptionKey},
+            std::move(providers));
+        std::atomic<bool> ready{false};
+        std::atomic<bool> start{false};
+        std::thread staging([&] {
+            auto transaction = database.beginWrite();
+            auto writer = transaction.createBlob();
+            std::vector<std::byte> content(
+                SmallChunkLimits::blobChunkBytes, std::byte{0x52});
+            ready.store(true, std::memory_order_release);
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            writer.write(content);
+            writer.abort();
+            transaction.rollback();
+        });
+        while (!ready.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        compressionView->armCompression();
+        start.store(true, std::memory_order_release);
+        compressionView->waitUntilEntered();
+        assert(!miare::testing::DatabaseAccess::operationsAreQuiescent(
+            database));
+        compressionView->release();
+        staging.join();
+        database.close();
+    }
+
+    {
+        auto file = std::make_unique<miare::testing::MemoryDurableFile>();
+        auto compression = std::make_unique<BlockingCompressionProvider>();
+        auto* compressionView = compression.get();
+        auto providers = miare::detail::ProviderAccess::make(
+            std::make_unique<miare::testing::DeterministicCryptoProvider>(53),
+            std::move(compression));
+        auto database = miare::testing::DatabaseAccess::create(
+            std::move(file),
+            miare::EncryptionKeyView{encryptionKey},
+            std::move(providers));
+        std::atomic<bool> ready{false};
+        std::atomic<bool> start{false};
+        std::thread committing([&] {
+            auto transaction = database.beginWrite();
+            std::vector<std::byte> value(2048, std::byte{0x53});
+            transaction.put(bytes("guarded commit"), value);
+            ready.store(true, std::memory_order_release);
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            transaction.commit();
+        });
+        while (!ready.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        compressionView->armCompression();
+        start.store(true, std::memory_order_release);
+        compressionView->waitUntilEntered();
+        assert(!miare::testing::DatabaseAccess::operationsAreQuiescent(
+            database));
+        compressionView->release();
+        committing.join();
+        database.close();
+    }
+}
+
 void blobLimitsFailWithoutAdvancingStreamState() {
     auto file = std::make_unique<miare::testing::MemoryDurableFile>();
     auto database = miare::testing::DatabaseAccess::create<
@@ -1191,6 +1391,8 @@ int main() {
     minimumChunkProfileInteroperatesAcrossReopen();
     numericChunkIndexPrefixIncludesInteriorKeys();
     tamperedChunkStopsTheSessionBeforePlaintextRelease();
+    confirmedCorruptionWaitsForInflightBlobRead();
+    blobStagingAndCommitHoldInflightLeases();
     blobLimitsFailWithoutAdvancingStreamState();
     failedCommitPublishesNeitherValueNorBlob();
     stagingIoFailurePreservesWriterContents();

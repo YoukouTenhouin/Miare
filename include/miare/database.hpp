@@ -16,6 +16,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -163,26 +164,28 @@ public:
 
         std::size_t read(MutableByteView destination) {
             requireFunctional();
-            const auto available = version_->size - position_;
-            const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(
-                available, destination.size()));
-            if (count != 0) {
-                try {
+            try {
+                std::shared_lock operation{session_->operationMutex};
+                requireFunctional();
+                const auto available = version_->size - position_;
+                const auto count = static_cast<std::size_t>(
+                    std::min<std::uint64_t>(available, destination.size()));
+                if (count != 0) {
                     detail::readBlobRange<Limits>(
                         *session_,
                         *version_,
                         position_,
                         destination.first(count));
-                } catch (const DatabaseError& error) {
-                    if (error.code() == Errc::Corrupt) {
-                        Database::enterRecoveryAfterCorruption(
-                            *session_, *sessionLifetime_);
-                    }
-                    throw;
+                    position_ += count;
                 }
-                position_ += count;
+                return count;
+            } catch (const DatabaseError& error) {
+                if (error.code() == Errc::Corrupt) {
+                    Database::enterRecoveryAfterCorruption(
+                        *session_, *sessionLifetime_);
+                }
+                throw;
             }
-            return count;
         }
 
         void seek(std::uint64_t absoluteOffset) {
@@ -246,6 +249,12 @@ public:
                     Errc::WrongThread,
                     "Blob reader belongs to another thread"};
             }
+            if (session_->confirmedCorruptionPending.load(
+                    std::memory_order_acquire)) {
+                throw DatabaseError{
+                    Errc::RecoveryRequired,
+                    "database requires recovery"};
+            }
         }
 
         Session* session_;
@@ -308,30 +317,34 @@ public:
 
         void write(ByteView source) {
             requireFunctional();
-            if (source.size() > Limits::maxBlobBytes - position_ ||
-                source.size() > Limits::maxBlobBytesPerTransaction -
-                    state_->bytesWritten) {
-                state_->session->capacityFailureCount.fetch_add(
-                    1, std::memory_order_relaxed);
-                throw DatabaseError{
-                    Errc::ResourceLimit,
-                    "Blob streaming exceeds the capacity profile"};
-            }
             using ByteAllocator = typename std::allocator_traits<Allocator>::
                 template rebind_alloc<std::byte>;
             using ReferenceAllocator = typename std::allocator_traits<Allocator>::
                 template rebind_alloc<detail::ExtentReference>;
-            StoredBytes working{ByteAllocator{state_->session->allocator}};
-            working = buffer_;
             detail::ExtentReferences<Allocator> prepared{
                 ReferenceAllocator{state_->session->allocator}};
-            const auto possibleChunks =
-                source.size() / Limits::blobChunkBytes +
-                (source.size() % Limits::blobChunkBytes + working.size()) /
-                    Limits::blobChunkBytes;
-            stagedChunks_.reserve(stagedChunks_.size() + possibleChunks);
-            prepared.reserve(possibleChunks);
             try {
+                std::shared_lock operation{
+                    state_->session->operationMutex};
+                requireFunctional();
+                if (source.size() > Limits::maxBlobBytes - position_ ||
+                    source.size() > Limits::maxBlobBytesPerTransaction -
+                        state_->bytesWritten) {
+                    state_->session->capacityFailureCount.fetch_add(
+                        1, std::memory_order_relaxed);
+                    throw DatabaseError{
+                        Errc::ResourceLimit,
+                        "Blob streaming exceeds the capacity profile"};
+                }
+                StoredBytes working{
+                    ByteAllocator{state_->session->allocator}};
+                working = buffer_;
+                const auto possibleChunks =
+                    source.size() / Limits::blobChunkBytes +
+                    (source.size() % Limits::blobChunkBytes + working.size()) /
+                        Limits::blobChunkBytes;
+                stagedChunks_.reserve(stagedChunks_.size() + possibleChunks);
+                prepared.reserve(possibleChunks);
                 if (possibleChunks != 0) {
                     detail::initializeBlobStagingAllocator<Limits>(*state_);
                     state_->stagingFreeRuns.reserve(
@@ -357,6 +370,11 @@ public:
                         working.clear();
                     }
                 }
+                stagedChunks_.insert(
+                    stagedChunks_.end(), prepared.begin(), prepared.end());
+                buffer_ = std::move(working);
+                position_ += source.size();
+                state_->bytesWritten += source.size();
             } catch (const DatabaseError& error) {
                 detail::releaseBlobStagingReferences<Limits>(
                     *state_, prepared);
@@ -367,11 +385,6 @@ public:
                     *state_, prepared);
                 throw;
             }
-            stagedChunks_.insert(
-                stagedChunks_.end(), prepared.begin(), prepared.end());
-            buffer_ = std::move(working);
-            position_ += source.size();
-            state_->bytesWritten += source.size();
         }
 
         void finish() {
@@ -380,12 +393,15 @@ public:
                 template rebind_alloc<detail::ExtentReference>;
             using VersionAllocator = typename std::allocator_traits<Allocator>::
                 template rebind_alloc<BlobVersion>;
-            detail::ExtentReferences<Allocator> chunks{
-                stagedChunks_.begin(),
-                stagedChunks_.end(),
-                ReferenceAllocator{state_->session->allocator}};
             std::optional<detail::ExtentReference> finalChunk;
             try {
+                std::shared_lock operation{
+                    state_->session->operationMutex};
+                requireFunctional();
+                detail::ExtentReferences<Allocator> chunks{
+                    stagedChunks_.begin(),
+                    stagedChunks_.end(),
+                    ReferenceAllocator{state_->session->allocator}};
                 if (!buffer_.empty()) {
                     finalChunk = detail::stageBlobChunk<Limits>(
                         *state_, id_, chunks.size(), buffer_);
@@ -416,6 +432,11 @@ public:
                         priorVersion->chunks.begin(),
                         priorVersion->chunks.end());
                 }
+                state_->abortableStagingReferences -=
+                    stagedChunks_.size() + (finalChunk ? 1U : 0U);
+                state_->openWriterIds.erase(id_);
+                --state_->openWriters;
+                active_ = false;
             } catch (const DatabaseError& error) {
                 if (finalChunk) {
                     detail::releaseBlobStagingReference<Limits>(
@@ -430,11 +451,6 @@ public:
                 }
                 throw;
             }
-            state_->abortableStagingReferences -=
-                stagedChunks_.size() + (finalChunk ? 1U : 0U);
-            state_->openWriterIds.erase(id_);
-            --state_->openWriters;
-            active_ = false;
             state_.reset();
             sessionLifetime_.reset();
         }
@@ -495,6 +511,12 @@ public:
                 throw ContractError{
                     Errc::WrongThread,
                     "Blob writer belongs to another thread"};
+            }
+            if (state_->session->confirmedCorruptionPending.load(
+                    std::memory_order_acquire)) {
+                throw DatabaseError{
+                    Errc::RecoveryRequired,
+                    "database requires recovery"};
             }
         }
 
@@ -635,6 +657,12 @@ public:
             }
             if (thread_ != std::this_thread::get_id()) {
                 throw ContractError{Errc::WrongThread, "read transaction belongs to another thread"};
+            }
+            if (session_->confirmedCorruptionPending.load(
+                    std::memory_order_acquire)) {
+                throw DatabaseError{
+                    Errc::RecoveryRequired,
+                    "database requires recovery"};
             }
             const auto state = session_->state.load(std::memory_order_acquire);
             if (state == DatabaseState::Closed || state == DatabaseState::Closing) {
@@ -877,8 +905,12 @@ public:
                 return;
             }
             try {
-                detail::commitExact<Limits>(
-                    *session_, values_, blobState_->blobs, *blobState_);
+                {
+                    std::shared_lock operation{session_->operationMutex};
+                    requireFunctional();
+                    detail::commitExact<Limits>(
+                        *session_, values_, blobState_->blobs, *blobState_);
+                }
             } catch (const DatabaseError& error) {
                 if (error.code() == Errc::ResourceLimit) {
                     session_->capacityFailureCount.fetch_add(
@@ -962,6 +994,12 @@ public:
             }
             if (thread_ != std::this_thread::get_id()) {
                 throw ContractError{Errc::WrongThread, "write transaction belongs to another thread"};
+            }
+            if (session_->confirmedCorruptionPending.load(
+                    std::memory_order_acquire)) {
+                throw DatabaseError{
+                    Errc::RecoveryRequired,
+                    "database requires recovery"};
             }
             const auto state = session_->state.load(std::memory_order_acquire);
             if (state == DatabaseState::RecoveryRequired) {
@@ -1152,6 +1190,25 @@ public:
 
     [[nodiscard]] DiagnosticsSnapshot diagnostics() const {
         auto& session = requireSession();
+        try {
+            std::shared_lock operation{session.operationMutex};
+            std::lock_guard lock{session.mutex};
+            const auto current = session.state.load(std::memory_order_acquire);
+            if (current != DatabaseState::Open &&
+                current != DatabaseState::RecoveryRequired) {
+                throw ContractError{
+                    Errc::InvalidState,
+                    "database diagnostics require an open session"};
+            }
+            if (current == DatabaseState::Open) {
+                ensureAllocatorSnapshotLoaded(session);
+            }
+        } catch (const DatabaseError& error) {
+            if (error.code() == Errc::Corrupt) {
+                enterRecoveryAfterCorruption(session, *lifetime_);
+            }
+            throw;
+        }
         std::lock_guard lock{session.mutex};
         const auto current = session.state.load(std::memory_order_acquire);
         if (current != DatabaseState::Open &&
@@ -1159,9 +1216,6 @@ public:
             throw ContractError{
                 Errc::InvalidState,
                 "database diagnostics require an open session"};
-        }
-        if (current == DatabaseState::Open) {
-            ensureAllocatorSnapshotLoaded(session, *lifetime_);
         }
         std::optional<std::uint64_t> oldestReaderGeneration;
         std::optional<std::chrono::steady_clock::time_point> oldestReaderStart;
@@ -1229,10 +1283,20 @@ public:
 
     [[nodiscard]] ReadTransaction beginRead() {
         auto& session = requireSession();
+        try {
+            std::shared_lock operation{session.operationMutex};
+            std::lock_guard lock{session.mutex};
+            requireOpen(session);
+            ensureValuesLoaded(session);
+            ensureBlobsLoaded(session);
+        } catch (const DatabaseError& error) {
+            if (error.code() == Errc::Corrupt) {
+                enterRecoveryAfterCorruption(session, *lifetime_);
+            }
+            throw;
+        }
         std::lock_guard lock{session.mutex};
         requireOpen(session);
-        ensureValuesLoaded(session, *lifetime_);
-        ensureBlobsLoaded(session, *lifetime_);
         if (session.activeReaders.size() == session.maxReaders ||
             session.nextReaderIdentity ==
                 std::numeric_limits<std::uint64_t>::max()) {
@@ -1266,11 +1330,21 @@ public:
 
     [[nodiscard]] WriteTransaction beginWrite() {
         auto& session = requireSession();
+        try {
+            std::shared_lock operation{session.operationMutex};
+            std::lock_guard lock{session.mutex};
+            requireOpen(session);
+            ensureValuesLoaded(session);
+            ensureBlobsLoaded(session);
+            ensureAllocatorSnapshotLoaded(session);
+        } catch (const DatabaseError& error) {
+            if (error.code() == Errc::Corrupt) {
+                enterRecoveryAfterCorruption(session, *lifetime_);
+            }
+            throw;
+        }
         std::unique_lock lock{session.mutex};
         requireOpen(session);
-        ensureValuesLoaded(session, *lifetime_);
-        ensureBlobsLoaded(session, *lifetime_);
-        ensureAllocatorSnapshotLoaded(session, *lifetime_);
         if (session.nextWriterTicket == std::numeric_limits<std::uint64_t>::max()) {
             session.capacityFailureCount.fetch_add(1, std::memory_order_relaxed);
             throw DatabaseError{Errc::ResourceLimit, "writer admission sequence exhausted"};
@@ -1320,11 +1394,21 @@ public:
 
     [[nodiscard]] Result<WriteTransaction, WriterBusy> tryBeginWrite() {
         auto& session = requireSession();
+        try {
+            std::shared_lock operation{session.operationMutex};
+            std::lock_guard lock{session.mutex};
+            requireOpen(session);
+            ensureValuesLoaded(session);
+            ensureBlobsLoaded(session);
+            ensureAllocatorSnapshotLoaded(session);
+        } catch (const DatabaseError& error) {
+            if (error.code() == Errc::Corrupt) {
+                enterRecoveryAfterCorruption(session, *lifetime_);
+            }
+            throw;
+        }
         std::lock_guard lock{session.mutex};
         requireOpen(session);
-        ensureValuesLoaded(session, *lifetime_);
-        ensureBlobsLoaded(session, *lifetime_);
-        ensureAllocatorSnapshotLoaded(session, *lifetime_);
         if (session.writerActive || session.waitingWriters != 0) {
             return Result<WriteTransaction, WriterBusy>::failure(WriterBusy{});
         }
@@ -1477,6 +1561,12 @@ private:
     }
 
     static void requireOpen(const Session& session) {
+        if (session.confirmedCorruptionPending.load(
+                std::memory_order_acquire)) {
+            throw DatabaseError{
+                Errc::RecoveryRequired,
+                "database requires recovery"};
+        }
         const auto current = session.state.load(std::memory_order_acquire);
         if (current == DatabaseState::RecoveryRequired) {
             throw DatabaseError{Errc::RecoveryRequired, "database requires recovery"};
@@ -1555,7 +1645,10 @@ private:
     static void enterRecoveryAfterCorruption(
         Session& session,
         ChildLifetime& lifetime) noexcept {
+        session.confirmedCorruptionPending.store(
+            true, std::memory_order_release);
         try {
+            std::unique_lock operation{session.operationMutex};
             std::lock_guard lock{session.mutex};
             enterRecoveryAfterCorruptionLocked(session, lifetime);
         } catch (...) {
@@ -1570,79 +1663,53 @@ private:
         }
     }
 
-    static void ensureValuesLoaded(
-        Session& session,
-        ChildLifetime& lifetime) {
+    static void ensureValuesLoaded(Session& session) {
         if (session.valuesLoaded) {
             return;
         }
-        try {
-            auto values = detail::loadExactValues<Limits>(
-                *session.file,
-                session.opened,
-                *session.providers,
-                session.allocator,
-                nullptr,
-                session.cursorTree.get());
-            session.values = std::move(values);
-            session.valuesLoaded = true;
-        } catch (const DatabaseError& error) {
-            if (error.code() == Errc::Corrupt) {
-                enterRecoveryAfterCorruptionLocked(session, lifetime);
-            }
-            throw;
-        }
+        auto values = detail::loadExactValues<Limits>(
+            *session.file,
+            session.opened,
+            *session.providers,
+            session.allocator,
+            nullptr,
+            session.cursorTree.get());
+        session.values = std::move(values);
+        session.valuesLoaded = true;
     }
 
-    static void ensureBlobsLoaded(
-        Session& session,
-        ChildLifetime& lifetime) {
+    static void ensureBlobsLoaded(Session& session) {
         if (session.blobsLoaded) {
             return;
         }
-        try {
-            session.blobs = detail::loadBlobCatalog<Limits>(
-                *session.file,
-                session.opened,
-                *session.providers,
-                session.allocator);
-            session.blobsLoaded = true;
-        } catch (const DatabaseError& error) {
-            if (error.code() == Errc::Corrupt) {
-                enterRecoveryAfterCorruptionLocked(session, lifetime);
-            }
-            throw;
-        }
+        session.blobs = detail::loadBlobCatalog<Limits>(
+            *session.file,
+            session.opened,
+            *session.providers,
+            session.allocator);
+        session.blobsLoaded = true;
     }
 
-    static void ensureAllocatorSnapshotLoaded(
-        Session& session,
-        ChildLifetime& lifetime) {
+    static void ensureAllocatorSnapshotLoaded(Session& session) {
         if (session.allocatorSnapshotLoaded) {
             return;
         }
-        try {
-            auto snapshot = detail::loadAllocatorSnapshot<Limits>(
-                *session.file,
-                session.opened,
-                *session.providers,
-                session.allocator);
-            session.liveBlocks = snapshot.liveBlocks;
-            session.retiredBlocksByGeneration = std::move(
-                snapshot.retiredBlocksByGeneration);
-            session.allocatorSnapshotLoaded = true;
-        } catch (const DatabaseError& error) {
-            if (error.code() == Errc::Corrupt) {
-                enterRecoveryAfterCorruptionLocked(session, lifetime);
-            }
-            throw;
-        }
+        auto snapshot = detail::loadAllocatorSnapshot<Limits>(
+            *session.file,
+            session.opened,
+            *session.providers,
+            session.allocator);
+        session.liveBlocks = snapshot.liveBlocks;
+        session.retiredBlocksByGeneration = std::move(
+            snapshot.retiredBlocksByGeneration);
+        session.allocatorSnapshotLoaded = true;
     }
 
     static void shutdownSession(
         Session& session,
         ChildLifetime& lifetime) noexcept {
         try {
+            std::unique_lock operation{session.operationMutex};
             std::lock_guard lock{session.mutex};
             lifetime.invalidated.store(true, std::memory_order_release);
             session.liveTransactions = 0;

@@ -439,6 +439,23 @@ public:
     }
 
     template<class Allocator, class Limits>
+    static void forceConfirmedCorruption(
+        Database<Allocator, Limits>& database) {
+        Database<Allocator, Limits>::enterRecoveryAfterCorruption(
+            *database.session_, *database.lifetime_);
+    }
+
+    template<class Allocator, class Limits>
+    [[nodiscard]] static bool operationsAreQuiescent(
+        Database<Allocator, Limits>& database) {
+        if (!database.session_->operationMutex.try_lock()) {
+            return false;
+        }
+        database.session_->operationMutex.unlock();
+        return true;
+    }
+
+    template<class Allocator, class Limits>
     [[nodiscard]] static std::size_t waitingWriters(
         Database<Allocator, Limits>& database) {
         std::lock_guard lock{database.session_->mutex};
