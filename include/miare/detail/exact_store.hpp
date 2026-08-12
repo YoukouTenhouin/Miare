@@ -193,6 +193,10 @@ struct DatabaseSession {
               std::less<std::uint64_t>{},
               typename std::allocator_traits<Allocator>::template rebind_alloc<
                   std::pair<const std::uint64_t, std::uint64_t>>{allocator}),
+          blobRetiredBlocksByGeneration(
+              std::less<std::uint64_t>{},
+              typename std::allocator_traits<Allocator>::template rebind_alloc<
+                  std::pair<const std::uint64_t, std::uint64_t>>{allocator}),
           blobCache(std::allocate_shared<BlobCacheState>(
               typename std::allocator_traits<Allocator>::
                   template rebind_alloc<BlobCacheState>{allocator})),
@@ -221,6 +225,13 @@ struct DatabaseSession {
         typename std::allocator_traits<Allocator>::template rebind_alloc<
             std::pair<const std::uint64_t, std::uint64_t>>>
         retiredBlocksByGeneration;
+    std::map<
+        std::uint64_t,
+        std::uint64_t,
+        std::less<std::uint64_t>,
+        typename std::allocator_traits<Allocator>::template rebind_alloc<
+            std::pair<const std::uint64_t, std::uint64_t>>>
+        blobRetiredBlocksByGeneration;
     std::shared_ptr<BlobCacheState> blobCache;
     std::mutex mutex;
     // File/provider operations take this shared and then mutex. Recovery and
@@ -255,6 +266,7 @@ struct AllocatorSnapshot {
 
     std::uint64_t liveBlocks = 0;
     RetirementCounts retiredBlocksByGeneration;
+    RetirementCounts blobRetiredBlocksByGeneration;
 };
 
 struct ExtentLayout {
@@ -333,6 +345,14 @@ struct ExtentRun {
     std::uint64_t count;
     std::uint64_t retirementGeneration = 0;
 };
+
+[[nodiscard]] inline std::uint64_t checkedExtentRunEnd(
+    const ExtentRun& run) {
+    if (run.count > std::numeric_limits<std::uint64_t>::max() - run.start) {
+        throwCorrupt("allocator extent run overflows");
+    }
+    return run.start + run.count;
+}
 
 template<class Allocator>
 using ExtentReferences = StoredVector<ExtentReference, Allocator>;
@@ -1730,6 +1750,8 @@ template<class Limits, class Allocator>
     Snapshot snapshot{
         commonBlocks,
         typename Snapshot::RetirementCounts{
+            std::less<std::uint64_t>{}, RetirementAllocator{allocator}},
+        typename Snapshot::RetirementCounts{
             std::less<std::uint64_t>{}, RetirementAllocator{allocator}}};
     auto payloadResult = shallowValidateAllocatorRoot<Limits>(
         file, opened, providers, allocator);
@@ -1772,6 +1794,39 @@ template<class Limits, class Allocator>
     if (retiredBlocks != readLittleEndian<std::uint64_t>(
             payload, AllocatorRootLayout::retiredBlocks)) {
         throwCorrupt("allocator retirement diagnostics contradict their counter");
+    }
+    for (const auto& run : retiredRuns) {
+        const auto runEnd = checkedExtentRunEnd(run);
+        for (auto block = run.start; block != runEnd;) {
+            std::array<std::byte, ExtentLayout::bytes> preamble{};
+            file.readExactAt(
+                block * Limits::allocationQuantumBytes, preamble);
+            if (!matches(preamble, ExtentLayout::magic, "MIAREXT\0") ||
+                readLittleEndian<std::uint16_t>(
+                    preamble, ExtentLayout::version) != 1 ||
+                readLittleEndian<std::uint32_t>(
+                    preamble, ExtentLayout::preambleLength) !=
+                    ExtentLayout::bytes ||
+                readLittleEndian<std::uint64_t>(
+                    preamble, ExtentLayout::blockIndex) != block) {
+                ++block;
+                continue;
+            }
+            const auto blockCount = readLittleEndian<std::uint64_t>(
+                preamble, ExtentLayout::blockCount);
+            if (blockCount == 0 || blockCount > runEnd - block) {
+                ++block;
+                continue;
+            }
+            const auto unitKind = readLittleEndian<std::uint16_t>(
+                preamble, ExtentLayout::unitKind);
+            if (unitKind == 5 || unitKind == 6 || unitKind == 12 ||
+                unitKind == 13) {
+                snapshot.blobRetiredBlocksByGeneration[
+                    run.retirementGeneration] += blockCount;
+            }
+            block += blockCount;
+        }
     }
     return snapshot;
 }
@@ -4095,6 +4150,65 @@ inline void commitExact(
         retiredBlocks += run.count;
         committedRetirementCounts[run.retirementGeneration] += run.count;
     }
+    decltype(session.blobRetiredBlocksByGeneration)
+        committedBlobRetirementCounts{
+            session.blobRetiredBlocksByGeneration.key_comp(),
+            session.blobRetiredBlocksByGeneration.get_allocator()};
+    for (const auto& [retirementGeneration, blocks] :
+         session.blobRetiredBlocksByGeneration) {
+        if (oldestReaderGeneration < retirementGeneration) {
+            committedBlobRetirementCounts.emplace(
+                retirementGeneration, blocks);
+        }
+    }
+    std::uint64_t newlyRetiredBlobBlocks = 0;
+    auto retired = std::lower_bound(
+        retiredRuns.begin(), retiredRuns.end(), generation,
+        [](const auto& run, std::uint64_t soughtGeneration) {
+            return run.retirementGeneration < soughtGeneration;
+        });
+    if (retired != retiredRuns.end() &&
+        retired->retirementGeneration == generation) {
+        ExtentReferences<Allocator> blobOwnedReferences{
+            ReferenceAllocator{session.allocator}};
+        for (const auto& [id, version] : session.blobs) {
+            (void)id;
+            blobOwnedReferences.insert(
+                blobOwnedReferences.end(),
+                version->reachable.begin(),
+                version->reachable.end());
+        }
+        std::sort(
+            blobOwnedReferences.begin(), blobOwnedReferences.end(),
+            [](const auto& left, const auto& right) {
+                return left.blockIndex < right.blockIndex;
+            });
+        for (const auto& reference : blobOwnedReferences) {
+            const auto referenceEnd =
+                reference.blockIndex + reference.blockCount;
+            while (retired != retiredRuns.end() &&
+                   retired->retirementGeneration == generation &&
+                   retired->start + retired->count <= reference.blockIndex) {
+                ++retired;
+            }
+            auto scan = retired;
+            while (scan != retiredRuns.end() &&
+                   scan->retirementGeneration == generation &&
+                   scan->start < referenceEnd) {
+                const auto overlapBegin =
+                    std::max(reference.blockIndex, scan->start);
+                const auto overlapEnd = std::min(
+                    referenceEnd, scan->start + scan->count);
+                if (overlapBegin < overlapEnd) {
+                    newlyRetiredBlobBlocks += overlapEnd - overlapBegin;
+                }
+                ++scan;
+            }
+        }
+    }
+    if (newlyRetiredBlobBlocks != 0) {
+        committedBlobRetirementCounts[generation] += newlyRetiredBlobBlocks;
+    }
     std::array<std::byte, AllocatorRootLayout::bytes> allocatorPayload{};
     MutableByteView allocatorOutput{allocatorPayload};
     writeBytes(allocatorOutput, AllocatorRootLayout::magic, "MIAREALC");
@@ -4231,6 +4345,8 @@ inline void commitExact(
             commonRegionBytes / Limits::allocationQuantumBytes + reachableBlocks;
         session.retiredBlocksByGeneration = std::move(
             committedRetirementCounts);
+        session.blobRetiredBlocksByGeneration = std::move(
+            committedBlobRetirementCounts);
         session.allocatorSnapshotLoaded = true;
     }
 }

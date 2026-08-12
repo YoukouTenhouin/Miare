@@ -1258,6 +1258,17 @@ public:
                 reclaimableBlocks += blocks;
             }
         }
+        std::uint64_t blobReclaimableBlocks = 0;
+        std::uint64_t blobSnapshotRetainedBlocks = 0;
+        for (const auto& [retirementGeneration, blocks] :
+             session.blobRetiredBlocksByGeneration) {
+            if (oldestReaderGeneration &&
+                *oldestReaderGeneration < retirementGeneration) {
+                blobSnapshotRetainedBlocks += blocks;
+            } else {
+                blobReclaimableBlocks += blocks;
+            }
+        }
         const auto quantum = Limits::allocationQuantumBytes;
         DiagnosticsSnapshot result;
         result.state = current;
@@ -1277,6 +1288,9 @@ public:
         result.liveBytes = session.liveBlocks * quantum;
         result.reclaimableBytes = reclaimableBlocks * quantum;
         result.snapshotRetainedBytes = snapshotRetainedBlocks * quantum;
+        result.blobReclaimableBytes = blobReclaimableBlocks * quantum;
+        result.blobSnapshotRetainedBytes =
+            blobSnapshotRetainedBlocks * quantum;
         result.cacheCapacityBytes = session.cacheCapacityBytes;
         result.cacheUsedBytes = session.blobCache->usedBytes.load(
             std::memory_order_relaxed);
@@ -1761,6 +1775,8 @@ private:
         session.liveBlocks = snapshot.liveBlocks;
         session.retiredBlocksByGeneration = std::move(
             snapshot.retiredBlocksByGeneration);
+        session.blobRetiredBlocksByGeneration = std::move(
+            snapshot.blobRetiredBlocksByGeneration);
         session.allocatorSnapshotLoaded = true;
     }
 

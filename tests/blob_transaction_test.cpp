@@ -348,6 +348,112 @@ void replacementPreservesOpenedVersionsAndPublishesAtomically() {
     database.close();
 }
 
+void blobReclamationWaitsForSnapshotsAndSurvivesReopen() {
+    auto file = std::make_unique<miare::testing::MemoryDurableFile>();
+    auto* fileView = file.get();
+    auto database = miare::testing::DatabaseAccess::create<
+        std::allocator<std::byte>, SmallChunkLimits>(
+        std::move(file),
+        miare::EncryptionKeyView{encryptionKey},
+        deterministicProviders(55));
+    std::vector<std::byte> original(
+        SmallChunkLimits::blobChunkBytes * 2, std::byte{0x31});
+    std::vector<std::byte> replacement(
+        SmallChunkLimits::blobChunkBytes, std::byte{0x32});
+
+    auto seed = database.beginWrite();
+    auto seedWriter = seed.createBlob();
+    const auto id = seedWriter.id();
+    seedWriter.write(original);
+    seedWriter.finish();
+    seed.commit();
+
+    auto retainedSnapshot = database.beginRead();
+    auto retainedReader = retainedSnapshot.openBlob(id);
+    assert(retainedReader);
+    auto replacing = database.beginWrite();
+    auto replacementWriter = replacing.replaceBlob(id);
+    assert(replacementWriter);
+    replacementWriter->write(replacement);
+    replacementWriter->finish();
+    replacing.commit();
+
+    const auto retained = database.diagnostics();
+    assert(retained.blobSnapshotRetainedBytes > 0);
+    assert(retained.blobSnapshotRetainedBytes <= retained.snapshotRetainedBytes);
+    assert(retained.blobReclaimableBytes == 0);
+    std::vector<std::byte> originalRead(original.size());
+    assert(retainedReader->read(originalRead) == originalRead.size());
+    assert(originalRead == original);
+    retainedReader->close();
+    retainedSnapshot.end();
+
+    const auto released = database.diagnostics();
+    assert(released.blobSnapshotRetainedBytes == 0);
+    assert(released.blobReclaimableBytes ==
+        retained.blobSnapshotRetainedBytes);
+    assert(released.blobReclaimableBytes <= released.reclaimableBytes);
+
+    auto image = fileView->bytes();
+    std::uint64_t invalidatedBlobBlocks = 0;
+    for (std::uint64_t offset = miare::detail::commonRegionBytes;
+         offset + miare::detail::ExtentLayout::bytes <= image.size();
+         offset += SmallChunkLimits::allocationQuantumBytes) {
+        const miare::ByteView imageView{image};
+        if (!miare::detail::matches(
+                imageView,
+                offset + miare::detail::ExtentLayout::magic,
+                "MIAREXT\0") ||
+            miare::detail::readLittleEndian<std::uint16_t>(
+                imageView,
+                offset + miare::detail::ExtentLayout::unitKind) != 13 ||
+            miare::detail::readLittleEndian<std::uint64_t>(
+                imageView,
+                offset + miare::detail::ExtentLayout::generation) >=
+                released.lastCommittedGeneration) {
+            continue;
+        }
+        invalidatedBlobBlocks = miare::detail::readLittleEndian<std::uint64_t>(
+            imageView,
+            offset + miare::detail::ExtentLayout::blockCount);
+        image[offset + 7] = std::byte{0x7f};
+        break;
+    }
+    assert(invalidatedBlobBlocks != 0);
+    database.close();
+    auto reopenedFile = std::make_unique<miare::testing::MemoryDurableFile>();
+    reopenedFile->replaceStableBytes(image);
+    auto reopened = miare::testing::DatabaseAccess::open<
+        std::allocator<std::byte>, SmallChunkLimits>(
+        std::move(reopenedFile),
+        miare::EncryptionKeyView{encryptionKey},
+        deterministicProviders(56));
+    assert(reopened);
+    const auto reopenedDiagnostics = reopened.value().diagnostics();
+    assert(reopenedDiagnostics.blobSnapshotRetainedBytes == 0);
+    assert(reopenedDiagnostics.blobReclaimableBytes ==
+        released.blobReclaimableBytes - invalidatedBlobBlocks *
+            SmallChunkLimits::allocationQuantumBytes);
+
+    auto reclaiming = reopened.value().beginWrite();
+    reclaiming.put(bytes("reclaim"), bytes("eligible Blob extents"));
+    reclaiming.commit();
+    const auto reclaimed = reopened.value().diagnostics();
+    assert(reclaimed.blobSnapshotRetainedBytes == 0);
+    assert(reclaimed.blobReclaimableBytes == 0);
+    reopened.value().close();
+}
+
+void overflowingRetiredRunIsCorrupt() {
+    try {
+        (void)miare::detail::checkedExtentRunEnd(miare::detail::ExtentRun{
+            std::numeric_limits<std::uint64_t>::max(), 2, 1});
+        assert(false);
+    } catch (const miare::DatabaseError& error) {
+        assert(error.code() == miare::Errc::Corrupt);
+    }
+}
+
 void multiChunkBlobSupportsSequentialAndRandomAccess() {
     auto file = std::make_unique<miare::testing::MemoryDurableFile>();
     auto database = miare::testing::DatabaseAccess::create(
@@ -1582,6 +1688,8 @@ int main() {
     writeTransactionReadsFinishedBlob();
     commitPublishesBlobToNewSnapshotsAndReopen();
     replacementPreservesOpenedVersionsAndPublishesAtomically();
+    blobReclamationWaitsForSnapshotsAndSurvivesReopen();
+    overflowingRetiredRunIsCorrupt();
     multiChunkBlobSupportsSequentialAndRandomAccess();
     eraseAndUnfinishedWritersAreTransactional();
     persistedChunksHaveCanonicalIndependentFraming();

@@ -461,7 +461,8 @@ The canonical report fields, recovery selection algorithm, publication interrupt
 - format and capacity profile, backend, compression, and encryption identities;
 - last known committed generation;
 - main-file and sidecar bytes;
-- live, reclaimable, and snapshot-retained byte estimates;
+- live, reclaimable, and snapshot-retained byte estimates, including Blob-owned
+  reclaimable and snapshot-retained subsets;
 - cache capacity, use, pinned bytes, and eviction count;
 - active reader count, oldest reader generation and age;
 - writer or maintenance activity and FIFO queue depth;
@@ -469,6 +470,8 @@ The canonical report fields, recovery selection algorithm, publication interrupt
 - whether open rejected an incomplete inactive publication and the number of Abandoned-tail bytes outside the selected committed boundary.
 
 Diagnostics never include keys, values, Blob identifiers, key material, paths, or native error messages.
+`blobReclaimableBytes` and `blobSnapshotRetainedBytes` are the Blob-owned
+subsets of `reclaimableBytes` and `snapshotRetainedBytes`, respectively.
 
 ### Close and destruction
 
