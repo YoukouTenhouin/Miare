@@ -29,6 +29,11 @@ target_link_libraries(
     miare_blob_transaction_test PRIVATE miare::miare Threads::Threads)
 add_test(NAME miare.blob_transaction COMMAND miare_blob_transaction_test)
 
+add_executable(miare_blob_lifecycle_test blob_lifecycle_test.cpp)
+target_link_libraries(miare_blob_lifecycle_test PRIVATE miare::miare)
+add_test(NAME miare.blob_lifecycle COMMAND miare_blob_lifecycle_test)
+set_tests_properties(miare.blob_lifecycle PROPERTIES TIMEOUT 60)
+
 add_executable(miare_database_format_test database_format_test.cpp)
 target_link_libraries(miare_database_format_test PRIVATE miare::miare)
 add_test(NAME miare.database_format COMMAND miare_database_format_test)
