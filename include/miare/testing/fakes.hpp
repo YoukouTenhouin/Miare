@@ -264,6 +264,10 @@ public:
             source.size() > std::numeric_limits<std::size_t>::max() - offset) {
             throw ContractError{Errc::InvalidArgument, "file range is not representable"};
         }
+        if (const auto transferred = takeOperationFailure(
+                DurableFileOperationKind::Write, source.size())) {
+            failAfterBytes_ = *transferred;
+        }
         transfer(source.size(), [&](std::size_t position, std::size_t count) {
             const auto chunkEnd = static_cast<std::size_t>(offset) + position + count;
             if (chunkEnd > bytes_.size()) {
@@ -287,6 +291,9 @@ public:
         std::lock_guard lock{mutex_};
         auto& operation = beginOperation(
             DurableFileOperationKind::Resize, length, 0);
+        if (takeOperationFailure(DurableFileOperationKind::Resize, 0)) {
+            throw DatabaseError{Errc::Io, "injected resize interruption"};
+        }
         if (failResize_) {
             failResize_ = false;
             throw DatabaseError{Errc::Io, "injected resize failure"};
@@ -305,6 +312,9 @@ public:
     void stableStorageBarrier() override {
         std::lock_guard lock{mutex_};
         auto& operation = beginOperation(DurableFileOperationKind::Barrier, 0, 0);
+        if (takeOperationFailure(DurableFileOperationKind::Barrier, 0)) {
+            throw DatabaseError{Errc::Durability, "injected barrier interruption"};
+        }
         if (failBarrier_ || (failBarrierAfter_ && *failBarrierAfter_ == 0)) {
             failBarrier_ = false;
             failBarrierAfter_.reset();
@@ -327,6 +337,13 @@ public:
     }
 
     void failAfterTransferredBytes(std::size_t bytes) { failAfterBytes_ = bytes; }
+    void failOperation(
+        std::size_t operationIndex,
+        std::size_t transferredBytes = 0) {
+        operationFailure_ = OperationFailure{
+            operationIndex,
+            transferredBytes};
+    }
     void failReadsAtOrAfter(std::uint64_t offset) noexcept {
         failReadsAtOrAfter_ = offset;
     }
@@ -372,6 +389,7 @@ public:
 
     void clearFaults() noexcept {
         failAfterBytes_.reset();
+        operationFailure_.reset();
         failReadsAtOrAfter_.reset();
         failBarrier_ = false;
         failBarrierAfter_.reset();
@@ -402,12 +420,35 @@ private:
         std::vector<std::byte> bytes;
     };
 
+    struct OperationFailure {
+        std::size_t operationIndex;
+        std::size_t transferredBytes;
+    };
+
     DurableFileOperation& beginOperation(
         DurableFileOperationKind kind,
         std::uint64_t offset,
         std::size_t requestedBytes) {
         return operations_.emplace_back(
             DurableFileOperation{kind, offset, requestedBytes, 0, false});
+    }
+
+    [[nodiscard]] std::optional<std::size_t> takeOperationFailure(
+        DurableFileOperationKind kind,
+        std::size_t requestedBytes) {
+        if (!operationFailure_ ||
+            operationFailure_->operationIndex != operations_.size() - 1) {
+            return std::nullopt;
+        }
+        const auto transferredBytes = operationFailure_->transferredBytes;
+        operationFailure_.reset();
+        if (transferredBytes > requestedBytes ||
+            (kind != DurableFileOperationKind::Write && transferredBytes != 0)) {
+            throw ContractError{
+                Errc::InvalidArgument,
+                "injected operation transfer is out of bounds"};
+        }
+        return transferredBytes;
     }
 
     template<class Transfer>
@@ -438,6 +479,7 @@ private:
     std::vector<UnbarrieredMutation> unbarrieredMutations_;
     std::size_t maxTransferBytes_ = std::numeric_limits<std::size_t>::max();
     std::optional<std::size_t> failAfterBytes_;
+    std::optional<OperationFailure> operationFailure_;
     std::optional<std::uint64_t> failReadsAtOrAfter_;
     std::size_t barrierCount_ = 0;
     bool failBarrier_ = false;
