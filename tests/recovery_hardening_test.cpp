@@ -374,6 +374,105 @@ void everyPublicationSectorSubsetSelectsOneCompleteGeneration() {
     }
 }
 
+void failedFirstBarrierPermitsLossAndReorderingOnlyInAbandonedState() {
+    const auto fixture = predecessorFixture();
+    auto traceFile = std::make_unique<miare::testing::MemoryDurableFile>();
+    auto* traceFileView = traceFile.get();
+    traceFile->replaceStableBytes(fixture.image);
+    auto traceOpened = miare::testing::DatabaseAccess::open<
+        std::allocator<std::byte>, RecoveryLimits>(
+        std::move(traceFile),
+        miare::EncryptionKeyView{encryptionKey},
+        deterministicProviders(600));
+    assert(traceOpened);
+    auto traceDatabase = std::move(traceOpened).value();
+    traceFileView->clearOperations();
+    const auto trace = applyCandidate(
+        traceDatabase, *traceFileView, fixture.blobId);
+    traceDatabase.close();
+    const auto firstBarrier = std::find_if(
+        trace.operations.begin() +
+            static_cast<std::ptrdiff_t>(trace.commitOperationStart),
+        trace.operations.begin() +
+            static_cast<std::ptrdiff_t>(trace.publicationOperation),
+        [](const auto& operation) {
+            return operation.kind ==
+                miare::testing::DurableFileOperationKind::Barrier;
+        });
+    assert(firstBarrier != trace.operations.end());
+    const auto barrierOperation = static_cast<std::size_t>(
+        firstBarrier - trace.operations.begin());
+
+    const auto interruptedMutationCount = [&] {
+        auto file = std::make_unique<miare::testing::MemoryDurableFile>();
+        auto* fileView = file.get();
+        file->replaceStableBytes(fixture.image);
+        auto opened = miare::testing::DatabaseAccess::open<
+            std::allocator<std::byte>, RecoveryLimits>(
+            std::move(file),
+            miare::EncryptionKeyView{encryptionKey},
+            deterministicProviders(601));
+        assert(opened);
+        auto database = std::move(opened).value();
+        fileView->clearOperations();
+        fileView->failOperation(barrierOperation);
+        try {
+            (void)applyCandidate(database, *fileView, fixture.blobId);
+            assert(false);
+        } catch (const miare::DatabaseError& error) {
+            assert(error.code() == miare::Errc::CommitFailed);
+        }
+        return fileView->unbarrieredMutationCount();
+    }();
+    assert(interruptedMutationCount != 0);
+
+    std::vector<std::vector<std::size_t>> retainedOrders(1);
+    for (std::size_t mutation = 0;
+         mutation != interruptedMutationCount;
+         ++mutation) {
+        retainedOrders.push_back({mutation});
+    }
+    retainedOrders.emplace_back();
+    retainedOrders.back().reserve(interruptedMutationCount);
+    for (std::size_t mutation = interruptedMutationCount;
+         mutation != 0;
+         --mutation) {
+        retainedOrders.back().push_back(mutation - 1);
+    }
+    retainedOrders.emplace_back();
+    retainedOrders.back().reserve(interruptedMutationCount);
+    for (std::size_t mutation = 0;
+         mutation != interruptedMutationCount;
+         ++mutation) {
+        retainedOrders.back().push_back(mutation);
+    }
+
+    std::uint64_t providerSeed = 610;
+    for (const auto& retainedOrder : retainedOrders) {
+        auto file = std::make_unique<miare::testing::MemoryDurableFile>();
+        auto* fileView = file.get();
+        file->replaceStableBytes(fixture.image);
+        auto opened = miare::testing::DatabaseAccess::open<
+            std::allocator<std::byte>, RecoveryLimits>(
+            std::move(file),
+            miare::EncryptionKeyView{encryptionKey},
+            deterministicProviders(providerSeed++));
+        assert(opened);
+        auto database = std::move(opened).value();
+        fileView->clearOperations();
+        fileView->failOperation(barrierOperation);
+        try {
+            (void)applyCandidate(database, *fileView, fixture.blobId);
+            assert(false);
+        } catch (const miare::DatabaseError& error) {
+            assert(error.code() == miare::Errc::CommitFailed);
+        }
+        fileView->simulateCrash(retainedOrder);
+        assertPredecessor(
+            fileView->bytes(), fixture.blobId, providerSeed++);
+    }
+}
+
 void shortAndTornWritesCannotExposeMixedState() {
     const auto fixture = predecessorFixture();
     auto traceFile = std::make_unique<miare::testing::MemoryDurableFile>();
@@ -763,6 +862,7 @@ void authenticatedExtentDamageNeverReleasesUntrustedState() {
 int main() {
     everyPersistenceOperationCanBeInterruptedBeforeMutation();
     everyPublicationSectorSubsetSelectsOneCompleteGeneration();
+    failedFirstBarrierPermitsLossAndReorderingOnlyInAbandonedState();
     shortAndTornWritesCannotExposeMixedState();
     openFailureCategoriesRemainDistinctAndFailClosed();
     authenticatedExtentDamageNeverReleasesUntrustedState();
