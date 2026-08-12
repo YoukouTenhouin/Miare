@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
@@ -47,6 +48,100 @@ enum class RecoveryCause : std::uint8_t {
     MaintenancePersistenceFailed,
     ClosePersistenceFailed,
     ConfirmedCorruption,
+};
+
+enum class VerificationSeverity : std::uint8_t {
+    Corruption = 0,
+    Observation = 1,
+};
+
+enum class VerificationExtentRole : std::uint8_t {
+    Unknown = 0,
+    OrderedInternal,
+    OrderedLeaf,
+    OverflowValue,
+    BlobCatalogInternal,
+    BlobCatalogLeaf,
+    BlobManifest,
+    BlobChunkIndexInternal,
+    BlobChunkIndexLeaf,
+    BlobChunk,
+    AllocatorRoot,
+    FreeIndexInternal,
+    FreeIndexLeaf,
+    RetiredIndexInternal,
+    RetiredIndexLeaf,
+};
+
+enum class VerificationFindingCode : std::uint16_t {
+    IncompleteInactivePublication = 1,
+    AbandonedTail = 2,
+    PublicationConflict = 0x100,
+    FileTruncated,
+    ExtentOutOfBounds,
+    ExtentFramingInvalid,
+    ExtentAuthenticationFailed,
+    CodecEnvelopeInvalid,
+    DecodeFailed,
+    CanonicalEncodingInvalid,
+    ReferenceMismatch,
+    RoleMismatch,
+    GenerationMismatch,
+    TreeTopologyInvalid,
+    TreeOrderingInvalid,
+    BlobInvariantInvalid,
+    AllocationOverlap,
+    AllocationGap,
+    AllocationCountMismatch,
+    DuplicateReachability,
+};
+
+struct VerificationFinding {
+    VerificationSeverity severity = VerificationSeverity::Corruption;
+    VerificationFindingCode code =
+        VerificationFindingCode::CanonicalEncodingInvalid;
+    std::uint64_t blockIndex = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t blockCount = 0;
+    VerificationExtentRole extentRole = VerificationExtentRole::Unknown;
+    std::uint64_t generation = std::numeric_limits<std::uint64_t>::max();
+};
+
+template<class Allocator = std::allocator<std::byte>>
+struct BasicVerificationReport {
+    using FindingAllocator = typename std::allocator_traits<Allocator>::
+        template rebind_alloc<VerificationFinding>;
+
+    explicit BasicVerificationReport(const Allocator& allocator = {})
+        : findings(FindingAllocator{allocator}) {}
+
+    bool valid = true;
+    std::uint64_t selectedGeneration = 0;
+    std::uint64_t extentsChecked = 0;
+    std::uint64_t encodedBytesChecked = 0;
+    std::uint64_t decodedBytesChecked = 0;
+    std::uint64_t keysChecked = 0;
+    std::uint64_t blobsChecked = 0;
+    std::uint64_t blobChunksChecked = 0;
+    std::uint64_t liveBlocks = 0;
+    std::uint64_t freeBlocks = 0;
+    std::uint64_t retiredBlocks = 0;
+    std::uint64_t abandonedTailBlocks = 0;
+    std::vector<VerificationFinding, FindingAllocator> findings;
+    bool findingsTruncated = false;
+};
+
+using VerificationReport = BasicVerificationReport<>;
+
+struct BackupReport {
+    std::uint64_t sourceGeneration = 0;
+    std::uint64_t destinationFileBytes = 0;
+    std::uint64_t extentsVerified = 0;
+    std::uint64_t encodedBytesVerified = 0;
+    std::uint64_t liveBlocks = 0;
+    std::uint64_t freeBlocks = 0;
+    std::uint64_t retiredBlocks = 0;
+    bool hadIncompleteInactivePublication = false;
+    std::uint64_t excludedAbandonedTailBytes = 0;
 };
 
 struct CreateOptions {

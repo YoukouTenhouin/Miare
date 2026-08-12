@@ -242,6 +242,7 @@ struct DatabaseSession {
     std::uint64_t servingWriterTicket = 0;
     std::size_t waitingWriters = 0;
     bool writerActive = false;
+    bool maintenanceActive = false;
     std::size_t liveTransactions = 0;
     std::uint64_t nextReaderIdentity = 0;
     std::uint64_t liveBlocks =
@@ -3455,7 +3456,8 @@ inline void commitExact(
     DatabaseSession<Allocator, Limits>& session,
     const OrderedKeyValues<Allocator>& values,
     const BlobCatalog<Allocator>& blobs,
-    const BlobWriteState<Allocator, Limits>& blobState) {
+    const BlobWriteState<Allocator, Limits>& blobState,
+    std::optional<RecoveryCause> persistenceFailureCause = std::nullopt) {
     const auto generation = session.opened.format.generation + 1;
     if (generation == 0) {
         throw DatabaseError{Errc::ResourceLimit, "database generation is exhausted"};
@@ -4303,6 +4305,14 @@ inline void commitExact(
         session.file->stableStorageBarrier();
     } catch (const DatabaseError& error) {
         recordAbandonedTail();
+        if (persistenceFailureCause) {
+            session.recoveryCause.store(
+                *persistenceFailureCause,
+                std::memory_order_release);
+            session.state.store(
+                DatabaseState::RecoveryRequired, std::memory_order_release);
+            throw;
+        }
         session.recoveryCause.store(
             publicationStarted
                 ? RecoveryCause::CommitOutcomeUnknown
@@ -4319,7 +4329,9 @@ inline void commitExact(
     } catch (...) {
         recordAbandonedTail();
         session.recoveryCause.store(
-            RecoveryCause::CommitOutcomeUnknown,
+            persistenceFailureCause
+                ? *persistenceFailureCause
+                : RecoveryCause::CommitOutcomeUnknown,
             std::memory_order_release);
         session.state.store(
             DatabaseState::RecoveryRequired, std::memory_order_release);

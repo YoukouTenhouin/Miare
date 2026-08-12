@@ -124,6 +124,7 @@ public:
     using OwnedBytes = std::vector<
         std::byte,
         typename std::allocator_traits<Allocator>::template rebind_alloc<std::byte>>;
+    using VerificationReport = BasicVerificationReport<Allocator>;
 
 public:
     using ReadCursor = detail::OrderedCursor<Allocator, Limits, false>;
@@ -1175,6 +1176,55 @@ public:
             options.maxReaders});
     }
 
+    [[nodiscard]] static Result<VerificationReport, AuthenticationFailed>
+    verifyFile(
+        const std::filesystem::path& path,
+        EncryptionKeyView key,
+        ProviderSet providers,
+        Allocator allocator = {}) {
+        auto file = detail::NativeDurableFile::openExisting(path);
+        std::optional<VerificationReport> openingCorruption;
+        const auto openForVerification = [&] {
+            try {
+                return detail::openFormat<Limits>(*file, key, providers);
+            } catch (const DatabaseError& error) {
+                if (error.code() != Errc::Corrupt) {
+                    throw;
+                }
+                openingCorruption.emplace(allocator);
+                openingCorruption->valid = false;
+                openingCorruption->findings.push_back(
+                    verificationFinding(error));
+                return Result<detail::OpenedDatabase, AuthenticationFailed>::
+                    failure(AuthenticationFailed{});
+            }
+        };
+        auto opened = openForVerification();
+        if (!opened) {
+            if (openingCorruption) {
+                return Result<VerificationReport, AuthenticationFailed>::success(
+                    std::move(*openingCorruption));
+            }
+            return Result<VerificationReport, AuthenticationFailed>::failure(
+                AuthenticationFailed{});
+        }
+        auto selected = std::move(opened).value();
+        try {
+            return Result<VerificationReport, AuthenticationFailed>::success(
+                verifyOpened(*file, selected, providers, allocator));
+        } catch (const DatabaseError& error) {
+            if (error.code() != Errc::Corrupt) {
+                throw;
+            }
+            VerificationReport report{allocator};
+            report.valid = false;
+            report.selectedGeneration = selected.format.generation;
+            report.findings.push_back(verificationFinding(error));
+            return Result<VerificationReport, AuthenticationFailed>::success(
+                std::move(report));
+        }
+    }
+
     Database(const Database&) = delete;
     Database& operator=(const Database&) = delete;
 
@@ -1302,6 +1352,7 @@ public:
         result.oldestReaderGeneration = oldestReaderGeneration;
         result.oldestReaderAge = oldestReaderAge;
         result.writerActive = session.writerActive;
+        result.maintenanceActive = session.maintenanceActive;
         result.writerQueueDepth = static_cast<std::uint32_t>(
             session.waitingWriters);
         result.recoveryRequired = current == DatabaseState::RecoveryRequired;
@@ -1470,6 +1521,165 @@ public:
         return result;
     }
 
+    void checkpoint() {
+        auto& session = requireSession();
+        std::shared_lock operation{session.operationMutex};
+        acquireMaintenance(session);
+        try {
+            ensureValuesLoaded(session);
+            ensureBlobsLoaded(session);
+            ensureAllocatorSnapshotLoaded(session);
+            checkpointEligibleRetirements(
+                session, RecoveryCause::MaintenancePersistenceFailed);
+            removeAbandonedTail(session, RecoveryCause::MaintenancePersistenceFailed);
+        } catch (const DatabaseError& error) {
+            releaseMaintenance(session);
+            operation.unlock();
+            if (error.code() == Errc::Corrupt) {
+                enterRecoveryAfterCorruption(session, *lifetime_);
+            }
+            throw;
+        } catch (...) {
+            releaseMaintenance(session);
+            throw;
+        }
+        releaseMaintenance(session);
+    }
+
+    void compact() {
+        checkpoint();
+    }
+
+    [[nodiscard]] VerificationReport verify() {
+        auto& session = requireSession();
+        std::shared_lock operation{session.operationMutex};
+        acquireMaintenance(session);
+        try {
+            auto report = verifyOpened(
+                *session.file,
+                session.opened,
+                *session.providers,
+                session.allocator);
+            releaseMaintenance(session);
+            return report;
+        } catch (const DatabaseError& error) {
+            releaseMaintenance(session);
+            if (error.code() != Errc::Corrupt) {
+                throw;
+            }
+            VerificationReport report{session.allocator};
+            report.valid = false;
+            report.selectedGeneration = session.opened.format.generation;
+            report.findings.push_back(verificationFinding(error));
+            operation.unlock();
+            enterRecoveryAfterCorruption(session, *lifetime_);
+            return report;
+        } catch (...) {
+            releaseMaintenance(session);
+            throw;
+        }
+    }
+
+    [[nodiscard]] BackupReport backupTo(
+        const std::filesystem::path& destination) {
+        auto& session = requireSession();
+        validateTargetDoesNotExist(destination);
+        std::shared_lock operation{session.operationMutex};
+        acquireMaintenance(session);
+        std::filesystem::path temporaryPath;
+        try {
+            temporaryPath = createTemporaryPath(destination);
+            const auto verification = verifyOpened(
+                *session.file,
+                session.opened,
+                *session.providers,
+                session.allocator);
+            const auto committedBytes = session.opened.format.highWaterBytes;
+            const auto physicalBytes = session.file->size();
+            if (physicalBytes < committedBytes) {
+                detail::throwCorrupt(
+                    "database file is shorter than its committed high-water mark");
+            }
+            const auto abandonedTailBytes = physicalBytes - committedBytes;
+            constexpr std::size_t copyChunkBytes = 1U * 1024U * 1024U;
+            StoredBytes buffer{
+                typename StoredBytes::allocator_type{session.allocator}};
+            buffer.resize(static_cast<std::size_t>(std::min<std::uint64_t>(
+                copyChunkBytes, committedBytes)));
+            StoredBytes sourceBuffer{
+                typename StoredBytes::allocator_type{session.allocator}};
+            sourceBuffer.resize(buffer.size());
+            {
+                auto destinationFile =
+                    detail::NativeDurableFile::createNew(temporaryPath);
+                destinationFile->resize(committedBytes);
+                for (std::uint64_t offset = 0; offset != committedBytes;) {
+                    const auto count = static_cast<std::size_t>(
+                        std::min<std::uint64_t>(
+                            buffer.size(), committedBytes - offset));
+                    auto chunk = MutableByteView{buffer}.first(count);
+                    session.file->readExactAt(offset, chunk);
+                    destinationFile->writeExactAt(offset, chunk);
+                    offset += count;
+                }
+                destinationFile->stableStorageBarrier();
+                for (std::uint64_t offset = 0; offset != committedBytes;) {
+                    const auto count = static_cast<std::size_t>(
+                        std::min<std::uint64_t>(
+                            buffer.size(), committedBytes - offset));
+                    auto chunk = MutableByteView{buffer}.first(count);
+                    destinationFile->readExactAt(offset, chunk);
+                    auto source = MutableByteView{sourceBuffer}.first(count);
+                    session.file->readExactAt(offset, source);
+                    if (!std::equal(
+                            source.begin(), source.end(),
+                            chunk.begin(), chunk.end())) {
+                        throw DatabaseError{
+                            Errc::Durability,
+                            "backup validation did not preserve source bytes"};
+                    }
+                    offset += count;
+                }
+            }
+            detail::NativeDurableFile::installExclusive(
+                temporaryPath, destination);
+            {
+                auto installed =
+                    detail::NativeDurableFile::openExisting(destination);
+                if (installed->size() != committedBytes) {
+                    throw DatabaseError{
+                        Errc::Durability,
+                        "installed backup has the wrong length"};
+                }
+            }
+            releaseMaintenance(session);
+            return BackupReport{
+                verification.selectedGeneration,
+                committedBytes,
+                verification.extentsChecked,
+                verification.encodedBytesChecked,
+                verification.liveBlocks,
+                verification.freeBlocks,
+                verification.retiredBlocks,
+                session.opened.rejectedInactivePublication,
+                abandonedTailBytes};
+        } catch (const DatabaseError& error) {
+            releaseMaintenance(session);
+            std::error_code ignored;
+            std::filesystem::remove(temporaryPath, ignored);
+            operation.unlock();
+            if (error.code() == Errc::Corrupt) {
+                enterRecoveryAfterCorruption(session, *lifetime_);
+            }
+            throw;
+        } catch (...) {
+            releaseMaintenance(session);
+            std::error_code ignored;
+            std::filesystem::remove(temporaryPath, ignored);
+            throw;
+        }
+    }
+
     void close() {
         auto& session = requireSession();
         std::unique_lock operation{session.operationMutex};
@@ -1522,9 +1732,34 @@ public:
         }
         const auto recoveryCause = session.recoveryCause.load(
             std::memory_order_acquire);
-        if (expected == DatabaseState::Open ||
-            (expected == DatabaseState::RecoveryRequired &&
-             recoveryCause == RecoveryCause::ClosePersistenceFailed)) {
+        const bool resolveAndCheckpoint = expected == DatabaseState::Open ||
+            recoveryCause != RecoveryCause::ConfirmedCorruption;
+        if (resolveAndCheckpoint) {
+            try {
+                if (expected == DatabaseState::RecoveryRequired) {
+                    reselectSessionForClose(session);
+                }
+                ensureValuesLoaded(session);
+                ensureBlobsLoaded(session);
+                ensureAllocatorSnapshotLoaded(session);
+                checkpointEligibleRetirements(
+                    session, RecoveryCause::ClosePersistenceFailed);
+            } catch (const DatabaseError& error) {
+                if (session.state.load(std::memory_order_acquire) !=
+                    DatabaseState::RecoveryRequired) {
+                    session.state.store(
+                        error.code() == Errc::Corrupt
+                            ? DatabaseState::RecoveryRequired
+                            : expected,
+                        std::memory_order_release);
+                    if (error.code() == Errc::Corrupt) {
+                        session.recoveryCause.store(
+                            RecoveryCause::ConfirmedCorruption,
+                            std::memory_order_release);
+                    }
+                }
+                throw;
+            }
             consolidateAbandonedTailForClose(session, expected);
         }
         operation.unlock();
@@ -1780,6 +2015,293 @@ private:
         session.allocatorSnapshotLoaded = true;
     }
 
+    static void reselectSessionForClose(Session& session) {
+        auto selected = detail::selectPublication<Limits>(
+            *session.file, session.opened.keys, *session.providers);
+        if (!selected) {
+            detail::throwCorrupt(
+                "recovery close could not authenticate a committed publication");
+        }
+        auto publication = std::move(selected).value();
+        session.opened.format = publication.format;
+        session.opened.bootstrap = publication.bootstrap;
+        session.opened.publication = publication.publication;
+        session.opened.rejectedInactivePublication =
+            publication.rejectedInactivePublication;
+        session.opened.abandonedTailBytes = publication.abandonedTailBytes;
+        session.values = detail::makeOrderedKeyValues(session.allocator);
+        session.valuesLoaded = false;
+        session.blobs = detail::makeBlobCatalog(session.allocator);
+        session.blobsLoaded = false;
+        using TreeAllocator = typename std::allocator_traits<Allocator>::
+            template rebind_alloc<MutableTree>;
+        session.cursorTree = std::allocate_shared<MutableTree>(
+            TreeAllocator{session.allocator}, session.allocator);
+        session.retiredBlocksByGeneration.clear();
+        session.blobRetiredBlocksByGeneration.clear();
+        session.allocatorSnapshotLoaded = false;
+    }
+
+    static void checkpointEligibleRetirements(
+        Session& session,
+        RecoveryCause persistenceFailureCause) {
+        bool eligibleRetirement = false;
+        {
+            std::lock_guard lock{session.mutex};
+            auto oldestReader = std::numeric_limits<std::uint64_t>::max();
+            for (const auto& [identity, reader] : session.activeReaders) {
+                (void)identity;
+                oldestReader = std::min(oldestReader, reader.generation);
+            }
+            eligibleRetirement = std::any_of(
+                session.retiredBlocksByGeneration.begin(),
+                session.retiredBlocksByGeneration.end(),
+                [oldestReader](const auto& retirement) {
+                    return oldestReader >= retirement.first;
+                });
+        }
+        if (!eligibleRetirement) {
+            return;
+        }
+        auto blobState = makeWriteBlobState(session);
+        detail::commitExact<Limits>(
+            session,
+            session.values,
+            session.blobs,
+            *blobState,
+            persistenceFailureCause);
+    }
+
+    static void acquireMaintenance(Session& session) {
+        std::unique_lock lock{session.mutex};
+        requireOpen(session);
+        if (session.nextWriterTicket ==
+            std::numeric_limits<std::uint64_t>::max()) {
+            session.capacityFailureCount.fetch_add(
+                1, std::memory_order_relaxed);
+            throw DatabaseError{
+                Errc::ResourceLimit,
+                "maintenance admission sequence exhausted"};
+        }
+        const auto ticket = session.nextWriterTicket++;
+        ++session.waitingWriters;
+        session.writerAvailable.wait(lock, [&] {
+            return session.state.load(std::memory_order_acquire) !=
+                    DatabaseState::Open ||
+                (!session.writerActive &&
+                 ticket == session.servingWriterTicket);
+        });
+        --session.waitingWriters;
+        requireOpen(session);
+        session.writerActive = true;
+        session.maintenanceActive = true;
+    }
+
+    static void releaseMaintenance(Session& session) noexcept {
+        try {
+            std::lock_guard lock{session.mutex};
+            if (!session.maintenanceActive) {
+                return;
+            }
+            session.maintenanceActive = false;
+            session.writerActive = false;
+            ++session.servingWriterTicket;
+            session.writerAvailable.notify_all();
+        } catch (...) {
+        }
+    }
+
+    static void removeAbandonedTail(
+        Session& session,
+        RecoveryCause failureCause) {
+        const auto physicalBytes = session.file->size();
+        const auto highWaterBytes = session.opened.format.highWaterBytes;
+        if (physicalBytes < highWaterBytes) {
+            detail::throwCorrupt(
+                "database file is shorter than its committed high-water mark");
+        }
+        if (physicalBytes == highWaterBytes) {
+            session.opened.abandonedTailBytes = 0;
+            return;
+        }
+        try {
+            session.file->resize(highWaterBytes);
+            session.file->stableStorageBarrier();
+            session.opened.abandonedTailBytes = 0;
+        } catch (...) {
+            session.recoveryCause.store(failureCause, std::memory_order_release);
+            session.state.store(
+                DatabaseState::RecoveryRequired, std::memory_order_release);
+            throw;
+        }
+    }
+
+    [[nodiscard]] static VerificationExtentRole verificationRole(
+        std::uint16_t kind) noexcept {
+        switch (kind) {
+        case 1: return VerificationExtentRole::OrderedInternal;
+        case 2: return VerificationExtentRole::OrderedLeaf;
+        case 3: return VerificationExtentRole::BlobCatalogInternal;
+        case 4: return VerificationExtentRole::BlobCatalogLeaf;
+        case 5: return VerificationExtentRole::BlobChunkIndexInternal;
+        case 6: return VerificationExtentRole::BlobChunkIndexLeaf;
+        case 7: return VerificationExtentRole::FreeIndexInternal;
+        case 8: return VerificationExtentRole::FreeIndexLeaf;
+        case 9: return VerificationExtentRole::RetiredIndexInternal;
+        case 10: return VerificationExtentRole::RetiredIndexLeaf;
+        case 11: return VerificationExtentRole::OverflowValue;
+        case 12: return VerificationExtentRole::BlobManifest;
+        case 13: return VerificationExtentRole::BlobChunk;
+        case 14: return VerificationExtentRole::AllocatorRoot;
+        default: return VerificationExtentRole::Unknown;
+        }
+    }
+
+    [[nodiscard]] static VerificationFinding verificationFinding(
+        const DatabaseError& error) noexcept {
+        const std::string_view message{error.what()};
+        const auto contains = [&](std::string_view text) {
+            return message.find(text) != std::string_view::npos;
+        };
+        auto code = VerificationFindingCode::CanonicalEncodingInvalid;
+        if (contains("authentication failed")) {
+            code = VerificationFindingCode::ExtentAuthenticationFailed;
+        } else if (contains("shorter than") || contains("ends before")) {
+            code = VerificationFindingCode::FileTruncated;
+        } else if (contains("overlap")) {
+            code = VerificationFindingCode::AllocationOverlap;
+        } else if (contains("gap")) {
+            code = VerificationFindingCode::AllocationGap;
+        } else if (contains("partition") || contains("counter")) {
+            code = VerificationFindingCode::AllocationCountMismatch;
+        } else if (contains("duplicat")) {
+            code = VerificationFindingCode::DuplicateReachability;
+        } else if (contains("Blob")) {
+            code = VerificationFindingCode::BlobInvariantInvalid;
+        } else if (contains("role")) {
+            code = VerificationFindingCode::RoleMismatch;
+        } else if (contains("generation")) {
+            code = VerificationFindingCode::GenerationMismatch;
+        } else if (contains("reference")) {
+            code = VerificationFindingCode::ReferenceMismatch;
+        } else if (contains("separator") || contains("ordering") ||
+                   contains("keys are not canonical")) {
+            code = VerificationFindingCode::TreeOrderingInvalid;
+        } else if (contains("level") || contains("child") ||
+                   contains("tree")) {
+            code = VerificationFindingCode::TreeTopologyInvalid;
+        } else if (contains("codec") || contains("compression")) {
+            code = VerificationFindingCode::CodecEnvelopeInvalid;
+        } else if (contains("extent") || contains("preamble")) {
+            code = VerificationFindingCode::ExtentFramingInvalid;
+        }
+        return VerificationFinding{VerificationSeverity::Corruption, code};
+    }
+
+    [[nodiscard]] static VerificationReport verifyOpened(
+        detail::DurableFile& file,
+        detail::OpenedDatabase& opened,
+        ProviderSet& providers,
+        const Allocator& allocator) {
+        using ReferenceAllocator = typename std::allocator_traits<Allocator>::
+            template rebind_alloc<detail::ExtentReference>;
+        using RunAllocator = typename std::allocator_traits<Allocator>::
+            template rebind_alloc<detail::ExtentRun>;
+        detail::ExtentReferences<Allocator> reachable{
+            ReferenceAllocator{allocator}};
+        const auto values = detail::loadExactValues<Limits>(
+            file, opened, providers, allocator, &reachable);
+        detail::ExtentReferences<Allocator> blobReachable{
+            ReferenceAllocator{allocator}};
+        const auto blobs = detail::loadBlobCatalog<Limits>(
+            file, opened, providers, allocator, &blobReachable);
+        reachable.insert(
+            reachable.end(), blobReachable.begin(), blobReachable.end());
+        detail::ExtentRuns<Allocator> freeRuns{RunAllocator{allocator}};
+        detail::ExtentRuns<Allocator> retiredRuns{RunAllocator{allocator}};
+        detail::loadAllocatorReferences<Limits>(
+            file,
+            opened,
+            providers,
+            allocator,
+            reachable,
+            &freeRuns,
+            &retiredRuns);
+
+        VerificationReport report{allocator};
+        const auto physicalBytes = file.size();
+        if (physicalBytes < opened.format.highWaterBytes) {
+            detail::throwCorrupt(
+                "database file is shorter than its committed high-water mark");
+        }
+        const auto abandonedTailBytes =
+            physicalBytes - opened.format.highWaterBytes;
+        report.selectedGeneration = opened.format.generation;
+        report.keysChecked = values.size();
+        report.blobsChecked = blobs.size();
+        for (const auto& [id, version] : blobs) {
+            report.blobChunksChecked += version->chunks.size();
+            const auto owner = id.toBytes();
+            for (std::uint64_t ordinal = 0;
+                 ordinal != version->chunks.size();
+                 ++ordinal) {
+                const auto expectedLength = ordinal + 1 ==
+                        version->chunks.size()
+                    ? version->size - ordinal * Limits::blobChunkBytes
+                    : Limits::blobChunkBytes;
+                (void)detail::readAuthenticatedExtent<Limits>(
+                    file,
+                    version->chunks[ordinal],
+                    13,
+                    expectedLength,
+                    opened,
+                    providers,
+                    allocator,
+                    true,
+                    4,
+                    ordinal,
+                    owner);
+            }
+        }
+        report.extentsChecked = reachable.size();
+        report.liveBlocks =
+            detail::commonRegionBytes / Limits::allocationQuantumBytes;
+        for (const auto& reference : reachable) {
+            report.liveBlocks += reference.blockCount;
+            report.encodedBytesChecked += reference.encodedLength;
+            std::array<std::byte, detail::ExtentLayout::bytes> preamble{};
+            file.readExactAt(
+                reference.blockIndex * Limits::allocationQuantumBytes,
+                preamble);
+            report.decodedBytesChecked +=
+                detail::readLittleEndian<std::uint64_t>(
+                    preamble, detail::ExtentLayout::decodedLength);
+            (void)verificationRole(
+                detail::readLittleEndian<std::uint16_t>(
+                    preamble, detail::ExtentLayout::unitKind));
+        }
+        for (const auto& run : freeRuns) {
+            report.freeBlocks += run.count;
+        }
+        for (const auto& run : retiredRuns) {
+            report.retiredBlocks += run.count;
+        }
+        report.abandonedTailBlocks =
+            abandonedTailBytes / Limits::allocationQuantumBytes +
+            (abandonedTailBytes % Limits::allocationQuantumBytes != 0);
+        if (opened.rejectedInactivePublication) {
+            report.findings.push_back(VerificationFinding{
+                VerificationSeverity::Observation,
+                VerificationFindingCode::IncompleteInactivePublication});
+        }
+        if (abandonedTailBytes != 0) {
+            report.findings.push_back(VerificationFinding{
+                VerificationSeverity::Observation,
+                VerificationFindingCode::AbandonedTail});
+        }
+        return report;
+    }
+
     static void consolidateAbandonedTailForClose(
         Session& session,
         DatabaseState previousState) {
@@ -1836,6 +2358,7 @@ private:
             session.activeReaders.clear();
             session.waitingWriters = 0;
             session.writerActive = false;
+            session.maintenanceActive = false;
             eraseSessionKeys(session);
             session.file.reset();
             session.providers.reset();
