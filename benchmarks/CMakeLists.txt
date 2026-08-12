@@ -1,0 +1,2 @@
+add_executable(miare_qualification_benchmark qualification_benchmark.cpp)
+target_link_libraries(miare_qualification_benchmark PRIVATE miare::miare)

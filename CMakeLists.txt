@@ -8,6 +8,7 @@ option(
     "Register long-running backend qualification tests"
     OFF)
 option(MIARE_BUILD_FUZZERS "Build bounded libFuzzer targets" OFF)
+option(MIARE_BUILD_BENCHMARKS "Build v1 qualification benchmarks" OFF)
 
 add_library(miare INTERFACE)
 add_library(miare::miare ALIAS miare)
@@ -79,4 +80,8 @@ if(MIARE_BUILD_FUZZERS)
         message(FATAL_ERROR "MIARE_BUILD_FUZZERS requires Clang libFuzzer")
     endif()
     add_subdirectory(fuzz)
+endif()
+
+if(MIARE_BUILD_BENCHMARKS)
+    add_subdirectory(benchmarks)
 endif()
