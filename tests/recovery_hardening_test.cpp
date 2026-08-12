@@ -137,6 +137,54 @@ struct CandidateTrace {
     return std::move(opened).value();
 }
 
+template<class Mutation>
+[[nodiscard]] std::vector<std::byte> rewriteNewestPublication(
+    const std::vector<std::byte>& source,
+    Mutation&& mutate,
+    std::uint64_t providerSeed) {
+    auto providers = deterministicProviders(providerSeed);
+    miare::testing::MemoryDurableFile file;
+    file.replaceStableBytes(source);
+    auto openedResult = miare::detail::openFormat<RecoveryLimits>(
+        file,
+        miare::EncryptionKeyView{encryptionKey},
+        providers);
+    assert(openedResult);
+    auto opened = std::move(openedResult).value();
+    auto plaintext = opened.publication;
+    mutate(miare::MutableByteView{plaintext});
+    const auto slotIndex = static_cast<std::uint16_t>(
+        opened.format.generation % 2);
+    const auto slot = miare::detail::encodePublicationSlot(
+        opened, plaintext, slotIndex, providers);
+    auto image = source;
+    std::copy(
+        slot.begin(),
+        slot.end(),
+        image.begin() + static_cast<std::ptrdiff_t>(
+            miare::detail::bootstrapBytes +
+            slotIndex * miare::detail::publicationSlotBytes));
+    return image;
+}
+
+void expectOpenError(
+    const std::vector<std::byte>& image,
+    miare::Errc expected,
+    std::uint64_t providerSeed) {
+    auto file = std::make_unique<miare::testing::MemoryDurableFile>();
+    file->replaceStableBytes(image);
+    try {
+        (void)miare::testing::DatabaseAccess::open<
+            std::allocator<std::byte>, RecoveryLimits>(
+            std::move(file),
+            miare::EncryptionKeyView{encryptionKey},
+            deterministicProviders(providerSeed));
+        assert(false);
+    } catch (const miare::DatabaseError& error) {
+        assert(error.code() == expected);
+    }
+}
+
 void assertPredecessor(
     const std::vector<std::byte>& image,
     miare::BlobId blobId,
@@ -394,10 +442,113 @@ void shortAndTornWritesCannotExposeMixedState() {
     }
 }
 
+void openFailureCategoriesRemainDistinctAndFailClosed() {
+    const auto fixture = predecessorFixture();
+
+    auto wrongKey = encryptionKey;
+    wrongKey.front() ^= std::byte{1};
+    auto wrongKeyFile = std::make_unique<miare::testing::MemoryDurableFile>();
+    wrongKeyFile->replaceStableBytes(fixture.image);
+    auto wrongKeyResult = miare::testing::DatabaseAccess::open<
+        std::allocator<std::byte>, RecoveryLimits>(
+        std::move(wrongKeyFile),
+        miare::EncryptionKeyView{wrongKey},
+        deterministicProviders(2'000));
+    assert(!wrongKeyResult);
+    assert(wrongKeyResult.error() == miare::AuthenticationFailed{});
+
+    auto unauthenticated = fixture.image;
+    unauthenticated[miare::detail::bootstrapBytes +
+        miare::detail::SlotEnvelopeLayout::tag] ^= std::byte{1};
+    unauthenticated[miare::detail::bootstrapBytes +
+        miare::detail::publicationSlotBytes +
+        miare::detail::SlotEnvelopeLayout::tag] ^= std::byte{1};
+    auto unauthenticatedFile =
+        std::make_unique<miare::testing::MemoryDurableFile>();
+    unauthenticatedFile->replaceStableBytes(unauthenticated);
+    auto unauthenticatedResult = miare::testing::DatabaseAccess::open<
+        std::allocator<std::byte>, RecoveryLimits>(
+        std::move(unauthenticatedFile),
+        miare::EncryptionKeyView{encryptionKey},
+        deterministicProviders(2'001));
+    assert(!unauthenticatedResult);
+
+    const auto noncanonical = rewriteNewestPublication(
+        fixture.image,
+        [](miare::MutableByteView publication) {
+            publication[miare::detail::PublicationLayout::reserved] =
+                std::byte{1};
+        },
+        2'002);
+    expectOpenError(noncanonical, miare::Errc::Corrupt, 2'003);
+
+    const auto unsupportedFormat = rewriteNewestPublication(
+        fixture.image,
+        [](miare::MutableByteView publication) {
+            miare::detail::writeLittleEndian<std::uint32_t>(
+                2,
+                publication,
+                miare::detail::PublicationLayout::commonFormat);
+        },
+        2'004);
+    expectOpenError(
+        unsupportedFormat, miare::Errc::UnsupportedFormat, 2'005);
+
+    const auto unsupportedFeature = rewriteNewestPublication(
+        fixture.image,
+        [](miare::MutableByteView publication) {
+            miare::detail::writeLittleEndian<std::uint64_t>(
+                1,
+                publication,
+                miare::detail::PublicationLayout::requiredFeatures);
+        },
+        2'006);
+    expectOpenError(
+        unsupportedFeature, miare::Errc::UnsupportedFeature, 2'007);
+
+    const auto incompatibleProfile = rewriteNewestPublication(
+        fixture.image,
+        [](miare::MutableByteView publication) {
+            miare::detail::writeLittleEndian<std::uint32_t>(
+                2,
+                publication,
+                miare::detail::PublicationLayout::capacityProfileVersion);
+        },
+        2'008);
+    expectOpenError(
+        incompatibleProfile, miare::Errc::IncompatibleProfile, 2'009);
+
+    auto truncated = fixture.image;
+    truncated.resize(truncated.size() - 1);
+    expectOpenError(truncated, miare::Errc::Corrupt, 2'010);
+
+    auto failingCrypto =
+        std::make_unique<miare::testing::DeterministicCryptoProvider>(2'011);
+    auto* failingCryptoView = failingCrypto.get();
+    auto failingProviders = miare::detail::ProviderAccess::make(
+        std::move(failingCrypto),
+        std::make_unique<
+            miare::testing::FaultInjectingCompressionProvider>());
+    failingCryptoView->failNextProviderOperation();
+    auto providerFile = std::make_unique<miare::testing::MemoryDurableFile>();
+    providerFile->replaceStableBytes(fixture.image);
+    try {
+        (void)miare::testing::DatabaseAccess::open<
+            std::allocator<std::byte>, RecoveryLimits>(
+            std::move(providerFile),
+            miare::EncryptionKeyView{encryptionKey},
+            std::move(failingProviders));
+        assert(false);
+    } catch (const miare::DatabaseError& error) {
+        assert(error.code() == miare::Errc::ProviderUnavailable);
+    }
+}
+
 } // namespace
 
 int main() {
     everyPersistenceOperationCanBeInterruptedBeforeMutation();
     everyPublicationSectorSubsetSelectsOneCompleteGeneration();
     shortAndTornWritesCannotExposeMixedState();
+    openFailureCategoriesRemainDistinctAndFailClosed();
 }
