@@ -2093,6 +2093,9 @@ template<class Limits, class Allocator>
         reference.blockIndex * Limits::allocationQuantumBytes, preamble);
     const auto kind = readLittleEndian<std::uint16_t>(
         preamble, ExtentLayout::unitKind);
+    if (kind != internalKind && kind != leafKind) {
+        throwCorrupt("fixed-key page role is invalid");
+    }
     auto payload = readAuthenticatedExtent<Limits>(
         file, reference, kind, std::nullopt, opened, providers, allocator,
         true, keyDomain, 0, owner);
@@ -2249,6 +2252,9 @@ loadFixedTree(
         root.blockIndex * Limits::allocationQuantumBytes, preamble);
     const auto kind = readLittleEndian<std::uint16_t>(
         preamble, ExtentLayout::unitKind);
+    if (kind != internalKind && kind != leafKind) {
+        throwCorrupt("fixed-key root role is invalid");
+    }
     auto payload = readAuthenticatedExtent<Limits>(
         file, root, kind, std::nullopt, opened, providers, allocator,
         true, keyDomain, 0, owner);

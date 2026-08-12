@@ -440,6 +440,91 @@ void persistedChunksHaveCanonicalIndependentFraming() {
     database.close();
 }
 
+void fixedTreeRejectsNonPageExtentKindsBeforeParsing() {
+    auto file = std::make_unique<miare::testing::MemoryDurableFile>();
+    auto* fileView = file.get();
+    auto database = miare::testing::DatabaseAccess::create(
+        std::move(file),
+        miare::EncryptionKeyView{encryptionKey},
+        deterministicProviders(20));
+    auto transaction = database.beginWrite();
+    auto writer = transaction.createBlob();
+    const auto id = writer.id();
+    writer.write(bytes("x"));
+    writer.finish();
+    transaction.commit();
+    const auto image = fileView->bytes();
+    database.close();
+
+    constexpr auto quantum = miare::DefaultLimits::allocationQuantumBytes;
+    std::optional<miare::detail::ExtentReference> chunk;
+    for (std::uint64_t offset = miare::detail::commonRegionBytes;
+         offset < image.size();) {
+        const miare::ByteView input{image};
+        const auto kind = miare::detail::readLittleEndian<std::uint16_t>(
+            input, offset + miare::detail::ExtentLayout::unitKind);
+        const auto blockCount = miare::detail::readLittleEndian<std::uint64_t>(
+            input, offset + miare::detail::ExtentLayout::blockCount);
+        if (kind == 13) {
+            chunk = miare::detail::ExtentReference{
+                offset / quantum,
+                blockCount,
+                miare::detail::readLittleEndian<std::uint64_t>(
+                    input, offset + miare::detail::ExtentLayout::encodedLength),
+                miare::detail::readLittleEndian<std::uint64_t>(
+                    input, offset + miare::detail::ExtentLayout::generation)};
+            break;
+        }
+        offset += blockCount * quantum;
+    }
+    assert(chunk);
+
+    miare::testing::MemoryDurableFile persisted;
+    persisted.replaceStableBytes(image);
+    auto providers = deterministicProviders(21);
+    auto openedResult = miare::detail::openFormat<miare::DefaultLimits>(
+        persisted,
+        miare::EncryptionKeyView{encryptionKey},
+        providers);
+    assert(openedResult);
+    auto opened = std::move(openedResult).value();
+    const auto owner = id.toBytes();
+    expectDatabaseError(miare::Errc::Corrupt, [&] {
+        (void)miare::detail::loadFixedTree<miare::DefaultLimits>(
+            persisted,
+            *chunk,
+            2,
+            miare::BlobId::encodedSize,
+            3,
+            4,
+            4,
+            owner,
+            opened,
+            providers,
+            std::allocator<std::byte>{});
+    });
+
+    using Entry = miare::detail::FixedLeafEntry<std::allocator<std::byte>>;
+    miare::detail::StoredVector<Entry, std::allocator<std::byte>> entries;
+    expectDatabaseError(miare::Errc::Corrupt, [&] {
+        (void)miare::detail::loadFixedTreePage<miare::DefaultLimits>(
+            persisted,
+            *chunk,
+            0,
+            2,
+            miare::BlobId::encodedSize,
+            3,
+            4,
+            4,
+            owner,
+            opened,
+            providers,
+            std::allocator<std::byte>{},
+            entries,
+            nullptr);
+    });
+}
+
 void valueAndBlobIdentifierCommitTogether() {
     auto file = std::make_unique<miare::testing::MemoryDurableFile>();
     auto database = miare::testing::DatabaseAccess::create(
@@ -845,6 +930,7 @@ int main() {
     multiChunkBlobSupportsSequentialAndRandomAccess();
     eraseAndUnfinishedWritersAreTransactional();
     persistedChunksHaveCanonicalIndependentFraming();
+    fixedTreeRejectsNonPageExtentKindsBeforeParsing();
     valueAndBlobIdentifierCommitTogether();
     minimumChunkProfileInteroperatesAcrossReopen();
     tamperedChunkStopsTheSessionBeforePlaintextRelease();
