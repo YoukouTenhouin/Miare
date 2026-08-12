@@ -444,7 +444,9 @@ public:
                 return;
             }
             active_ = false;
-            if (state_ && state_->active.load(std::memory_order_acquire)) {
+            if (state_ && sessionLifetime_ &&
+                !sessionLifetime_->invalidated.load(std::memory_order_acquire) &&
+                state_->active.load(std::memory_order_acquire)) {
                 try {
                     detail::releaseBlobStagingReferences<Limits>(
                         *state_, stagedChunks_);
@@ -459,7 +461,8 @@ public:
         }
 
         [[nodiscard]] bool active() const noexcept {
-            return active_ && state_ &&
+            return active_ && state_ && sessionLifetime_ &&
+                !sessionLifetime_->invalidated.load(std::memory_order_acquire) &&
                 state_->active.load(std::memory_order_acquire);
         }
 

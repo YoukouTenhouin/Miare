@@ -490,6 +490,22 @@ void fixedTreeRejectsNonPageExtentKindsBeforeParsing() {
     assert(openedResult);
     auto opened = std::move(openedResult).value();
     const auto owner = id.toBytes();
+    auto outOfBoundsRoot = *chunk;
+    outOfBoundsRoot.blockIndex = opened.format.highWaterBytes / quantum;
+    expectDatabaseError(miare::Errc::Corrupt, [&] {
+        (void)miare::detail::loadFixedTree<miare::DefaultLimits>(
+            persisted,
+            outOfBoundsRoot,
+            2,
+            miare::BlobId::encodedSize,
+            3,
+            4,
+            4,
+            owner,
+            opened,
+            providers,
+            std::allocator<std::byte>{});
+    });
     expectDatabaseError(miare::Errc::Corrupt, [&] {
         (void)miare::detail::loadFixedTree<miare::DefaultLimits>(
             persisted,
@@ -625,6 +641,9 @@ void tamperedChunkStopsTheSessionBeforePlaintextRelease() {
                       offset + miare::detail::ExtentLayout::blockCount) *
             miare::DefaultLimits::allocationQuantumBytes;
     }
+    auto pending = database.beginWrite();
+    auto pendingWriter = pending.createBlob();
+    pendingWriter.write(bytes("pending"));
     auto read = database.beginRead();
     auto blob = read.openBlob(id);
     assert(blob);
@@ -635,9 +654,16 @@ void tamperedChunkStopsTheSessionBeforePlaintextRelease() {
     assert(database.state() == miare::DatabaseState::RecoveryRequired);
     assert(!blob->active());
     assert(!read.active());
+    assert(!pendingWriter.active());
+    assert(!pending.active());
+    expectContractError(miare::Errc::InvalidState, [&] {
+        pendingWriter.write(bytes("after corruption"));
+    });
     blob->close();
     read.end();
     database.close();
+    pendingWriter.abort();
+    pending.rollback();
 }
 
 void blobLimitsFailWithoutAdvancingStreamState() {

@@ -2298,6 +2298,8 @@ loadFixedTree(
     if (root.null()) {
         return entries;
     }
+    validateOrderedPageReference<Limits>(
+        root, opened.format.generation, opened.format.highWaterBytes);
     std::array<std::byte, ExtentLayout::bytes> preamble{};
     file.readExactAt(
         root.blockIndex * Limits::allocationQuantumBytes, preamble);
