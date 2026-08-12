@@ -699,6 +699,49 @@ void minimumChunkProfileInteroperatesAcrossReopen() {
     reopened.value().close();
 }
 
+void numericChunkIndexPrefixIncludesInteriorKeys() {
+    auto file = std::make_unique<miare::testing::MemoryDurableFile>();
+    auto* fileView = file.get();
+    auto database = miare::testing::DatabaseAccess::create<
+        std::allocator<std::byte>, SmallChunkLimits>(
+        std::move(file),
+        miare::EncryptionKeyView{encryptionKey},
+        deterministicProviders(49));
+    auto transaction = database.beginWrite();
+    auto writer = transaction.createBlob();
+    const auto id = writer.id();
+    std::vector<std::byte> chunk(
+        SmallChunkLimits::blobChunkBytes, std::byte{0x49});
+    constexpr std::size_t chunkCount = 412;
+    for (std::size_t index = 0; index != chunkCount; ++index) {
+        writer.write(chunk);
+    }
+    writer.finish();
+    transaction.commit();
+    auto image = fileView->bytes();
+    database.close();
+
+    auto reopenedFile = std::make_unique<miare::testing::MemoryDurableFile>();
+    reopenedFile->replaceStableBytes(image);
+    auto reopened = miare::testing::DatabaseAccess::open<
+        std::allocator<std::byte>, SmallChunkLimits>(
+        std::move(reopenedFile),
+        miare::EncryptionKeyView{encryptionKey},
+        deterministicProviders(50));
+    assert(reopened);
+    auto read = reopened.value().beginRead();
+    auto blob = read.openBlob(id);
+    assert(blob);
+    assert(blob->size() == chunkCount * SmallChunkLimits::blobChunkBytes);
+    blob->seek(256 * SmallChunkLimits::blobChunkBytes);
+    std::array<std::byte, 1> byte{};
+    assert(blob->read(byte) == 1);
+    assert(byte.front() == std::byte{0x49});
+    blob->close();
+    read.end();
+    reopened.value().close();
+}
+
 void tamperedChunkStopsTheSessionBeforePlaintextRelease() {
     auto file = std::make_unique<miare::testing::MemoryDurableFile>();
     auto* fileView = file.get();
@@ -1146,6 +1189,7 @@ int main() {
     blobCatalogRetainsUnchangedCopyOnWritePaths();
     valueAndBlobIdentifierCommitTogether();
     minimumChunkProfileInteroperatesAcrossReopen();
+    numericChunkIndexPrefixIncludesInteriorKeys();
     tamperedChunkStopsTheSessionBeforePlaintextRelease();
     blobLimitsFailWithoutAdvancingStreamState();
     failedCommitPublishesNeitherValueNorBlob();

@@ -843,12 +843,26 @@ template<class Limits, class Allocator, class Entries>
 }
 
 template<class Entries>
+[[nodiscard]] inline std::size_t fixedKeyPrefixLength(
+    const Entries& entries,
+    std::size_t begin,
+    std::size_t end) noexcept {
+    const auto first = ByteView{entries[begin].key};
+    auto prefixLength = first.size();
+    for (auto index = begin + 1; index != end && prefixLength != 0; ++index) {
+        prefixLength = commonPrefixLength(
+            first.first(prefixLength),
+            ByteView{entries[index].key}.first(prefixLength));
+    }
+    return prefixLength;
+}
+
+template<class Entries>
 [[nodiscard]] inline std::uint64_t fixedLeafUsedLength(
     const Entries& entries,
     std::size_t begin,
     std::size_t end) {
-    const auto prefixLength = commonPrefixLength(
-        entries[begin].key, entries[end - 1].key);
+    const auto prefixLength = fixedKeyPrefixLength(entries, begin, end);
     std::uint64_t used =
         PageLayout::bytes + prefixLength + (end - begin) * 8ULL;
     for (auto index = begin; index != end; ++index) {
@@ -871,8 +885,7 @@ template<class Limits, class Allocator, class Entries>
         ExtentLayout::bytes - authenticationTagBytes;
     StoredBytes<Allocator> payload{ByteAllocator{allocator}};
     payload.resize(payloadBytes);
-    const auto prefixLength = commonPrefixLength(
-        entries[begin].key, entries[end - 1].key);
+    const auto prefixLength = fixedKeyPrefixLength(entries, begin, end);
     const auto count = end - begin;
     const auto used = fixedLeafUsedLength(entries, begin, end);
     MutableByteView output{payload};
@@ -2207,6 +2220,7 @@ template<class Limits, class Allocator>
     }
     StoredBytes<Allocator> firstKey{ByteAllocator{allocator}};
     StoredBytes<Allocator> previousKey{ByteAllocator{allocator}};
+    std::size_t canonicalPrefixLength = count == 0 ? 0 : keySize;
     std::size_t expectedEntry = entriesOffset;
     for (std::uint32_t index = 0; index != count; ++index) {
         const auto slot = slotsOffset + index * 8U;
@@ -2234,6 +2248,10 @@ template<class Limits, class Allocator>
         }
         if (index == 0) {
             firstKey = key;
+        } else {
+            canonicalPrefixLength = commonPrefixLength(
+                ByteView{firstKey}.first(canonicalPrefixLength),
+                ByteView{key}.first(canonicalPrefixLength));
         }
         previousKey = key;
         const auto child = decodeExtentReference(ByteView{payload}.subspan(
@@ -2263,7 +2281,7 @@ template<class Limits, class Allocator>
         expectedEntry += entryLength;
     }
     if (expectedEntry != usedLength ||
-        commonPrefixLength(firstKey, previousKey) != prefixLength) {
+        canonicalPrefixLength != prefixLength) {
         throwCorrupt("fixed-key page image is noncanonical");
     }
     if (type == 1) {
