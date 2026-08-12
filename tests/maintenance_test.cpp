@@ -4,16 +4,40 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <string>
 #include <string_view>
 #include <vector>
 
 namespace {
 
 constexpr std::array<std::byte, 32> encryptionKey{};
+
+class TemporaryDirectory {
+public:
+    TemporaryDirectory() {
+        path_ = std::filesystem::temp_directory_path() /
+            ("miare-maintenance-" + std::to_string(
+                std::chrono::steady_clock::now().time_since_epoch().count()));
+        assert(std::filesystem::create_directory(path_));
+    }
+
+    ~TemporaryDirectory() {
+        std::error_code ignored;
+        std::filesystem::remove_all(path_, ignored);
+    }
+
+    [[nodiscard]] const std::filesystem::path& path() const noexcept {
+        return path_;
+    }
+
+private:
+    std::filesystem::path path_;
+};
 
 [[nodiscard]] miare::ByteView bytes(std::string_view text) {
     return {
@@ -106,8 +130,83 @@ void verificationIsBoundedAndFailsClosed() {
     const auto damaged = database.verify();
     assert(!damaged.valid);
     assert(!damaged.findings.empty());
+    assert(damaged.findings.front().code ==
+        miare::VerificationFindingCode::ExtentAuthenticationFailed);
     assert(damaged.findings.size() <= 64);
     assert(database.state() == miare::DatabaseState::RecoveryRequired);
+    database.close();
+}
+
+void backupIsPortableAndExcludesAbandonedTail() {
+    TemporaryDirectory temporary;
+    const auto backupPath = temporary.path() / "backup.miare";
+    auto file = std::make_unique<miare::testing::MemoryDurableFile>();
+    auto* fileView = file.get();
+    auto database = miare::testing::DatabaseAccess::create(
+        std::move(file),
+        miare::EncryptionKeyView{encryptionKey},
+        deterministicProviders(3));
+    auto write = database.beginWrite();
+    write.put(bytes("key"), bytes("portable"));
+    write.commit();
+    const auto committedBytes = database.diagnostics().mainFileBytes;
+    fileView->writeExactAt(committedBytes, bytes("abandoned"));
+
+    const auto report = database.backupTo(backupPath);
+    assert(report.sourceGeneration == 2);
+    assert(report.destinationFileBytes == committedBytes);
+    assert(report.excludedAbandonedTailBytes == 9);
+    assert(std::filesystem::file_size(backupPath) == committedBytes);
+    assert(database.state() == miare::DatabaseState::Open);
+
+    auto opened = miare::Database<>::open(
+        backupPath,
+        miare::EncryptionKeyView{encryptionKey},
+        deterministicProviders(4));
+    assert(opened);
+    auto read = opened.value().beginRead();
+    const auto value = read.get(bytes("key"));
+    assert(value && std::equal(
+        value->begin(), value->end(),
+        bytes("portable").begin(), bytes("portable").end()));
+    read.end();
+    opened.value().close();
+
+    const auto verified = miare::Database<>::verifyFile(
+        backupPath,
+        miare::EncryptionKeyView{encryptionKey},
+        deterministicProviders(5));
+    assert(verified && verified.value().valid);
+    const auto truncatedPath = temporary.path() / "truncated.miare";
+    assert(std::filesystem::copy_file(backupPath, truncatedPath));
+    {
+        auto truncated =
+            miare::detail::NativeDurableFile::openExisting(truncatedPath);
+        truncated->resize(miare::detail::commonRegionBytes);
+        truncated->stableStorageBarrier();
+    }
+    const auto truncated = miare::Database<>::verifyFile(
+        truncatedPath,
+        miare::EncryptionKeyView{encryptionKey},
+        deterministicProviders(13));
+    assert(truncated && !truncated.value().valid);
+    assert(truncated.value().findings.front().code ==
+        miare::VerificationFindingCode::FileTruncated);
+    auto wrongKey = encryptionKey;
+    wrongKey.front() ^= std::byte{1};
+    const auto rejected = miare::Database<>::verifyFile(
+        backupPath,
+        miare::EncryptionKeyView{wrongKey},
+        deterministicProviders(6));
+    assert(!rejected);
+
+    try {
+        (void)database.backupTo(backupPath);
+        assert(false);
+    } catch (const miare::DatabaseError& error) {
+        assert(error.code() == miare::Errc::Io);
+    }
+    assert(database.state() == miare::DatabaseState::Open);
     database.close();
 }
 
@@ -116,4 +215,5 @@ void verificationIsBoundedAndFailsClosed() {
 int main() {
     checkpointRespectsSnapshotsAndPersistsReclamation();
     verificationIsBoundedAndFailsClosed();
+    backupIsPortableAndExcludesAbandonedTail();
 }

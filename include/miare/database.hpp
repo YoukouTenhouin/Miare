@@ -1176,6 +1176,55 @@ public:
             options.maxReaders});
     }
 
+    [[nodiscard]] static Result<VerificationReport, AuthenticationFailed>
+    verifyFile(
+        const std::filesystem::path& path,
+        EncryptionKeyView key,
+        ProviderSet providers,
+        Allocator allocator = {}) {
+        auto file = detail::NativeDurableFile::openExisting(path);
+        std::optional<VerificationReport> openingCorruption;
+        const auto openForVerification = [&] {
+            try {
+                return detail::openFormat<Limits>(*file, key, providers);
+            } catch (const DatabaseError& error) {
+                if (error.code() != Errc::Corrupt) {
+                    throw;
+                }
+                openingCorruption.emplace(allocator);
+                openingCorruption->valid = false;
+                openingCorruption->findings.push_back(
+                    verificationFinding(error));
+                return Result<detail::OpenedDatabase, AuthenticationFailed>::
+                    failure(AuthenticationFailed{});
+            }
+        };
+        auto opened = openForVerification();
+        if (!opened) {
+            if (openingCorruption) {
+                return Result<VerificationReport, AuthenticationFailed>::success(
+                    std::move(*openingCorruption));
+            }
+            return Result<VerificationReport, AuthenticationFailed>::failure(
+                AuthenticationFailed{});
+        }
+        auto selected = std::move(opened).value();
+        try {
+            return Result<VerificationReport, AuthenticationFailed>::success(
+                verifyOpened(*file, selected, providers, allocator));
+        } catch (const DatabaseError& error) {
+            if (error.code() != Errc::Corrupt) {
+                throw;
+            }
+            VerificationReport report{allocator};
+            report.valid = false;
+            report.selectedGeneration = selected.format.generation;
+            report.findings.push_back(verificationFinding(error));
+            return Result<VerificationReport, AuthenticationFailed>::success(
+                std::move(report));
+        }
+    }
+
     Database(const Database&) = delete;
     Database& operator=(const Database&) = delete;
 
@@ -1543,14 +1592,112 @@ public:
             VerificationReport report{session.allocator};
             report.valid = false;
             report.selectedGeneration = session.opened.format.generation;
-            report.findings.push_back(VerificationFinding{
-                VerificationSeverity::Corruption,
-                VerificationFindingCode::CanonicalEncodingInvalid});
+            report.findings.push_back(verificationFinding(error));
             operation.unlock();
             enterRecoveryAfterCorruption(session, *lifetime_);
             return report;
         } catch (...) {
             releaseMaintenance(session);
+            throw;
+        }
+    }
+
+    [[nodiscard]] BackupReport backupTo(
+        const std::filesystem::path& destination) {
+        auto& session = requireSession();
+        validateTargetDoesNotExist(destination);
+        std::shared_lock operation{session.operationMutex};
+        acquireMaintenance(session);
+        std::filesystem::path temporaryPath;
+        try {
+            temporaryPath = createTemporaryPath(destination);
+            const auto verification = verifyOpened(
+                *session.file,
+                session.opened,
+                *session.providers,
+                session.allocator);
+            const auto committedBytes = session.opened.format.highWaterBytes;
+            const auto physicalBytes = session.file->size();
+            if (physicalBytes < committedBytes) {
+                detail::throwCorrupt(
+                    "database file is shorter than its committed high-water mark");
+            }
+            const auto abandonedTailBytes = physicalBytes - committedBytes;
+            constexpr std::size_t copyChunkBytes = 1U * 1024U * 1024U;
+            StoredBytes buffer{
+                typename StoredBytes::allocator_type{session.allocator}};
+            buffer.resize(static_cast<std::size_t>(std::min<std::uint64_t>(
+                copyChunkBytes, committedBytes)));
+            StoredBytes sourceBuffer{
+                typename StoredBytes::allocator_type{session.allocator}};
+            sourceBuffer.resize(buffer.size());
+            {
+                auto destinationFile =
+                    detail::NativeDurableFile::createNew(temporaryPath);
+                destinationFile->resize(committedBytes);
+                for (std::uint64_t offset = 0; offset != committedBytes;) {
+                    const auto count = static_cast<std::size_t>(
+                        std::min<std::uint64_t>(
+                            buffer.size(), committedBytes - offset));
+                    auto chunk = MutableByteView{buffer}.first(count);
+                    session.file->readExactAt(offset, chunk);
+                    destinationFile->writeExactAt(offset, chunk);
+                    offset += count;
+                }
+                destinationFile->stableStorageBarrier();
+                for (std::uint64_t offset = 0; offset != committedBytes;) {
+                    const auto count = static_cast<std::size_t>(
+                        std::min<std::uint64_t>(
+                            buffer.size(), committedBytes - offset));
+                    auto chunk = MutableByteView{buffer}.first(count);
+                    destinationFile->readExactAt(offset, chunk);
+                    auto source = MutableByteView{sourceBuffer}.first(count);
+                    session.file->readExactAt(offset, source);
+                    if (!std::equal(
+                            source.begin(), source.end(),
+                            chunk.begin(), chunk.end())) {
+                        throw DatabaseError{
+                            Errc::Durability,
+                            "backup validation did not preserve source bytes"};
+                    }
+                    offset += count;
+                }
+            }
+            detail::NativeDurableFile::installExclusive(
+                temporaryPath, destination);
+            {
+                auto installed =
+                    detail::NativeDurableFile::openExisting(destination);
+                if (installed->size() != committedBytes) {
+                    throw DatabaseError{
+                        Errc::Durability,
+                        "installed backup has the wrong length"};
+                }
+            }
+            releaseMaintenance(session);
+            return BackupReport{
+                verification.selectedGeneration,
+                committedBytes,
+                verification.extentsChecked,
+                verification.encodedBytesChecked,
+                verification.liveBlocks,
+                verification.freeBlocks,
+                verification.retiredBlocks,
+                session.opened.rejectedInactivePublication,
+                abandonedTailBytes};
+        } catch (const DatabaseError& error) {
+            releaseMaintenance(session);
+            std::error_code ignored;
+            std::filesystem::remove(temporaryPath, ignored);
+            operation.unlock();
+            if (error.code() == Errc::Corrupt) {
+                enterRecoveryAfterCorruption(session, *lifetime_);
+            }
+            throw;
+        } catch (...) {
+            releaseMaintenance(session);
+            std::error_code ignored;
+            std::filesystem::remove(temporaryPath, ignored);
             throw;
         }
     }
@@ -1950,6 +2097,47 @@ private:
         }
     }
 
+    [[nodiscard]] static VerificationFinding verificationFinding(
+        const DatabaseError& error) noexcept {
+        const std::string_view message{error.what()};
+        const auto contains = [&](std::string_view text) {
+            return message.find(text) != std::string_view::npos;
+        };
+        auto code = VerificationFindingCode::CanonicalEncodingInvalid;
+        if (contains("authentication failed")) {
+            code = VerificationFindingCode::ExtentAuthenticationFailed;
+        } else if (contains("shorter than") || contains("ends before")) {
+            code = VerificationFindingCode::FileTruncated;
+        } else if (contains("overlap")) {
+            code = VerificationFindingCode::AllocationOverlap;
+        } else if (contains("gap")) {
+            code = VerificationFindingCode::AllocationGap;
+        } else if (contains("partition") || contains("counter")) {
+            code = VerificationFindingCode::AllocationCountMismatch;
+        } else if (contains("duplicat")) {
+            code = VerificationFindingCode::DuplicateReachability;
+        } else if (contains("Blob")) {
+            code = VerificationFindingCode::BlobInvariantInvalid;
+        } else if (contains("role")) {
+            code = VerificationFindingCode::RoleMismatch;
+        } else if (contains("generation")) {
+            code = VerificationFindingCode::GenerationMismatch;
+        } else if (contains("reference")) {
+            code = VerificationFindingCode::ReferenceMismatch;
+        } else if (contains("separator") || contains("ordering") ||
+                   contains("keys are not canonical")) {
+            code = VerificationFindingCode::TreeOrderingInvalid;
+        } else if (contains("level") || contains("child") ||
+                   contains("tree")) {
+            code = VerificationFindingCode::TreeTopologyInvalid;
+        } else if (contains("codec") || contains("compression")) {
+            code = VerificationFindingCode::CodecEnvelopeInvalid;
+        } else if (contains("extent") || contains("preamble")) {
+            code = VerificationFindingCode::ExtentFramingInvalid;
+        }
+        return VerificationFinding{VerificationSeverity::Corruption, code};
+    }
+
     [[nodiscard]] static VerificationReport verifyOpened(
         detail::DurableFile& file,
         detail::OpenedDatabase& opened,
@@ -1981,6 +2169,13 @@ private:
             &retiredRuns);
 
         VerificationReport report{allocator};
+        const auto physicalBytes = file.size();
+        if (physicalBytes < opened.format.highWaterBytes) {
+            detail::throwCorrupt(
+                "database file is shorter than its committed high-water mark");
+        }
+        const auto abandonedTailBytes =
+            physicalBytes - opened.format.highWaterBytes;
         report.selectedGeneration = opened.format.generation;
         report.keysChecked = values.size();
         report.blobsChecked = blobs.size();
@@ -2032,14 +2227,14 @@ private:
             report.retiredBlocks += run.count;
         }
         report.abandonedTailBlocks =
-            opened.abandonedTailBytes / Limits::allocationQuantumBytes +
-            (opened.abandonedTailBytes % Limits::allocationQuantumBytes != 0);
+            abandonedTailBytes / Limits::allocationQuantumBytes +
+            (abandonedTailBytes % Limits::allocationQuantumBytes != 0);
         if (opened.rejectedInactivePublication) {
             report.findings.push_back(VerificationFinding{
                 VerificationSeverity::Observation,
                 VerificationFindingCode::IncompleteInactivePublication});
         }
-        if (opened.abandonedTailBytes != 0) {
+        if (abandonedTailBytes != 0) {
             report.findings.push_back(VerificationFinding{
                 VerificationSeverity::Observation,
                 VerificationFindingCode::AbandonedTail});
