@@ -1,0 +1,237 @@
+name: v1 qualification
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+  schedule:
+    - cron: '17 2 * * 0'
+
+permissions:
+  contents: read
+
+jobs:
+  portability-produce:
+    name: produce (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            os: ubuntu-24.04
+            family: linux
+            executable: qualification-build/tests/miare_portability_fixture_test
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
+            family: linux
+            executable: qualification-build/tests/miare_portability_fixture_test
+          - name: macos-x64
+            os: macos-15-intel
+            family: macos
+            executable: qualification-build/tests/miare_portability_fixture_test
+          - name: macos-arm64
+            os: macos-15
+            family: macos
+            executable: qualification-build/tests/miare_portability_fixture_test
+          - name: windows-x64
+            os: windows-2025
+            family: windows
+            architecture: x64
+            triplet: x64-windows
+            executable: qualification-build/tests/Release/miare_portability_fixture_test.exe
+          - name: windows-arm64
+            os: windows-11-arm
+            family: windows
+            architecture: ARM64
+            triplet: arm64-windows
+            executable: qualification-build/tests/Release/miare_portability_fixture_test.exe
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install providers (Linux)
+        if: matrix.family == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y libsodium-dev libzstd-dev
+
+      - name: Install providers (macOS)
+        if: matrix.family == 'macos'
+        run: brew install libsodium zstd
+
+      - name: Install providers (Windows)
+        if: matrix.family == 'windows'
+        run: |
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            vcpkg install libsodium:${{ matrix.triplet }} zstd:${{ matrix.triplet }}
+            if ($LASTEXITCODE -eq 0) { break }
+            if ($attempt -eq 3) { exit $LASTEXITCODE }
+            Start-Sleep -Seconds (15 * $attempt)
+          }
+
+      - name: Configure (Linux)
+        if: matrix.family == 'linux'
+        run: >-
+          cmake -S . -B qualification-build
+          -DMIARE_BUILD_TESTS=ON
+          -DCMAKE_BUILD_TYPE=Release
+
+      - name: Configure (macOS)
+        if: matrix.family == 'macos'
+        run: >-
+          cmake -S . -B qualification-build
+          -DMIARE_BUILD_TESTS=ON
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_PREFIX_PATH="$(brew --prefix libsodium);$(brew --prefix zstd)"
+
+      - name: Configure (Windows)
+        if: matrix.family == 'windows'
+        run: >-
+          cmake -S . -B qualification-build
+          -A ${{ matrix.architecture }}
+          -DMIARE_BUILD_TESTS=ON
+          -DVCPKG_TARGET_TRIPLET=${{ matrix.triplet }}
+          -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+
+      - name: Build fixture tool
+        run: >-
+          cmake --build qualification-build
+          --config Release
+          --target miare_portability_fixture_test
+          --parallel
+
+      - name: Produce fixture corpus
+        run: >-
+          ${{ matrix.executable }}
+          --produce qualification-fixtures
+          ${{ matrix.name }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fixtures-${{ matrix.name }}
+          path: qualification-fixtures
+          if-no-files-found: error
+          retention-days: 30
+
+  portability-consume:
+    name: consume (${{ matrix.name }})
+    needs: portability-produce
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            os: ubuntu-24.04
+            family: linux
+            executable: qualification-build/tests/miare_portability_fixture_test
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
+            family: linux
+            executable: qualification-build/tests/miare_portability_fixture_test
+          - name: macos-x64
+            os: macos-15-intel
+            family: macos
+            executable: qualification-build/tests/miare_portability_fixture_test
+          - name: macos-arm64
+            os: macos-15
+            family: macos
+            executable: qualification-build/tests/miare_portability_fixture_test
+          - name: windows-x64
+            os: windows-2025
+            family: windows
+            architecture: x64
+            triplet: x64-windows
+            executable: qualification-build/tests/Release/miare_portability_fixture_test.exe
+          - name: windows-arm64
+            os: windows-11-arm
+            family: windows
+            architecture: ARM64
+            triplet: arm64-windows
+            executable: qualification-build/tests/Release/miare_portability_fixture_test.exe
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: fixtures-*
+          path: qualification-fixtures
+          merge-multiple: true
+
+      - name: Install providers (Linux)
+        if: matrix.family == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y libsodium-dev libzstd-dev
+
+      - name: Install providers (macOS)
+        if: matrix.family == 'macos'
+        run: brew install libsodium zstd
+
+      - name: Install providers (Windows)
+        if: matrix.family == 'windows'
+        run: |
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            vcpkg install libsodium:${{ matrix.triplet }} zstd:${{ matrix.triplet }}
+            if ($LASTEXITCODE -eq 0) { break }
+            if ($attempt -eq 3) { exit $LASTEXITCODE }
+            Start-Sleep -Seconds (15 * $attempt)
+          }
+
+      - name: Configure (Linux)
+        if: matrix.family == 'linux'
+        run: >-
+          cmake -S . -B qualification-build
+          -DMIARE_BUILD_TESTS=ON
+          -DCMAKE_BUILD_TYPE=Release
+
+      - name: Configure (macOS)
+        if: matrix.family == 'macos'
+        run: >-
+          cmake -S . -B qualification-build
+          -DMIARE_BUILD_TESTS=ON
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_PREFIX_PATH="$(brew --prefix libsodium);$(brew --prefix zstd)"
+
+      - name: Configure (Windows)
+        if: matrix.family == 'windows'
+        run: >-
+          cmake -S . -B qualification-build
+          -A ${{ matrix.architecture }}
+          -DMIARE_BUILD_TESTS=ON
+          -DVCPKG_TARGET_TRIPLET=${{ matrix.triplet }}
+          -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+
+      - name: Build fixture tool
+        run: >-
+          cmake --build qualification-build
+          --config Release
+          --target miare_portability_fixture_test
+          --parallel
+
+      - name: Consume every platform fixture
+        run: >-
+          ${{ matrix.executable }}
+          --consume qualification-fixtures
+
+  long-running-gates:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1440
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install providers
+        run: sudo apt-get update && sudo apt-get install -y libsodium-dev libzstd-dev
+      - name: Configure qualification suite
+        run: >-
+          cmake -S . -B qualification-build
+          -DMIARE_BUILD_TESTS=ON
+          -DMIARE_BUILD_QUALIFICATION_TESTS=ON
+          -DCMAKE_BUILD_TYPE=Release
+      - name: Build qualification suite
+        run: cmake --build qualification-build --parallel
+      - name: Run public-model and concurrency gates
+        run: >-
+          ctest --test-dir qualification-build
+          -L qualification
+          --output-on-failure
