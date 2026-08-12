@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <condition_variable>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -52,6 +53,15 @@ public:
     explicit DeterministicCryptoProvider(std::uint64_t seed) : state_(seed) {}
 
     void randomBytes(MutableByteView output) override {
+        {
+            std::unique_lock lock{randomMutex_};
+            if (blockRandom_) {
+                randomEntered_ = true;
+                randomCondition_.notify_all();
+                randomCondition_.wait(lock, [&] { return releaseRandom_; });
+                blockRandom_ = false;
+            }
+        }
         if (failRandom_) {
             failRandom_ = false;
             throw DatabaseError{Errc::ProviderUnavailable, "injected randomness failure"};
@@ -130,12 +140,32 @@ public:
         ProviderFailureInjection::failNextProviderOperation();
     }
     void corruptNextCiphertext() noexcept { corruptCiphertext_ = true; }
+    void blockNextRandom() {
+        std::lock_guard lock{randomMutex_};
+        blockRandom_ = true;
+        randomEntered_ = false;
+        releaseRandom_ = false;
+    }
+    void waitUntilRandomBlocked() {
+        std::unique_lock lock{randomMutex_};
+        randomCondition_.wait(lock, [&] { return randomEntered_; });
+    }
+    void releaseRandom() {
+        std::lock_guard lock{randomMutex_};
+        releaseRandom_ = true;
+        randomCondition_.notify_all();
+    }
 
 private:
     detail::SodiumCryptoProvider delegate_;
     std::uint64_t state_;
     bool failRandom_ = false;
     bool corruptCiphertext_ = false;
+    std::mutex randomMutex_;
+    std::condition_variable randomCondition_;
+    bool blockRandom_ = false;
+    bool randomEntered_ = false;
+    bool releaseRandom_ = false;
 };
 
 class FaultInjectingCompressionProvider final

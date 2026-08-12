@@ -2775,11 +2775,11 @@ inline void readBlobRange(
                 Errc::ResourceLimit,
                 "Blob chunk exceeds the configured cache capacity"};
         }
-        StoredBytes<Allocator> chunk{
-            typename std::allocator_traits<Allocator>::template rebind_alloc<
-                std::byte>{session.allocator}};
         {
             std::lock_guard lock{session.mutex};
+            StoredBytes<Allocator> chunk{
+                typename std::allocator_traits<Allocator>::template rebind_alloc<
+                    std::byte>{session.allocator}};
             chunk = readAuthenticatedExtent<Limits>(
                 *session.file,
                 version.chunks[ordinal],
@@ -2798,15 +2798,15 @@ inline void readBlobRange(
                 version.pending
                     ? std::optional<std::uint64_t>{version.stagedHighWaterBytes}
                     : std::nullopt);
+            const auto count = std::min<std::size_t>(
+                destination.size() - copied,
+                chunk.size() - static_cast<std::size_t>(within));
+            std::copy_n(
+                chunk.begin() + static_cast<std::ptrdiff_t>(within),
+                count,
+                destination.begin() + static_cast<std::ptrdiff_t>(copied));
+            copied += count;
         }
-        const auto count = std::min<std::size_t>(
-            destination.size() - copied,
-            chunk.size() - static_cast<std::size_t>(within));
-        std::copy_n(
-            chunk.begin() + static_cast<std::ptrdiff_t>(within),
-            count,
-            destination.begin() + static_cast<std::ptrdiff_t>(copied));
-        copied += count;
     }
 }
 

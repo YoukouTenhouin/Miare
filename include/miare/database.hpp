@@ -750,6 +750,8 @@ public:
 
         [[nodiscard]] BlobWriter createBlob() {
             requireFunctional();
+            std::shared_lock operation{session_->operationMutex};
+            requireFunctional();
             requireBlobWriterCapacity();
             std::array<std::byte, BlobId::encodedSize> randomBytes{};
             std::optional<BlobId> selected;
@@ -1438,6 +1440,20 @@ public:
 
     void close() {
         auto& session = requireSession();
+        std::unique_lock operation{session.operationMutex};
+        if (session.confirmedCorruptionPending.load(
+                std::memory_order_acquire) &&
+            session.state.load(std::memory_order_acquire) ==
+                DatabaseState::Open) {
+            operation.unlock();
+            std::unique_lock lock{session.mutex};
+            session.writerAvailable.wait(lock, [&] {
+                return session.state.load(std::memory_order_acquire) !=
+                    DatabaseState::Open;
+            });
+            lock.unlock();
+            operation.lock();
+        }
         auto expected = session.state.load(std::memory_order_acquire);
         for (;;) {
             if (expected != DatabaseState::Open &&
@@ -1472,6 +1488,7 @@ public:
                     "database has live transactions"};
             }
         }
+        operation.unlock();
         shutdownSession(session, *lifetime_);
     }
 
@@ -1629,6 +1646,11 @@ private:
     static void enterRecoveryAfterCorruptionLocked(
         Session& session,
         ChildLifetime& lifetime) noexcept {
+        const auto current = session.state.load(std::memory_order_acquire);
+        if (current != DatabaseState::Open &&
+            current != DatabaseState::RecoveryRequired) {
+            return;
+        }
         session.recoveryCause.store(
             RecoveryCause::ConfirmedCorruption,
             std::memory_order_release);
@@ -1652,14 +1674,19 @@ private:
             std::lock_guard lock{session.mutex};
             enterRecoveryAfterCorruptionLocked(session, lifetime);
         } catch (...) {
-            session.recoveryCause.store(
-                RecoveryCause::ConfirmedCorruption,
-                std::memory_order_release);
-            session.state.store(
-                DatabaseState::RecoveryRequired,
-                std::memory_order_release);
-            lifetime.invalidated.store(true, std::memory_order_release);
-            session.writerAvailable.notify_all();
+            auto expected = DatabaseState::Open;
+            if (session.state.compare_exchange_strong(
+                    expected,
+                    DatabaseState::RecoveryRequired,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire) ||
+                expected == DatabaseState::RecoveryRequired) {
+                session.recoveryCause.store(
+                    RecoveryCause::ConfirmedCorruption,
+                    std::memory_order_release);
+                lifetime.invalidated.store(true, std::memory_order_release);
+                session.writerAvailable.notify_all();
+            }
         }
     }
 

@@ -916,6 +916,8 @@ void confirmedCorruptionWaitsForInflightBlobRead() {
     assert(readSucceeded.load(std::memory_order_acquire));
     assert(database.state() == miare::DatabaseState::RecoveryRequired);
     database.close();
+    miare::testing::DatabaseAccess::forceConfirmedCorruption(database);
+    assert(database.state() == miare::DatabaseState::Closed);
 }
 
 void blobStagingAndCommitHoldInflightLeases() {
@@ -994,6 +996,42 @@ void blobStagingAndCommitHoldInflightLeases() {
         committing.join();
         database.close();
     }
+}
+
+void blobIdentifierGenerationHoldsInflightLease() {
+    auto file = std::make_unique<miare::testing::MemoryDurableFile>();
+    auto crypto =
+        std::make_unique<miare::testing::DeterministicCryptoProvider>(54);
+    auto* cryptoView = crypto.get();
+    auto providers = miare::detail::ProviderAccess::make(
+        std::move(crypto),
+        std::make_unique<miare::testing::FaultInjectingCompressionProvider>());
+    auto database = miare::testing::DatabaseAccess::create(
+        std::move(file),
+        miare::EncryptionKeyView{encryptionKey},
+        std::move(providers));
+    std::atomic<bool> ready{false};
+    std::atomic<bool> start{false};
+    std::thread creating([&] {
+        auto transaction = database.beginWrite();
+        ready.store(true, std::memory_order_release);
+        while (!start.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        auto writer = transaction.createBlob();
+        writer.abort();
+        transaction.rollback();
+    });
+    while (!ready.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    cryptoView->blockNextRandom();
+    start.store(true, std::memory_order_release);
+    cryptoView->waitUntilRandomBlocked();
+    assert(!miare::testing::DatabaseAccess::operationsAreQuiescent(database));
+    cryptoView->releaseRandom();
+    creating.join();
+    database.close();
 }
 
 void blobLimitsFailWithoutAdvancingStreamState() {
@@ -1393,6 +1431,7 @@ int main() {
     tamperedChunkStopsTheSessionBeforePlaintextRelease();
     confirmedCorruptionWaitsForInflightBlobRead();
     blobStagingAndCommitHoldInflightLeases();
+    blobIdentifierGenerationHoldsInflightLease();
     blobLimitsFailWithoutAdvancingStreamState();
     failedCommitPublishesNeitherValueNorBlob();
     stagingIoFailurePreservesWriterContents();
