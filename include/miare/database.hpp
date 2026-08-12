@@ -1122,6 +1122,7 @@ public:
                 std::move(allocator),
                 std::move(validated.opened),
                 std::move(validated.values),
+                std::move(validated.blobs),
                 64U * 1024U * 1024U,
                 256};
         } catch (...) {
@@ -1158,6 +1159,7 @@ public:
             std::move(allocator),
             std::move(validated.opened),
             std::move(validated.values),
+            std::move(validated.blobs),
             options.cacheCapacityBytes,
             options.maxReaders});
     }
@@ -1497,6 +1499,7 @@ private:
         std::unique_ptr<detail::DurableFile> file;
         detail::OpenedDatabase opened;
         OrderedKeyValues values;
+        BlobCatalog blobs;
     };
 
     [[nodiscard]] static MutableTree snapshotCursorTree(
@@ -1531,10 +1534,11 @@ private:
         Allocator allocator,
         detail::OpenedDatabase opened,
         OrderedKeyValues values,
+        BlobCatalog blobs,
         std::size_t cacheCapacityBytes,
         std::uint32_t maxReaders) {
         SessionAllocator sessionAllocator{allocator};
-        return std::allocate_shared<Session>(
+        auto session = std::allocate_shared<Session>(
             sessionAllocator,
             std::move(file),
             std::move(providers),
@@ -1543,6 +1547,9 @@ private:
             std::move(values),
             cacheCapacityBytes,
             maxReaders);
+        session->blobs = std::move(blobs);
+        session->blobsLoaded = true;
+        return session;
     }
 
     Database(
@@ -1551,6 +1558,7 @@ private:
         Allocator allocator,
         detail::OpenedDatabase opened,
         OrderedKeyValues values,
+        BlobCatalog blobs,
         std::size_t cacheCapacityBytes,
         std::uint32_t maxReaders)
         : lifetime_(makeChildLifetime(allocator)),
@@ -1560,6 +1568,7 @@ private:
               std::move(allocator),
               std::move(opened),
               std::move(values),
+              std::move(blobs),
               cacheCapacityBytes,
               maxReaders)) {}
 
@@ -1807,7 +1816,7 @@ private:
         auto openedDatabase = std::move(opened).value();
         (void)detail::shallowValidateOrderedRoot<Limits>(
             *file, openedDatabase, providers, allocator);
-        (void)detail::loadBlobCatalog<Limits>(
+        auto blobs = detail::loadBlobCatalog<Limits>(
             *file, openedDatabase, providers, allocator);
         (void)detail::shallowValidateAllocatorRoot<Limits>(
             *file, openedDatabase, providers, allocator);
@@ -1815,7 +1824,8 @@ private:
         return Result<ValidatedFile, AuthenticationFailed>::success(ValidatedFile{
             std::move(file),
             std::move(openedDatabase),
-            std::move(values)});
+            std::move(values),
+            std::move(blobs)});
     }
 
     [[nodiscard]] static ValidatedFile requireCreatedAuthentication(

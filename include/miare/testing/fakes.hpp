@@ -547,7 +547,7 @@ public:
         auto openedDatabase = std::move(opened).value();
         (void)detail::shallowValidateOrderedRoot<Limits>(
             *file, openedDatabase, providers, allocator);
-        (void)detail::loadBlobCatalog<Limits>(
+        auto blobs = detail::loadBlobCatalog<Limits>(
             *file, openedDatabase, providers, allocator);
         (void)detail::shallowValidateAllocatorRoot<Limits>(
             *file, openedDatabase, providers, allocator);
@@ -560,6 +560,7 @@ public:
                 std::move(allocator),
                 std::move(openedDatabase),
                 std::move(values),
+                std::move(blobs),
                 64U * 1024U * 1024U,
                 256});
     }

@@ -808,6 +808,45 @@ void numericChunkIndexPrefixIncludesInteriorKeys() {
     reopened.value().close();
 }
 
+void openRetainsValidatedBlobCatalog() {
+    auto file = std::make_unique<miare::testing::MemoryDurableFile>();
+    auto* fileView = file.get();
+    auto database = miare::testing::DatabaseAccess::create<
+        std::allocator<std::byte>, SmallChunkLimits>(
+        std::move(file),
+        miare::EncryptionKeyView{encryptionKey},
+        deterministicProviders(55));
+    auto transaction = database.beginWrite();
+    auto writer = transaction.createBlob();
+    writer.write(std::vector<std::byte>(
+        SmallChunkLimits::blobChunkBytes * 2, std::byte{0x55}));
+    writer.finish();
+    transaction.commit();
+    auto image = fileView->bytes();
+    database.close();
+
+    auto reopenedFile = std::make_unique<miare::testing::MemoryDurableFile>();
+    reopenedFile->replaceStableBytes(image);
+    auto compression =
+        std::make_unique<miare::testing::FaultInjectingCompressionProvider>();
+    auto* compressionView = compression.get();
+    auto providers = miare::detail::ProviderAccess::make(
+        std::make_unique<miare::testing::DeterministicCryptoProvider>(56),
+        std::move(compression));
+    auto reopened = miare::testing::DatabaseAccess::open<
+        std::allocator<std::byte>, SmallChunkLimits>(
+        std::move(reopenedFile),
+        miare::EncryptionKeyView{encryptionKey},
+        std::move(providers));
+    assert(reopened);
+    assert(compressionView->decompressionCalls() != 0);
+    compressionView->resetOperationCounts();
+    auto read = reopened.value().beginRead();
+    assert(compressionView->decompressionCalls() == 0);
+    read.end();
+    reopened.value().close();
+}
+
 void tamperedChunkStopsTheSessionBeforePlaintextRelease() {
     auto file = std::make_unique<miare::testing::MemoryDurableFile>();
     auto* fileView = file.get();
@@ -1428,6 +1467,7 @@ int main() {
     valueAndBlobIdentifierCommitTogether();
     minimumChunkProfileInteroperatesAcrossReopen();
     numericChunkIndexPrefixIncludesInteriorKeys();
+    openRetainsValidatedBlobCatalog();
     tamperedChunkStopsTheSessionBeforePlaintextRelease();
     confirmedCorruptionWaitsForInflightBlobRead();
     blobStagingAndCommitHoldInflightLeases();
