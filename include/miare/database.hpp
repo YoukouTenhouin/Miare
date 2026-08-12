@@ -139,6 +139,7 @@ public:
               sessionLifetime_(std::move(other.sessionLifetime_)),
               lifetime_(std::move(other.lifetime_)),
               version_(std::move(other.version_)),
+              cacheState_(std::move(other.cacheState_)),
               decodedChunk_(std::move(other.decodedChunk_)),
               thread_(other.thread_),
               position_(other.position_),
@@ -209,12 +210,14 @@ public:
                 !lifetime_->invalidated.load(std::memory_order_acquire)) {
                 lifetime_->liveReaders.fetch_sub(1, std::memory_order_relaxed);
             }
-            if (session_) {
-                detail::releaseDecodedBlobChunk(*session_, decodedChunk_);
+            if (cacheState_) {
+                detail::releaseDecodedBlobChunk(
+                    *cacheState_, decodedChunk_);
             }
             version_.reset();
             lifetime_.reset();
             sessionLifetime_.reset();
+            cacheState_.reset();
             session_ = nullptr;
         }
 
@@ -239,6 +242,7 @@ public:
               sessionLifetime_(std::move(sessionLifetime)),
               lifetime_(std::move(lifetime)),
               version_(std::move(version)),
+              cacheState_(session.blobCache),
               thread_(thread),
               position_(0),
               active_(true) {
@@ -266,6 +270,7 @@ public:
         std::shared_ptr<ChildLifetime> sessionLifetime_;
         std::shared_ptr<BlobReaderLifetime> lifetime_;
         BlobVersionPtr version_;
+        std::shared_ptr<detail::BlobCacheState> cacheState_;
         std::optional<detail::DecodedBlobChunk<Allocator>> decodedChunk_;
         std::thread::id thread_;
         std::uint64_t position_;
@@ -1273,10 +1278,10 @@ public:
         result.reclaimableBytes = reclaimableBlocks * quantum;
         result.snapshotRetainedBytes = snapshotRetainedBlocks * quantum;
         result.cacheCapacityBytes = session.cacheCapacityBytes;
-        result.cacheUsedBytes = session.cacheUsedBytes.load(
+        result.cacheUsedBytes = session.blobCache->usedBytes.load(
             std::memory_order_relaxed);
         result.cachePinnedBytes = result.cacheUsedBytes;
-        result.cacheEvictions = session.cacheEvictions.load(
+        result.cacheEvictions = session.blobCache->evictions.load(
             std::memory_order_relaxed);
         result.activeReaders = static_cast<std::uint32_t>(
             session.activeReaders.size());
@@ -1500,6 +1505,13 @@ public:
                     Errc::LiveChildren,
                     "database has live transactions"};
             }
+        }
+        const auto recoveryCause = session.recoveryCause.load(
+            std::memory_order_acquire);
+        if (expected == DatabaseState::Open ||
+            (expected == DatabaseState::RecoveryRequired &&
+             recoveryCause == RecoveryCause::ClosePersistenceFailed)) {
+            consolidateAbandonedTailForClose(session, expected);
         }
         operation.unlock();
         shutdownSession(session, *lifetime_);
@@ -1750,6 +1762,51 @@ private:
         session.retiredBlocksByGeneration = std::move(
             snapshot.retiredBlocksByGeneration);
         session.allocatorSnapshotLoaded = true;
+    }
+
+    static void consolidateAbandonedTailForClose(
+        Session& session,
+        DatabaseState previousState) {
+        std::uint64_t physicalBytes = 0;
+        try {
+            physicalBytes = session.file->size();
+        } catch (...) {
+            session.state.store(previousState, std::memory_order_release);
+            throw;
+        }
+        const auto highWaterBytes = session.opened.format.highWaterBytes;
+        if (physicalBytes < highWaterBytes) {
+            session.recoveryCause.store(
+                RecoveryCause::ConfirmedCorruption,
+                std::memory_order_release);
+            session.state.store(
+                DatabaseState::RecoveryRequired,
+                std::memory_order_release);
+            throw DatabaseError{
+                Errc::Corrupt,
+                "database file is shorter than its committed high-water mark"};
+        }
+        const bool retryingPersistence =
+            previousState == DatabaseState::RecoveryRequired;
+        if (physicalBytes == highWaterBytes && !retryingPersistence) {
+            session.opened.abandonedTailBytes = 0;
+            return;
+        }
+        try {
+            if (physicalBytes > highWaterBytes) {
+                session.file->resize(highWaterBytes);
+            }
+            session.file->stableStorageBarrier();
+            session.opened.abandonedTailBytes = 0;
+        } catch (...) {
+            session.recoveryCause.store(
+                RecoveryCause::ClosePersistenceFailed,
+                std::memory_order_release);
+            session.state.store(
+                DatabaseState::RecoveryRequired,
+                std::memory_order_release);
+            throw;
+        }
     }
 
     static void shutdownSession(

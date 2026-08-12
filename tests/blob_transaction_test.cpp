@@ -899,6 +899,77 @@ void smallReadsReuseDecodedBlobChunks() {
     database.close();
 }
 
+void invalidatedCachedReaderCanOutliveDatabase() {
+    std::unique_ptr<BlobReader> surviving;
+    {
+        auto file = std::make_unique<miare::testing::MemoryDurableFile>();
+        auto database = miare::testing::DatabaseAccess::create(
+            std::move(file),
+            miare::EncryptionKeyView{encryptionKey},
+            deterministicProviders(58));
+        auto transaction = database.beginWrite();
+        auto writer = transaction.createBlob();
+        const auto id = writer.id();
+        writer.write(bytes("cached content"));
+        writer.finish();
+        transaction.commit();
+
+        auto read = database.beginRead();
+        auto blob = read.openBlob(id);
+        assert(blob);
+        std::array<std::byte, 1> output{};
+        assert(blob->read(output) == 1);
+        surviving = std::make_unique<BlobReader>(std::move(*blob));
+        read.end();
+        assert(!surviving->active());
+        database.close();
+    }
+    surviving.reset();
+}
+
+void closeTailConsolidationFailureIsRetryable() {
+    const auto exercise = [](bool failBarrier) {
+        auto file = std::make_unique<miare::testing::MemoryDurableFile>();
+        auto* fileView = file.get();
+        auto database = miare::testing::DatabaseAccess::create<
+            std::allocator<std::byte>, SmallChunkLimits>(
+            std::move(file),
+            miare::EncryptionKeyView{encryptionKey},
+            deterministicProviders(failBarrier ? 59 : 60));
+        const auto committedBytes = fileView->size();
+        auto transaction = database.beginWrite();
+        auto writer = transaction.createBlob();
+        writer.write(std::vector<std::byte>(
+            SmallChunkLimits::blobChunkBytes, std::byte{0x59}));
+        assert(fileView->size() > committedBytes);
+        writer.abort();
+        transaction.rollback();
+
+        if (failBarrier) {
+            fileView->failNextBarrier();
+            expectDatabaseError(miare::Errc::Durability, [&] {
+                database.close();
+            });
+            assert(fileView->size() == committedBytes);
+            assert(fileView->unbarrieredMutationCount() != 0);
+        } else {
+            fileView->failNextResize();
+            expectDatabaseError(miare::Errc::Io, [&] {
+                database.close();
+            });
+            assert(fileView->size() > committedBytes);
+        }
+        assert(database.state() == miare::DatabaseState::RecoveryRequired);
+        assert(database.diagnostics().recoveryCause ==
+               miare::RecoveryCause::ClosePersistenceFailed);
+        database.close();
+        assert(database.state() == miare::DatabaseState::Closed);
+    };
+
+    exercise(false);
+    exercise(true);
+}
+
 void tamperedChunkStopsTheSessionBeforePlaintextRelease() {
     auto file = std::make_unique<miare::testing::MemoryDurableFile>();
     auto* fileView = file.get();
@@ -1521,6 +1592,8 @@ int main() {
     numericChunkIndexPrefixIncludesInteriorKeys();
     openRetainsValidatedBlobCatalog();
     smallReadsReuseDecodedBlobChunks();
+    invalidatedCachedReaderCanOutliveDatabase();
+    closeTailConsolidationFailureIsRetryable();
     tamperedChunkStopsTheSessionBeforePlaintextRelease();
     confirmedCorruptionWaitsForInflightBlobRead();
     blobStagingAndCommitHoldInflightLeases();

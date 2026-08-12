@@ -160,6 +160,11 @@ struct ActiveReader {
     std::chrono::steady_clock::time_point startedAt;
 };
 
+struct BlobCacheState {
+    std::atomic<std::uint64_t> usedBytes{0};
+    std::atomic<std::uint64_t> evictions{0};
+};
+
 template<class Allocator, class Limits>
 struct DatabaseSession {
     DatabaseSession(
@@ -188,6 +193,9 @@ struct DatabaseSession {
               std::less<std::uint64_t>{},
               typename std::allocator_traits<Allocator>::template rebind_alloc<
                   std::pair<const std::uint64_t, std::uint64_t>>{allocator}),
+          blobCache(std::allocate_shared<BlobCacheState>(
+              typename std::allocator_traits<Allocator>::
+                  template rebind_alloc<BlobCacheState>{allocator})),
           cacheCapacityBytes(configuredCacheCapacityBytes),
           maxReaders(configuredMaxReaders) {}
 
@@ -213,6 +221,7 @@ struct DatabaseSession {
         typename std::allocator_traits<Allocator>::template rebind_alloc<
             std::pair<const std::uint64_t, std::uint64_t>>>
         retiredBlocksByGeneration;
+    std::shared_ptr<BlobCacheState> blobCache;
     std::mutex mutex;
     // File/provider operations take this shared and then mutex. Recovery and
     // shutdown take it exclusively before clearing session resources.
@@ -229,8 +238,6 @@ struct DatabaseSession {
     bool allocatorSnapshotLoaded = opened.format.generation == 1;
     std::size_t cacheCapacityBytes;
     std::uint32_t maxReaders;
-    std::atomic<std::uint64_t> cacheUsedBytes{0};
-    std::atomic<std::uint64_t> cacheEvictions{0};
     std::atomic<DatabaseState> state{DatabaseState::Open};
     std::atomic<bool> confirmedCorruptionPending{false};
     std::atomic<RecoveryCause> recoveryCause{RecoveryCause::None};
@@ -2766,19 +2773,19 @@ template<class Limits, class Allocator>
     }
 }
 
-template<class Limits, class Allocator>
+template<class Allocator>
 inline void releaseDecodedBlobChunk(
-    DatabaseSession<Allocator, Limits>& session,
+    BlobCacheState& cacheState,
     std::optional<DecodedBlobChunk<Allocator>>& cached,
     bool eviction = false) noexcept {
     if (!cached) {
         return;
     }
-    session.cacheUsedBytes.fetch_sub(
+    cacheState.usedBytes.fetch_sub(
         cached->bytes.size(), std::memory_order_relaxed);
     cached.reset();
     if (eviction) {
-        session.cacheEvictions.fetch_add(1, std::memory_order_relaxed);
+        cacheState.evictions.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
@@ -2801,8 +2808,9 @@ inline void readBlobRange(
         {
             std::lock_guard lock{session.mutex};
             if (!cached || cached->ordinal != ordinal) {
-                releaseDecodedBlobChunk(session, cached, cached.has_value());
-                auto used = session.cacheUsedBytes.load(
+                releaseDecodedBlobChunk(
+                    *session.blobCache, cached, cached.has_value());
+                auto used = session.blobCache->usedBytes.load(
                     std::memory_order_relaxed);
                 const auto capacity = static_cast<std::uint64_t>(
                     session.cacheCapacityBytes);
@@ -2814,7 +2822,7 @@ inline void readBlobRange(
                             Errc::ResourceLimit,
                             "Blob chunk exceeds the available cache capacity"};
                     }
-                } while (!session.cacheUsedBytes.compare_exchange_weak(
+                } while (!session.blobCache->usedBytes.compare_exchange_weak(
                     used,
                     used + expectedLength,
                     std::memory_order_relaxed,
@@ -2844,7 +2852,7 @@ inline void readBlobRange(
                             : std::nullopt);
                     cached.emplace(ordinal, std::move(chunk));
                 } catch (...) {
-                    session.cacheUsedBytes.fetch_sub(
+                    session.blobCache->usedBytes.fetch_sub(
                         expectedLength, std::memory_order_relaxed);
                     throw;
                 }
