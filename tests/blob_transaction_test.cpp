@@ -542,6 +542,93 @@ void fixedTreeRejectsNonPageExtentKindsBeforeParsing() {
     });
 }
 
+void blobCatalogRetainsUnchangedCopyOnWritePaths() {
+    auto file = std::make_unique<miare::testing::MemoryDurableFile>();
+    auto* fileView = file.get();
+    auto database = miare::testing::DatabaseAccess::create(
+        std::move(file),
+        miare::EncryptionKeyView{encryptionKey},
+        deterministicProviders(24));
+    std::vector<miare::BlobId> ids;
+    ids.reserve(400);
+    auto creating = database.beginWrite();
+    for (std::size_t index = 0; index != 400; ++index) {
+        auto writer = creating.createBlob();
+        ids.push_back(writer.id());
+        writer.finish();
+    }
+    creating.commit();
+
+    const auto originalRoot =
+        miare::testing::DatabaseAccess::blobRoot(database);
+    auto valueOnly = database.beginWrite();
+    valueOnly.put(bytes("catalog-independent"), bytes("value"));
+    valueOnly.commit();
+    const auto valueOnlyRoot =
+        miare::testing::DatabaseAccess::blobRoot(database);
+    assert(miare::detail::encodeExtentReference(originalRoot) ==
+           miare::detail::encodeExtentReference(valueOnlyRoot));
+
+    const auto catalogPages = [&](miare::detail::ExtentReference root) {
+        miare::testing::MemoryDurableFile snapshot;
+        snapshot.replaceStableBytes(fileView->bytes());
+        auto providers = deterministicProviders(25);
+        auto openedResult = miare::detail::openFormat<miare::DefaultLimits>(
+            snapshot,
+            miare::EncryptionKeyView{encryptionKey},
+            providers);
+        assert(openedResult);
+        auto opened = std::move(openedResult).value();
+        miare::detail::ExtentReferences<std::allocator<std::byte>> reachable;
+        (void)miare::detail::loadFixedTree<miare::DefaultLimits>(
+            snapshot,
+            root,
+            2,
+            miare::BlobId::encodedSize,
+            3,
+            4,
+            2,
+            {},
+            opened,
+            providers,
+            std::allocator<std::byte>{},
+            &reachable);
+        std::vector<std::array<std::byte, 32>> pages;
+        for (const auto& reference : reachable) {
+            const auto offset = reference.blockIndex *
+                miare::DefaultLimits::allocationQuantumBytes;
+            const auto kind = miare::detail::readLittleEndian<std::uint16_t>(
+                miare::ByteView{fileView->bytes()},
+                offset + miare::detail::ExtentLayout::unitKind);
+            if (kind == 3 || kind == 4) {
+                pages.push_back(miare::detail::encodeExtentReference(reference));
+            }
+        }
+        return pages;
+    };
+    const auto originalPages = catalogPages(valueOnlyRoot);
+    assert(originalPages.size() >= 3);
+
+    auto replacing = database.beginWrite();
+    auto replacement = replacing.replaceBlob(ids.front());
+    assert(replacement);
+    replacement->finish();
+    replacing.commit();
+    const auto replacementRoot =
+        miare::testing::DatabaseAccess::blobRoot(database);
+    assert(miare::detail::encodeExtentReference(replacementRoot) !=
+           miare::detail::encodeExtentReference(valueOnlyRoot));
+    const auto replacementPages = catalogPages(replacementRoot);
+    assert(std::any_of(
+        originalPages.begin(), originalPages.end(),
+        [&](const auto& oldPage) {
+            return std::find(
+                       replacementPages.begin(), replacementPages.end(), oldPage) !=
+                replacementPages.end();
+        }));
+    database.close();
+}
+
 void valueAndBlobIdentifierCommitTogether() {
     auto file = std::make_unique<miare::testing::MemoryDurableFile>();
     auto database = miare::testing::DatabaseAccess::create(
@@ -1056,6 +1143,7 @@ int main() {
     eraseAndUnfinishedWritersAreTransactional();
     persistedChunksHaveCanonicalIndependentFraming();
     fixedTreeRejectsNonPageExtentKindsBeforeParsing();
+    blobCatalogRetainsUnchangedCopyOnWritePaths();
     valueAndBlobIdentifierCommitTogether();
     minimumChunkProfileInteroperatesAcrossReopen();
     tamperedChunkStopsTheSessionBeforePlaintextRelease();

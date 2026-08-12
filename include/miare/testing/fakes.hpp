@@ -425,6 +425,14 @@ public:
     }
 
     template<class Allocator, class Limits>
+    [[nodiscard]] static detail::ExtentReference blobRoot(
+        Database<Allocator, Limits>& database) {
+        std::lock_guard lock{database.session_->mutex};
+        return detail::decodeExtentReference(
+            database.session_->opened.format.blobRoot);
+    }
+
+    template<class Allocator, class Limits>
     static void forceRecoveryRequired(Database<Allocator, Limits>& database) {
         database.session_->state.store(
             DatabaseState::RecoveryRequired, std::memory_order_release);

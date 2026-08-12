@@ -2128,7 +2128,8 @@ template<class Limits, class Allocator>
     ProviderSet& providers,
     const Allocator& allocator,
     StoredVector<FixedLeafEntry<Allocator>, Allocator>& entries,
-    ExtentReferences<Allocator>* reachable) {
+    ExtentReferences<Allocator>* reachable,
+    MutableTreeNode<Allocator>* mutableNode = nullptr) {
     if (expectedLevel > maximumTreeLevel) {
         throwCorrupt("fixed-key tree exceeds the supported depth");
     }
@@ -2154,6 +2155,10 @@ template<class Limits, class Allocator>
         payload, PageLayout::type);
     const auto level = readLittleEndian<std::uint32_t>(
         payload, PageLayout::level);
+    if (mutableNode) {
+        mutableNode->reference = reference;
+        mutableNode->level = level;
+    }
     if (!matches(payload, PageLayout::magic, "MIAREPG\0") ||
         readLittleEndian<std::uint16_t>(payload, PageLayout::version) != 1 ||
         (type != 1 && type != 2) ||
@@ -2239,6 +2244,14 @@ template<class Limits, class Allocator>
         if (type == 1) {
             validateExtentReference<Limits>(
                 child, opened.format.generation, opened.format.highWaterBytes);
+            if (mutableNode) {
+                StoredBytes<Allocator> storedReference{ByteAllocator{allocator}};
+                const auto encodedReference = encodeExtentReference(child);
+                storedReference.assign(
+                    encodedReference.begin(), encodedReference.end());
+                mutableNode->values.push_back(MutableTreeValue<Allocator>{
+                    key, std::move(storedReference), {}});
+            }
             entries.push_back(FixedLeafEntry<Allocator>{
                 std::move(key), child});
             if (reachable) {
@@ -2254,16 +2267,26 @@ template<class Limits, class Allocator>
         throwCorrupt("fixed-key page image is noncanonical");
     }
     if (type == 1) {
+        if (mutableNode) {
+            mutableNode->minimumKey = firstKey;
+        }
         return FixedTreeBounds<Allocator>{
             std::move(firstKey), std::move(previousKey)};
     }
     StoredBytes<Allocator> subtreeMinimum{ByteAllocator{allocator}};
     StoredBytes<Allocator> subtreeMaximum{ByteAllocator{allocator}};
+    if (mutableNode) {
+        mutableNode->children.reserve(children.size());
+        for (std::size_t index = 0; index != children.size(); ++index) {
+            mutableNode->children.emplace_back(allocator);
+        }
+    }
     for (std::size_t index = 0; index != children.size(); ++index) {
         auto bounds = loadFixedTreePage<Limits>(
             file, children[index].second, level - 1, role, keySize,
             internalKind, leafKind, keyDomain, owner, opened, providers,
-            allocator, entries, reachable);
+            allocator, entries, reachable,
+            mutableNode ? &mutableNode->children[index] : nullptr);
         if (index == 0) {
             subtreeMinimum = std::move(bounds.minimum);
         } else if (children[index].first != bounds.minimum ||
@@ -2271,6 +2294,9 @@ template<class Limits, class Allocator>
             throwCorrupt("fixed-key internal separator is invalid");
         }
         subtreeMaximum = std::move(bounds.maximum);
+    }
+    if (mutableNode) {
+        mutableNode->minimumKey = subtreeMinimum;
     }
     return FixedTreeBounds<Allocator>{
         std::move(subtreeMinimum), std::move(subtreeMaximum)};
@@ -2290,7 +2316,8 @@ loadFixedTree(
     OpenedDatabase& opened,
     ProviderSet& providers,
     const Allocator& allocator,
-    ExtentReferences<Allocator>* reachable = nullptr) {
+    ExtentReferences<Allocator>* reachable = nullptr,
+    MutableTreeNode<Allocator>* mutableRoot = nullptr) {
     using Entry = FixedLeafEntry<Allocator>;
     StoredVector<Entry, Allocator> entries{
         typename std::allocator_traits<Allocator>::template rebind_alloc<Entry>{
@@ -2319,7 +2346,7 @@ loadFixedTree(
     }
     (void)loadFixedTreePage<Limits>(
         file, root, level, role, keySize, internalKind, leafKind, keyDomain,
-        owner, opened, providers, allocator, entries, reachable);
+        owner, opened, providers, allocator, entries, reachable, mutableRoot);
     return entries;
 }
 
@@ -2329,7 +2356,8 @@ template<class Limits, class Allocator>
     OpenedDatabase& opened,
     ProviderSet& providers,
     const Allocator& allocator,
-    ExtentReferences<Allocator>* reachable = nullptr) {
+    ExtentReferences<Allocator>* reachable = nullptr,
+    MutableTreeNode<Allocator>* mutableRoot = nullptr) {
     auto blobs = makeBlobCatalog(allocator);
     const auto root = decodeExtentReference(opened.format.blobRoot);
     if (opened.format.generation == 1) {
@@ -2340,7 +2368,7 @@ template<class Limits, class Allocator>
     }
     auto catalogEntries = loadFixedTree<Limits>(
         file, root, 2, BlobId::encodedSize, 3, 4, 2, {},
-        opened, providers, allocator, reachable);
+        opened, providers, allocator, reachable, mutableRoot);
     using ReferenceAllocator = typename std::allocator_traits<Allocator>::
         template rebind_alloc<ExtentReference>;
     using VersionAllocator = typename std::allocator_traits<Allocator>::
@@ -2878,6 +2906,132 @@ template<class Limits, class Allocator, class Entries, class PrepareExtent>
     return nodes.front().reference;
 }
 
+template<class Limits, class Allocator, class PrepareExtent>
+[[nodiscard]] inline ExtentReference persistMutableFixedTree(
+    MutableTreeNode<Allocator>& root,
+    std::uint32_t role,
+    std::uint16_t internalKind,
+    std::uint16_t leafKind,
+    const Allocator& allocator,
+    PrepareExtent&& prepareExtent,
+    StoredVector<PreparedExactExtent<Allocator>, Allocator>& extents,
+    ExtentReferences<Allocator>& retainedReferences) {
+    using Entry = FixedLeafEntry<Allocator>;
+    using EntryAllocator = typename std::allocator_traits<Allocator>::
+        template rebind_alloc<Entry>;
+    using Node = PreparedTreeNode<Allocator>;
+    using NodeAllocator = typename std::allocator_traits<Allocator>::
+        template rebind_alloc<Node>;
+    constexpr auto pagePayloadBytes = std::max<std::uint64_t>(
+        16U * 1024U, Limits::allocationQuantumBytes) -
+        ExtentLayout::bytes - authenticationTagBytes;
+
+    while (root.level != 0 && root.children.size() == 1) {
+        auto collapsed = std::move(root.children.front());
+        root = std::move(collapsed);
+        root.dirty = true;
+    }
+    if ((root.level == 0 && root.values.empty()) ||
+        (root.level != 0 && root.children.empty())) {
+        return {};
+    }
+
+    const auto retainSubtree = [&](const auto& self, const auto& node) -> void {
+        retainedReferences.push_back(node.reference);
+        for (const auto& child : node.children) {
+            self(self, child);
+        }
+    };
+    const auto persistNode = [&](
+        const auto& self,
+        MutableTreeNode<Allocator>& node) -> StoredVector<Node, Allocator> {
+        if (!node.dirty) {
+            retainSubtree(retainSubtree, node);
+            StoredVector<Node, Allocator> retained{NodeAllocator{allocator}};
+            retained.push_back(Node{
+                node.reference, node.minimumKey, node.level});
+            return retained;
+        }
+        if (node.level == 0) {
+            StoredVector<Entry, Allocator> entries{EntryAllocator{allocator}};
+            entries.reserve(node.values.size());
+            for (const auto& value : node.values) {
+                if (value.value.size() != 32) {
+                    throw ContractError{
+                        Errc::InvalidState,
+                        "mutable fixed-tree reference has an invalid size"};
+                }
+                entries.push_back(Entry{
+                    value.key, decodeExtentReference(value.value)});
+            }
+            const auto ranges = balancedPageRanges(
+                entries.size(), pagePayloadBytes, allocator,
+                [&](std::size_t begin, std::size_t end) {
+                    return fixedLeafUsedLength(entries, begin, end);
+                });
+            StoredVector<Node, Allocator> result{NodeAllocator{allocator}};
+            for (const auto [begin, end] : ranges) {
+                auto payload = encodeFixedLeafPage<Limits>(
+                    entries, begin, end, role, allocator);
+                auto prepared = prepareExtent(payload, leafKind);
+                result.push_back(Node{
+                    prepared.reference, entries[begin].key, 0});
+                extents.push_back(std::move(prepared));
+            }
+            return result;
+        }
+        StoredVector<Node, Allocator> persistedChildren{
+            NodeAllocator{allocator}};
+        for (auto& child : node.children) {
+            auto replacements = self(self, child);
+            persistedChildren.insert(
+                persistedChildren.end(),
+                std::make_move_iterator(replacements.begin()),
+                std::make_move_iterator(replacements.end()));
+        }
+        const auto ranges = balancedPageRanges(
+            persistedChildren.size(), pagePayloadBytes, allocator,
+            [&](std::size_t begin, std::size_t end) {
+                return internalUsedLength<Allocator>(
+                    persistedChildren, begin, end);
+            });
+        StoredVector<Node, Allocator> result{NodeAllocator{allocator}};
+        for (const auto [begin, end] : ranges) {
+            auto payload = encodeInternalPage<Limits>(
+                persistedChildren, begin, end, allocator, role);
+            auto prepared = prepareExtent(payload, internalKind);
+            result.push_back(Node{
+                prepared.reference,
+                persistedChildren[begin].minimumKey,
+                persistedChildren[begin].level + 1});
+            extents.push_back(std::move(prepared));
+        }
+        return result;
+    };
+
+    auto nodes = persistNode(persistNode, root);
+    while (nodes.size() != 1) {
+        const auto ranges = balancedPageRanges(
+            nodes.size(), pagePayloadBytes, allocator,
+            [&](std::size_t begin, std::size_t end) {
+                return internalUsedLength<Allocator>(nodes, begin, end);
+            });
+        StoredVector<Node, Allocator> parents{NodeAllocator{allocator}};
+        for (const auto [begin, end] : ranges) {
+            auto payload = encodeInternalPage<Limits>(
+                nodes, begin, end, allocator, role);
+            auto prepared = prepareExtent(payload, internalKind);
+            parents.push_back(Node{
+                prepared.reference,
+                nodes[begin].minimumKey,
+                nodes[begin].level + 1});
+            extents.push_back(std::move(prepared));
+        }
+        nodes = std::move(parents);
+    }
+    return nodes.front().reference;
+}
+
 template<class Limits, class Allocator, class Runs, class PrepareExtent>
 [[nodiscard]] inline ExtentReference persistAllocatorIndex(
     const Runs& runs,
@@ -3207,6 +3361,7 @@ inline void commitExact(
         typename std::allocator_traits<Allocator>::
             template rebind_alloc<ExtentReference>{session.allocator}};
     MutableTreeNode<Allocator> mutableRoot{session.allocator};
+    MutableTreeNode<Allocator> mutableBlobRoot{session.allocator};
     (void)loadExactValues<Limits>(
         *session.file,
         session.opened,
@@ -3214,12 +3369,18 @@ inline void commitExact(
         session.allocator,
         &reachable,
         &mutableRoot);
+    ExtentReferences<Allocator> blobReachable{
+        typename std::allocator_traits<Allocator>::
+            template rebind_alloc<ExtentReference>{session.allocator}};
     (void)loadBlobCatalog<Limits>(
         *session.file,
         session.opened,
         *session.providers,
         session.allocator,
-        &reachable);
+        &blobReachable,
+        &mutableBlobRoot);
+    reachable.insert(
+        reachable.end(), blobReachable.begin(), blobReachable.end());
     ExtentRuns<Allocator> persistedFreeRuns{RunAllocator{session.allocator}};
     ExtentRuns<Allocator> persistedRetiredRuns{RunAllocator{session.allocator}};
     loadAllocatorReferences<Limits>(
@@ -3512,9 +3673,6 @@ inline void commitExact(
     using VersionAllocator = typename std::allocator_traits<Allocator>::
         template rebind_alloc<BlobVersion<Allocator>>;
     auto committedBlobs = makeBlobCatalog(session.allocator);
-    StoredVector<FixedEntry, Allocator> catalogEntries{
-        FixedEntryAllocator{session.allocator}};
-    catalogEntries.reserve(blobs.size());
     const auto prepareOwnedExtent = [&]<class Owner>(
         ByteView decoded,
         std::uint16_t unitKind,
@@ -3547,15 +3705,11 @@ inline void commitExact(
     };
     for (const auto& [id, version] : blobs) {
         const auto idBytes = id.toBytes();
-        StoredBytes<Allocator> catalogKey{ByteAllocator{session.allocator}};
-        catalogKey.assign(idBytes.begin(), idBytes.end());
         if (!version->pending) {
             retainedReferences.insert(
                 retainedReferences.end(),
                 version->reachable.begin(),
                 version->reachable.end());
-            catalogEntries.push_back(FixedEntry{
-                std::move(catalogKey), version->manifest});
             committedBlobs.emplace(id, version);
             continue;
         }
@@ -3641,21 +3795,39 @@ inline void commitExact(
             chunkRoot,
             std::move(chunkReferences),
             std::move(versionReachable));
-        catalogEntries.push_back(FixedEntry{
-            std::move(catalogKey), manifestReference});
         committedBlobs.emplace(id, std::move(committedVersion));
+    }
+    for (const auto& [id, version] : session.blobs) {
+        (void)version;
+        if (!committedBlobs.contains(id)) {
+            const auto idBytes = id.toBytes();
+            (void)eraseMutableTree(mutableBlobRoot, idBytes);
+        }
+    }
+    for (const auto& [id, version] : committedBlobs) {
+        const auto previous = session.blobs.find(id);
+        if (previous != session.blobs.end() &&
+            encodeExtentReference(previous->second->manifest) ==
+                encodeExtentReference(version->manifest)) {
+            continue;
+        }
+        const auto idBytes = id.toBytes();
+        const auto manifestBytes = encodeExtentReference(version->manifest);
+        putMutableTree(
+            mutableBlobRoot, idBytes, manifestBytes, session.allocator);
     }
     const auto prepareCatalog = [&](ByteView decoded, std::uint16_t kind) {
         return prepareExtent(decoded, kind);
     };
-    blobRoot = persistFixedTree<Limits>(
-        catalogEntries,
+    blobRoot = persistMutableFixedTree<Limits>(
+        mutableBlobRoot,
         2,
         3,
         4,
         session.allocator,
         prepareCatalog,
-        extents);
+        extents,
+        retainedReferences);
     subtractRetainedReferences(
         retiredRuns, retainedReferences, session.allocator);
     const auto eraseEmptyRuns = [&] {
