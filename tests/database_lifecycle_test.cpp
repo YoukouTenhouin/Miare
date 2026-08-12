@@ -131,6 +131,26 @@ void createCloseMoveAndReopen(const TemporaryDirectory& temporary) {
     reopened.value().close();
 }
 
+void cleanCloseRemovesRolledBackBlobTail(
+    const TemporaryDirectory& temporary) {
+    const auto path = temporary.path() / "rolled-back-blob-tail.miare";
+    auto database = miare::Database<>::create(
+        path,
+        miare::EncryptionKeyView{keyBytes},
+        deterministicProviders(74));
+    const auto committedBytes = std::filesystem::file_size(path);
+    auto transaction = database.beginWrite();
+    auto writer = transaction.createBlob();
+    writer.write(std::vector<std::byte>(
+        miare::DefaultLimits::blobChunkBytes, std::byte{0x74}));
+    assert(std::filesystem::file_size(path) > committedBytes);
+    writer.abort();
+    transaction.rollback();
+
+    database.close();
+    assert(std::filesystem::file_size(path) == committedBytes);
+}
+
 void wrongKeyAndBootstrapTamperingAreAuthenticationFailures(
     const TemporaryDirectory& temporary) {
     const auto path = temporary.path() / "authentication.miare";
@@ -356,6 +376,7 @@ void capacityProfileIdentityIsImmutable(const TemporaryDirectory& temporary) {
 int main() {
     TemporaryDirectory temporary;
     createCloseMoveAndReopen(temporary);
+    cleanCloseRemovesRolledBackBlobTail(temporary);
     wrongKeyAndBootstrapTamperingAreAuthenticationFailures(temporary);
     visibleCompatibilityFieldsHaveStableErrors(temporary);
     oneAuthenticPublicationSlotIsEnough(temporary);
