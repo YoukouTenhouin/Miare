@@ -442,7 +442,9 @@ private:
         }
         const auto transferredBytes = operationFailure_->transferredBytes;
         operationFailure_.reset();
-        if (transferredBytes > requestedBytes ||
+        if ((kind == DurableFileOperationKind::Write &&
+             transferredBytes >= requestedBytes) ||
+            transferredBytes > requestedBytes ||
             (kind != DurableFileOperationKind::Write && transferredBytes != 0)) {
             throw ContractError{
                 Errc::InvalidArgument,

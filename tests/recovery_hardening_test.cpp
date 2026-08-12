@@ -317,9 +317,87 @@ void everyPublicationSectorSubsetSelectsOneCompleteGeneration() {
     }
 }
 
+void shortAndTornWritesCannotExposeMixedState() {
+    const auto fixture = predecessorFixture();
+    auto traceFile = std::make_unique<miare::testing::MemoryDurableFile>();
+    auto* traceFileView = traceFile.get();
+    traceFile->replaceStableBytes(fixture.image);
+    auto traceOpened = miare::testing::DatabaseAccess::open<
+        std::allocator<std::byte>, RecoveryLimits>(
+        std::move(traceFile),
+        miare::EncryptionKeyView{encryptionKey},
+        deterministicProviders(800));
+    assert(traceOpened);
+    auto traceDatabase = std::move(traceOpened).value();
+    traceFileView->clearOperations();
+    const auto trace = applyCandidate(
+        traceDatabase, *traceFileView, fixture.blobId);
+    traceDatabase.close();
+
+    std::uint64_t providerSeed = 900;
+    for (std::size_t operationIndex = 0;
+         operationIndex <= trace.publicationOperation;
+         ++operationIndex) {
+        const auto& operation = trace.operations[operationIndex];
+        if (operation.kind != miare::testing::DurableFileOperationKind::Write ||
+            operation.requestedBytes == 0) {
+            continue;
+        }
+        const std::array<std::size_t, 5> candidatePoints{
+            0,
+            std::min<std::size_t>(1, operation.requestedBytes - 1),
+            std::min<std::size_t>(512, operation.requestedBytes - 1),
+            std::min<std::size_t>(
+                RecoveryLimits::allocationQuantumBytes,
+                operation.requestedBytes - 1),
+            operation.requestedBytes - 1};
+        std::vector<std::size_t> tearPoints{
+            candidatePoints.begin(), candidatePoints.end()};
+        std::sort(tearPoints.begin(), tearPoints.end());
+        tearPoints.erase(
+            std::unique(tearPoints.begin(), tearPoints.end()),
+            tearPoints.end());
+        for (const auto tearPoint : tearPoints) {
+            auto file = std::make_unique<miare::testing::MemoryDurableFile>();
+            auto* fileView = file.get();
+            file->replaceStableBytes(fixture.image);
+            auto opened = miare::testing::DatabaseAccess::open<
+                std::allocator<std::byte>, RecoveryLimits>(
+                std::move(file),
+                miare::EncryptionKeyView{encryptionKey},
+                deterministicProviders(providerSeed++));
+            assert(opened);
+            auto database = std::move(opened).value();
+            fileView->clearOperations();
+            fileView->failOperation(operationIndex, tearPoint);
+            try {
+                (void)applyCandidate(database, *fileView, fixture.blobId);
+                assert(false);
+            } catch (const miare::DatabaseError& error) {
+                const auto expected =
+                    operationIndex < trace.commitOperationStart
+                    ? miare::Errc::Io
+                    : operationIndex < trace.publicationOperation
+                        ? miare::Errc::CommitFailed
+                        : miare::Errc::CommitOutcomeUnknown;
+                assert(error.code() == expected);
+            }
+            std::vector<std::size_t> retained(
+                fileView->unbarrieredMutationCount());
+            for (std::size_t index = 0; index != retained.size(); ++index) {
+                retained[index] = index;
+            }
+            fileView->simulateCrash(retained);
+            assertPredecessor(
+                fileView->bytes(), fixture.blobId, providerSeed++);
+        }
+    }
+}
+
 } // namespace
 
 int main() {
     everyPersistenceOperationCanBeInterruptedBeforeMutation();
     everyPublicationSectorSubsetSelectsOneCompleteGeneration();
+    shortAndTornWritesCannotExposeMixedState();
 }
