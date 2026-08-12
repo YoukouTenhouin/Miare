@@ -39,6 +39,11 @@ target_link_libraries(miare_recovery_hardening_test PRIVATE miare::miare)
 add_test(NAME miare.recovery_hardening COMMAND miare_recovery_hardening_test)
 set_tests_properties(miare.recovery_hardening PROPERTIES TIMEOUT 60)
 
+add_executable(miare_maintenance_test maintenance_test.cpp)
+target_link_libraries(miare_maintenance_test PRIVATE miare::miare)
+add_test(NAME miare.maintenance COMMAND miare_maintenance_test)
+set_tests_properties(miare.maintenance PROPERTIES TIMEOUT 60)
+
 add_executable(miare_database_format_test database_format_test.cpp)
 target_link_libraries(miare_database_format_test PRIVATE miare::miare)
 add_test(NAME miare.database_format COMMAND miare_database_format_test)

@@ -124,6 +124,7 @@ public:
     using OwnedBytes = std::vector<
         std::byte,
         typename std::allocator_traits<Allocator>::template rebind_alloc<std::byte>>;
+    using VerificationReport = BasicVerificationReport<Allocator>;
 
 public:
     using ReadCursor = detail::OrderedCursor<Allocator, Limits, false>;
@@ -1302,6 +1303,7 @@ public:
         result.oldestReaderGeneration = oldestReaderGeneration;
         result.oldestReaderAge = oldestReaderAge;
         result.writerActive = session.writerActive;
+        result.maintenanceActive = session.maintenanceActive;
         result.writerQueueDepth = static_cast<std::uint32_t>(
             session.waitingWriters);
         result.recoveryRequired = current == DatabaseState::RecoveryRequired;
@@ -1468,6 +1470,89 @@ public:
         ++session.liveTransactions;
         result.value().active_ = true;
         return result;
+    }
+
+    void checkpoint() {
+        auto& session = requireSession();
+        std::shared_lock operation{session.operationMutex};
+        acquireMaintenance(session);
+        try {
+            ensureValuesLoaded(session);
+            ensureBlobsLoaded(session);
+            ensureAllocatorSnapshotLoaded(session);
+            bool eligibleRetirement = false;
+            {
+                std::lock_guard lock{session.mutex};
+                auto oldestReader = std::numeric_limits<std::uint64_t>::max();
+                for (const auto& [identity, reader] : session.activeReaders) {
+                    (void)identity;
+                    oldestReader = std::min(oldestReader, reader.generation);
+                }
+                eligibleRetirement = std::any_of(
+                    session.retiredBlocksByGeneration.begin(),
+                    session.retiredBlocksByGeneration.end(),
+                    [oldestReader](const auto& retirement) {
+                        return oldestReader >= retirement.first;
+                    });
+            }
+            if (eligibleRetirement) {
+                auto blobState = makeWriteBlobState(session);
+                detail::commitExact<Limits>(
+                    session,
+                    session.values,
+                    session.blobs,
+                    *blobState,
+                    true);
+            }
+            removeAbandonedTail(session, RecoveryCause::MaintenancePersistenceFailed);
+        } catch (const DatabaseError& error) {
+            releaseMaintenance(session);
+            operation.unlock();
+            if (error.code() == Errc::Corrupt) {
+                enterRecoveryAfterCorruption(session, *lifetime_);
+            }
+            throw;
+        } catch (...) {
+            releaseMaintenance(session);
+            throw;
+        }
+        releaseMaintenance(session);
+    }
+
+    void compact() {
+        checkpoint();
+    }
+
+    [[nodiscard]] VerificationReport verify() {
+        auto& session = requireSession();
+        std::shared_lock operation{session.operationMutex};
+        acquireMaintenance(session);
+        try {
+            auto report = verifyOpened(
+                *session.file,
+                session.opened,
+                *session.providers,
+                session.allocator);
+            releaseMaintenance(session);
+            return report;
+        } catch (const DatabaseError& error) {
+            releaseMaintenance(session);
+            if (error.code() != Errc::Corrupt) {
+                throw;
+            }
+            VerificationReport report{session.allocator};
+            report.valid = false;
+            report.selectedGeneration = session.opened.format.generation;
+            report.findings.push_back(VerificationFinding{
+                VerificationSeverity::Corruption,
+                VerificationFindingCode::CanonicalEncodingInvalid});
+            operation.unlock();
+            enterRecoveryAfterCorruption(session, *lifetime_);
+            return report;
+        } catch (...) {
+            releaseMaintenance(session);
+            throw;
+        }
     }
 
     void close() {
@@ -1780,6 +1865,188 @@ private:
         session.allocatorSnapshotLoaded = true;
     }
 
+    static void acquireMaintenance(Session& session) {
+        std::unique_lock lock{session.mutex};
+        requireOpen(session);
+        if (session.nextWriterTicket ==
+            std::numeric_limits<std::uint64_t>::max()) {
+            session.capacityFailureCount.fetch_add(
+                1, std::memory_order_relaxed);
+            throw DatabaseError{
+                Errc::ResourceLimit,
+                "maintenance admission sequence exhausted"};
+        }
+        const auto ticket = session.nextWriterTicket++;
+        ++session.waitingWriters;
+        session.writerAvailable.wait(lock, [&] {
+            return session.state.load(std::memory_order_acquire) !=
+                    DatabaseState::Open ||
+                (!session.writerActive &&
+                 ticket == session.servingWriterTicket);
+        });
+        --session.waitingWriters;
+        requireOpen(session);
+        session.writerActive = true;
+        session.maintenanceActive = true;
+    }
+
+    static void releaseMaintenance(Session& session) noexcept {
+        try {
+            std::lock_guard lock{session.mutex};
+            if (!session.maintenanceActive) {
+                return;
+            }
+            session.maintenanceActive = false;
+            session.writerActive = false;
+            ++session.servingWriterTicket;
+            session.writerAvailable.notify_all();
+        } catch (...) {
+        }
+    }
+
+    static void removeAbandonedTail(
+        Session& session,
+        RecoveryCause failureCause) {
+        const auto physicalBytes = session.file->size();
+        const auto highWaterBytes = session.opened.format.highWaterBytes;
+        if (physicalBytes < highWaterBytes) {
+            detail::throwCorrupt(
+                "database file is shorter than its committed high-water mark");
+        }
+        if (physicalBytes == highWaterBytes) {
+            session.opened.abandonedTailBytes = 0;
+            return;
+        }
+        try {
+            session.file->resize(highWaterBytes);
+            session.file->stableStorageBarrier();
+            session.opened.abandonedTailBytes = 0;
+        } catch (...) {
+            session.recoveryCause.store(failureCause, std::memory_order_release);
+            session.state.store(
+                DatabaseState::RecoveryRequired, std::memory_order_release);
+            throw;
+        }
+    }
+
+    [[nodiscard]] static VerificationExtentRole verificationRole(
+        std::uint16_t kind) noexcept {
+        switch (kind) {
+        case 1: return VerificationExtentRole::OrderedInternal;
+        case 2: return VerificationExtentRole::OrderedLeaf;
+        case 3: return VerificationExtentRole::BlobCatalogInternal;
+        case 4: return VerificationExtentRole::BlobCatalogLeaf;
+        case 5: return VerificationExtentRole::BlobChunkIndexInternal;
+        case 6: return VerificationExtentRole::BlobChunkIndexLeaf;
+        case 7: return VerificationExtentRole::FreeIndexInternal;
+        case 8: return VerificationExtentRole::FreeIndexLeaf;
+        case 9: return VerificationExtentRole::RetiredIndexInternal;
+        case 10: return VerificationExtentRole::RetiredIndexLeaf;
+        case 11: return VerificationExtentRole::OverflowValue;
+        case 12: return VerificationExtentRole::BlobManifest;
+        case 13: return VerificationExtentRole::BlobChunk;
+        case 14: return VerificationExtentRole::AllocatorRoot;
+        default: return VerificationExtentRole::Unknown;
+        }
+    }
+
+    [[nodiscard]] static VerificationReport verifyOpened(
+        detail::DurableFile& file,
+        detail::OpenedDatabase& opened,
+        ProviderSet& providers,
+        const Allocator& allocator) {
+        using ReferenceAllocator = typename std::allocator_traits<Allocator>::
+            template rebind_alloc<detail::ExtentReference>;
+        using RunAllocator = typename std::allocator_traits<Allocator>::
+            template rebind_alloc<detail::ExtentRun>;
+        detail::ExtentReferences<Allocator> reachable{
+            ReferenceAllocator{allocator}};
+        const auto values = detail::loadExactValues<Limits>(
+            file, opened, providers, allocator, &reachable);
+        detail::ExtentReferences<Allocator> blobReachable{
+            ReferenceAllocator{allocator}};
+        const auto blobs = detail::loadBlobCatalog<Limits>(
+            file, opened, providers, allocator, &blobReachable);
+        reachable.insert(
+            reachable.end(), blobReachable.begin(), blobReachable.end());
+        detail::ExtentRuns<Allocator> freeRuns{RunAllocator{allocator}};
+        detail::ExtentRuns<Allocator> retiredRuns{RunAllocator{allocator}};
+        detail::loadAllocatorReferences<Limits>(
+            file,
+            opened,
+            providers,
+            allocator,
+            reachable,
+            &freeRuns,
+            &retiredRuns);
+
+        VerificationReport report{allocator};
+        report.selectedGeneration = opened.format.generation;
+        report.keysChecked = values.size();
+        report.blobsChecked = blobs.size();
+        for (const auto& [id, version] : blobs) {
+            report.blobChunksChecked += version->chunks.size();
+            const auto owner = id.toBytes();
+            for (std::uint64_t ordinal = 0;
+                 ordinal != version->chunks.size();
+                 ++ordinal) {
+                const auto expectedLength = ordinal + 1 ==
+                        version->chunks.size()
+                    ? version->size - ordinal * Limits::blobChunkBytes
+                    : Limits::blobChunkBytes;
+                (void)detail::readAuthenticatedExtent<Limits>(
+                    file,
+                    version->chunks[ordinal],
+                    13,
+                    expectedLength,
+                    opened,
+                    providers,
+                    allocator,
+                    true,
+                    4,
+                    ordinal,
+                    owner);
+            }
+        }
+        report.extentsChecked = reachable.size();
+        report.liveBlocks =
+            detail::commonRegionBytes / Limits::allocationQuantumBytes;
+        for (const auto& reference : reachable) {
+            report.liveBlocks += reference.blockCount;
+            report.encodedBytesChecked += reference.encodedLength;
+            std::array<std::byte, detail::ExtentLayout::bytes> preamble{};
+            file.readExactAt(
+                reference.blockIndex * Limits::allocationQuantumBytes,
+                preamble);
+            report.decodedBytesChecked +=
+                detail::readLittleEndian<std::uint64_t>(
+                    preamble, detail::ExtentLayout::decodedLength);
+            (void)verificationRole(
+                detail::readLittleEndian<std::uint16_t>(
+                    preamble, detail::ExtentLayout::unitKind));
+        }
+        for (const auto& run : freeRuns) {
+            report.freeBlocks += run.count;
+        }
+        for (const auto& run : retiredRuns) {
+            report.retiredBlocks += run.count;
+        }
+        report.abandonedTailBlocks =
+            opened.abandonedTailBytes / Limits::allocationQuantumBytes +
+            (opened.abandonedTailBytes % Limits::allocationQuantumBytes != 0);
+        if (opened.rejectedInactivePublication) {
+            report.findings.push_back(VerificationFinding{
+                VerificationSeverity::Observation,
+                VerificationFindingCode::IncompleteInactivePublication});
+        }
+        if (opened.abandonedTailBytes != 0) {
+            report.findings.push_back(VerificationFinding{
+                VerificationSeverity::Observation,
+                VerificationFindingCode::AbandonedTail});
+        }
+        return report;
+    }
+
     static void consolidateAbandonedTailForClose(
         Session& session,
         DatabaseState previousState) {
@@ -1836,6 +2103,7 @@ private:
             session.activeReaders.clear();
             session.waitingWriters = 0;
             session.writerActive = false;
+            session.maintenanceActive = false;
             eraseSessionKeys(session);
             session.file.reset();
             session.providers.reset();
