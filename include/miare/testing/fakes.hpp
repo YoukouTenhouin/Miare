@@ -5,6 +5,7 @@
 #include <miare/detail/providers.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -151,6 +152,7 @@ public:
     [[nodiscard]] std::size_t compress(
         ByteView input,
         MutableByteView output) override {
+        compressionCalls_.fetch_add(1, std::memory_order_relaxed);
         failProviderIfRequested();
         if (reportExcessiveOutput_) {
             reportExcessiveOutput_ = false;
@@ -165,6 +167,7 @@ public:
     }
 
     void decompress(ByteView frame, MutableByteView output) override {
+        decompressionCalls_.fetch_add(1, std::memory_order_relaxed);
         failProviderIfRequested();
         delegate_.decompress(frame, output);
     }
@@ -177,9 +180,21 @@ public:
         requestMaximumOutputStorage_ = true;
     }
     void reportExcessiveOutput() noexcept { reportExcessiveOutput_ = true; }
+    void resetOperationCounts() noexcept {
+        compressionCalls_.store(0, std::memory_order_relaxed);
+        decompressionCalls_.store(0, std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::size_t compressionCalls() const noexcept {
+        return compressionCalls_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::size_t decompressionCalls() const noexcept {
+        return decompressionCalls_.load(std::memory_order_relaxed);
+    }
 
 private:
     detail::ZstdCompressionProvider delegate_;
+    std::atomic<std::size_t> compressionCalls_{0};
+    std::atomic<std::size_t> decompressionCalls_{0};
     bool corruptFrame_ = false;
     bool requestMaximumOutputStorage_ = false;
     bool reportExcessiveOutput_ = false;

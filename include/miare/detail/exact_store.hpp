@@ -568,6 +568,14 @@ struct PreparedExactExtent {
 };
 
 template<class Allocator>
+struct PreparedExtentPayload {
+    StoredBytes<Allocator> stored;
+    std::uint64_t decodedLength;
+    std::uint32_t flags;
+    std::uint32_t codec;
+};
+
+template<class Allocator>
 struct PersistedLeafEntry {
     const StoredBytes<Allocator>* key;
     const StoredBytes<Allocator>* value;
@@ -588,21 +596,14 @@ struct PreparedTreeNode {
 };
 
 template<class Limits, class Allocator>
-[[nodiscard]] inline PreparedExactExtent<Allocator> prepareAuthenticatedExtent(
+[[nodiscard]] inline PreparedExtentPayload<Allocator> prepareExtentPayload(
     ByteView decoded,
-    std::uint16_t unitKind,
-    std::uint64_t generation,
-    std::uint64_t blockIndex,
     OpenedDatabase& opened,
     ProviderSet& providers,
     const Allocator& allocator,
-    bool compressionEligible = true,
-    std::uint32_t keyDomain = 2,
-    std::uint64_t sequence = 0,
-    ByteView owner = {}) {
+    bool compressionEligible) {
     using ByteAllocator = typename std::allocator_traits<Allocator>::
         template rebind_alloc<std::byte>;
-    auto& crypto = ProviderAccess::crypto(providers);
     StoredBytes<Allocator> stored{ByteAllocator{allocator}};
     stored.assign(decoded.begin(), decoded.end());
     std::uint32_t flags = 0;
@@ -660,9 +661,27 @@ template<class Limits, class Allocator>
             codec = 1;
         }
     }
+    return PreparedExtentPayload<Allocator>{
+        std::move(stored), decoded.size(), flags, codec};
+}
 
+template<class Limits, class Allocator>
+[[nodiscard]] inline PreparedExactExtent<Allocator> sealAuthenticatedExtent(
+    const PreparedExtentPayload<Allocator>& payload,
+    std::uint16_t unitKind,
+    std::uint64_t generation,
+    std::uint64_t blockIndex,
+    OpenedDatabase& opened,
+    ProviderSet& providers,
+    const Allocator& allocator,
+    std::uint32_t keyDomain,
+    std::uint64_t sequence,
+    ByteView owner) {
+    using ByteAllocator = typename std::allocator_traits<Allocator>::
+        template rebind_alloc<std::byte>;
+    auto& crypto = ProviderAccess::crypto(providers);
     const auto encodedLength =
-        ExtentLayout::bytes + stored.size() + authenticationTagBytes;
+        ExtentLayout::bytes + payload.stored.size() + authenticationTagBytes;
     const auto blockCount =
         (encodedLength + Limits::allocationQuantumBytes - 1) /
         Limits::allocationQuantumBytes;
@@ -677,18 +696,21 @@ template<class Limits, class Allocator>
     writeBytes(output, ExtentLayout::magic, "MIAREXT\0");
     writeLittleEndian<std::uint16_t>(1, output, ExtentLayout::version);
     writeLittleEndian<std::uint16_t>(unitKind, output, ExtentLayout::unitKind);
-    writeLittleEndian<std::uint32_t>(flags, output, ExtentLayout::flags);
+    writeLittleEndian<std::uint32_t>(payload.flags, output, ExtentLayout::flags);
     writeLittleEndian<std::uint32_t>(
         keyDomain, output, ExtentLayout::keyDomain);
-    writeLittleEndian<std::uint32_t>(codec, output, ExtentLayout::codec);
-    writeLittleEndian<std::uint32_t>(codec, output, ExtentLayout::codecProfile);
+    writeLittleEndian<std::uint32_t>(payload.codec, output, ExtentLayout::codec);
+    writeLittleEndian<std::uint32_t>(
+        payload.codec, output, ExtentLayout::codecProfile);
     writeLittleEndian<std::uint32_t>(
         ExtentLayout::bytes, output, ExtentLayout::preambleLength);
     writeLittleEndian<std::uint64_t>(blockIndex, output, ExtentLayout::blockIndex);
     writeLittleEndian<std::uint64_t>(blockCount, output, ExtentLayout::blockCount);
     writeLittleEndian<std::uint64_t>(encodedLength, output, ExtentLayout::encodedLength);
-    writeLittleEndian<std::uint64_t>(stored.size(), output, ExtentLayout::storedLength);
-    writeLittleEndian<std::uint64_t>(decoded.size(), output, ExtentLayout::decodedLength);
+    writeLittleEndian<std::uint64_t>(
+        payload.stored.size(), output, ExtentLayout::storedLength);
+    writeLittleEndian<std::uint64_t>(
+        payload.decodedLength, output, ExtentLayout::decodedLength);
     writeLittleEndian<std::uint64_t>(generation, output, ExtentLayout::generation);
     writeLittleEndian<std::uint64_t>(sequence, output, ExtentLayout::sequence);
     if (!owner.empty()) {
@@ -707,12 +729,41 @@ template<class Limits, class Allocator>
     crypto.encryptDetached(
         keyDomain == 4 ? opened.keys.blob.view() : opened.keys.mainData.view(),
         nonce,
-        stored,
+        payload.stored,
         associatedData,
-        MutableByteView{extent}.subspan(ExtentLayout::bytes, stored.size()),
         MutableByteView{extent}.subspan(
-            ExtentLayout::bytes + stored.size(), authenticationTagBytes));
+            ExtentLayout::bytes, payload.stored.size()),
+        MutableByteView{extent}.subspan(
+            ExtentLayout::bytes + payload.stored.size(), authenticationTagBytes));
     return PreparedExactExtent<Allocator>{reference, std::move(extent)};
+}
+
+template<class Limits, class Allocator>
+[[nodiscard]] inline PreparedExactExtent<Allocator> prepareAuthenticatedExtent(
+    ByteView decoded,
+    std::uint16_t unitKind,
+    std::uint64_t generation,
+    std::uint64_t blockIndex,
+    OpenedDatabase& opened,
+    ProviderSet& providers,
+    const Allocator& allocator,
+    bool compressionEligible = true,
+    std::uint32_t keyDomain = 2,
+    std::uint64_t sequence = 0,
+    ByteView owner = {}) {
+    auto payload = prepareExtentPayload<Limits>(
+        decoded, opened, providers, allocator, compressionEligible);
+    return sealAuthenticatedExtent<Limits>(
+        payload,
+        unitKind,
+        generation,
+        blockIndex,
+        opened,
+        providers,
+        allocator,
+        keyDomain,
+        sequence,
+        owner);
 }
 
 template<class Limits, class Allocator, class Entries>
@@ -2547,63 +2598,57 @@ template<class Limits, class Allocator>
     auto& session = *state.session;
     const auto owner = id.toBytes();
     const auto generation = session.opened.format.generation + 1;
-    auto prepared = prepareAuthenticatedExtent<Limits>(
+    auto payload = prepareExtentPayload<Limits>(
         decoded,
-        13,
-        generation,
-        state.stagingNextBlock,
         session.opened,
         *session.providers,
         session.allocator,
-        true,
-        4,
-        ordinal,
-        owner);
+        true);
+    const auto encodedLength =
+        ExtentLayout::bytes + payload.stored.size() + authenticationTagBytes;
+    const auto blockCount =
+        (encodedLength + Limits::allocationQuantumBytes - 1) /
+        Limits::allocationQuantumBytes;
     state.stagingFreeRuns.reserve(
         state.stagingFreeRuns.size() +
         state.abortableStagingReferences + 1);
     auto allocated = state.stagingNextBlock;
     bool appended = true;
     for (auto& run : state.stagingFreeRuns) {
-        if (run.count >= prepared.reference.blockCount) {
+        if (run.count >= blockCount) {
             allocated = run.start;
-            run.start += prepared.reference.blockCount;
-            run.count -= prepared.reference.blockCount;
+            run.start += blockCount;
+            run.count -= blockCount;
             appended = false;
             break;
         }
     }
     if (appended) {
-        state.stagingNextBlock += prepared.reference.blockCount;
+        state.stagingNextBlock += blockCount;
     }
     const ExtentReference reserved{
         allocated,
-        prepared.reference.blockCount,
-        prepared.reference.encodedLength,
+        blockCount,
+        encodedLength,
         generation};
     try {
-        if (allocated != prepared.reference.blockIndex) {
-            prepared = prepareAuthenticatedExtent<Limits>(
-                decoded,
-                13,
-                generation,
-                allocated,
-                session.opened,
-                *session.providers,
-                session.allocator,
-                true,
-                4,
-                ordinal,
-                owner);
-        }
-        if (allocated > std::numeric_limits<std::uint64_t>::max() -
-                prepared.reference.blockCount) {
+        auto prepared = sealAuthenticatedExtent<Limits>(
+            payload,
+            13,
+            generation,
+            allocated,
+            session.opened,
+            *session.providers,
+            session.allocator,
+            4,
+            ordinal,
+            owner);
+        if (allocated > std::numeric_limits<std::uint64_t>::max() - blockCount) {
             throw DatabaseError{
                 Errc::ResourceLimit,
                 "Blob staging block range is not representable"};
         }
-        const auto requiredBlocks =
-            allocated + prepared.reference.blockCount;
+        const auto requiredBlocks = allocated + blockCount;
         if (requiredBlocks > std::numeric_limits<std::uint64_t>::max() /
                 Limits::allocationQuantumBytes) {
             throw DatabaseError{
@@ -2639,6 +2684,15 @@ template<class Limits, class Allocator>
         ++state.abortableStagingReferences;
         return prepared.reference;
     } catch (...) {
+        try {
+            std::lock_guard lock{session.mutex};
+            const auto physicalBytes = session.file->size();
+            session.opened.abandonedTailBytes =
+                physicalBytes > session.opened.format.highWaterBytes
+                ? physicalBytes - session.opened.format.highWaterBytes
+                : 0;
+        } catch (...) {
+        }
         insertBlobStagingFreeRun<Allocator>(
             state.stagingFreeRuns,
             ExtentRun{reserved.blockIndex, reserved.blockCount});
@@ -3285,26 +3339,29 @@ inline void commitExact(
         return allocated;
     };
     auto prepareExtent = [&](ByteView decoded, std::uint16_t unitKind) {
-        auto prepared = prepareAuthenticatedExtent<Limits>(
+        auto payload = prepareExtentPayload<Limits>(
             decoded,
-            unitKind,
-            generation,
-            nextBlock,
             session.opened,
             *session.providers,
-            session.allocator);
-        const auto allocated = allocateBlocks(prepared.reference.blockCount);
-        if (allocated != prepared.reference.blockIndex) {
-            prepared = prepareAuthenticatedExtent<Limits>(
-                decoded,
-                unitKind,
-                generation,
-                allocated,
-                session.opened,
-                *session.providers,
-                session.allocator);
-        }
-        return prepared;
+            session.allocator,
+            true);
+        const auto encodedLength =
+            ExtentLayout::bytes + payload.stored.size() + authenticationTagBytes;
+        const auto blockCount =
+            (encodedLength + Limits::allocationQuantumBytes - 1) /
+            Limits::allocationQuantumBytes;
+        const auto allocated = allocateBlocks(blockCount);
+        return sealAuthenticatedExtent<Limits>(
+            payload,
+            unitKind,
+            generation,
+            allocated,
+            session.opened,
+            *session.providers,
+            session.allocator,
+            2,
+            0,
+            {});
     };
     if (!values.empty()) {
         if (mutableRoot.reference.null()) {
@@ -3462,34 +3519,29 @@ inline void commitExact(
         bool compressionEligible,
         std::uint64_t sequence,
         const Owner& owner) {
-        auto prepared = prepareAuthenticatedExtent<Limits>(
+        auto payload = prepareExtentPayload<Limits>(
             decoded,
-            unitKind,
-            generation,
-            nextBlock,
             session.opened,
             *session.providers,
             session.allocator,
-            compressionEligible,
+            compressionEligible);
+        const auto encodedLength =
+            ExtentLayout::bytes + payload.stored.size() + authenticationTagBytes;
+        const auto blockCount =
+            (encodedLength + Limits::allocationQuantumBytes - 1) /
+            Limits::allocationQuantumBytes;
+        const auto allocated = allocateBlocks(blockCount);
+        return sealAuthenticatedExtent<Limits>(
+            payload,
+            unitKind,
+            generation,
+            allocated,
+            session.opened,
+            *session.providers,
+            session.allocator,
             4,
             sequence,
             owner);
-        const auto allocated = allocateBlocks(prepared.reference.blockCount);
-        if (allocated != prepared.reference.blockIndex) {
-            prepared = prepareAuthenticatedExtent<Limits>(
-                decoded,
-                unitKind,
-                generation,
-                allocated,
-                session.opened,
-                *session.providers,
-                session.allocator,
-                compressionEligible,
-                4,
-                sequence,
-                owner);
-        }
-        return prepared;
     };
     for (const auto& [id, version] : blobs) {
         const auto idBytes = id.toBytes();

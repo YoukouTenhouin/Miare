@@ -7,6 +7,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <type_traits>
 #include <vector>
@@ -750,6 +751,19 @@ void stagingIoFailurePreservesWriterContents() {
     });
     assert(writer.position() == 0);
     assert(transaction.stats().blobBytesWritten == 0);
+
+    fileView->setMaxTransferBytes(128);
+    fileView->failAfterTransferredBytes(128);
+    expectDatabaseError(miare::Errc::Io, [&] {
+        writer.write(content);
+    });
+    const auto failedDiagnostics = database.diagnostics();
+    assert(failedDiagnostics.abandonedTailBytes > 0);
+    assert(failedDiagnostics.mainFileBytes == fileView->size());
+    assert(writer.position() == 0);
+    assert(transaction.stats().blobBytesWritten == 0);
+    fileView->setMaxTransferBytes(std::numeric_limits<std::size_t>::max());
+
     writer.write(content);
     assert(writer.position() == content.size());
     writer.finish();
@@ -763,6 +777,49 @@ void stagingIoFailurePreservesWriterContents() {
     assert(output == content);
     reader->close();
     read.end();
+    database.close();
+}
+
+void reusedStagingAllocationCompressesOnce() {
+    auto file = std::make_unique<miare::testing::MemoryDurableFile>();
+    auto* fileView = file.get();
+    auto compression =
+        std::make_unique<miare::testing::FaultInjectingCompressionProvider>();
+    auto* compressionView = compression.get();
+    auto providers = miare::detail::ProviderAccess::make(
+        std::make_unique<miare::testing::DeterministicCryptoProvider>(23),
+        std::move(compression));
+    auto database = miare::testing::DatabaseAccess::create<
+        std::allocator<std::byte>, SmallChunkLimits>(
+        std::move(file),
+        miare::EncryptionKeyView{encryptionKey},
+        std::move(providers));
+    std::vector<std::byte> content(
+        SmallChunkLimits::blobChunkBytes, std::byte{0x35});
+
+    auto original = database.beginWrite();
+    auto originalWriter = original.createBlob();
+    const auto originalId = originalWriter.id();
+    originalWriter.write(content);
+    originalWriter.write(content);
+    originalWriter.finish();
+    original.commit();
+
+    auto erasing = database.beginWrite();
+    assert(erasing.eraseBlob(originalId));
+    erasing.commit();
+
+    auto replacement = database.beginWrite();
+    auto replacementWriter = replacement.createBlob();
+    replacementWriter.write(content);
+    compressionView->resetOperationCounts();
+    const auto physicalBytes = fileView->size();
+    replacementWriter.write(content);
+    assert(fileView->size() == physicalBytes);
+    assert(compressionView->compressionCalls() == 1);
+    assert(compressionView->decompressionCalls() == 1);
+    replacementWriter.abort();
+    replacement.rollback();
     database.close();
 }
 
@@ -980,6 +1037,7 @@ int main() {
     failedCommitPublishesNeitherValueNorBlob();
     stagingIoFailurePreservesWriterContents();
     stagingProviderFailurePreservesWriterContents();
+    reusedStagingAllocationCompressesOnce();
     stagingAllocatorCorruptionMakesChildrenTerminal();
     writerConstructionFailurePreservesTransactionContents();
     abortUsesPreallocatedStagingBookkeeping();
