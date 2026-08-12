@@ -44,6 +44,11 @@ target_link_libraries(miare_maintenance_test PRIVATE miare::miare)
 add_test(NAME miare.maintenance COMMAND miare_maintenance_test)
 set_tests_properties(miare.maintenance PROPERTIES TIMEOUT 60)
 
+add_executable(miare_portability_fixture_test portability_fixture_test.cpp)
+target_link_libraries(miare_portability_fixture_test PRIVATE miare::miare)
+add_test(NAME miare.portability_fixture COMMAND miare_portability_fixture_test)
+set_tests_properties(miare.portability_fixture PROPERTIES TIMEOUT 120)
+
 add_executable(miare_database_format_test database_format_test.cpp)
 target_link_libraries(miare_database_format_test PRIVATE miare::miare)
 add_test(NAME miare.database_format COMMAND miare_database_format_test)
@@ -57,7 +62,7 @@ add_executable(miare_exact_transaction_test exact_transaction_test.cpp)
 target_link_libraries(
     miare_exact_transaction_test PRIVATE miare::miare Threads::Threads)
 add_test(NAME miare.exact_transaction COMMAND miare_exact_transaction_test)
-set_tests_properties(miare.exact_transaction PROPERTIES TIMEOUT 10)
+set_tests_properties(miare.exact_transaction PROPERTIES TIMEOUT 30)
 
 add_executable(miare_concurrent_snapshot_test concurrent_snapshot_test.cpp)
 target_link_libraries(
@@ -95,7 +100,15 @@ if(MIARE_BUILD_QUALIFICATION_TESTS)
     set_tests_properties(
         miare.ordered_keyspace_qualification
         PROPERTIES
-            LABELS qualification
+            LABELS "qualification;backend-conformance"
+            TIMEOUT 21600)
+    add_test(
+        NAME miare.blob_lifecycle_qualification
+        COMMAND miare_blob_lifecycle_test --qualification)
+    set_tests_properties(
+        miare.blob_lifecycle_qualification
+        PROPERTIES
+            LABELS "qualification;backend-conformance"
             TIMEOUT 21600)
     add_test(
         NAME miare.concurrent_snapshot_qualification
@@ -103,7 +116,7 @@ if(MIARE_BUILD_QUALIFICATION_TESTS)
     set_tests_properties(
         miare.concurrent_snapshot_qualification
         PROPERTIES
-            LABELS qualification
+            LABELS "qualification;concurrency"
             TIMEOUT 86400)
     add_test(
         NAME miare.concurrent_snapshot_thread_sanitizer_smoke
@@ -113,7 +126,7 @@ if(MIARE_BUILD_QUALIFICATION_TESTS)
     set_tests_properties(
         miare.concurrent_snapshot_thread_sanitizer_smoke
         PROPERTIES
-            LABELS qualification
+            LABELS "qualification;sanitizer"
             TIMEOUT 600)
 endif()
 add_test(

@@ -94,7 +94,13 @@ jobs:
 
       - name: Install providers (Windows)
         if: runner.os == 'Windows'
-        run: vcpkg install libsodium:x64-windows zstd:x64-windows
+        run: |
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            vcpkg install libsodium:x64-windows zstd:x64-windows
+            if ($LASTEXITCODE -eq 0) { break }
+            if ($attempt -eq 3) { exit $LASTEXITCODE }
+            Start-Sleep -Seconds (15 * $attempt)
+          }
 
       - name: Configure (macOS)
         if: runner.os == 'macOS'
