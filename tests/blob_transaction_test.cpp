@@ -921,6 +921,48 @@ void abortUsesPreallocatedStagingBookkeeping() {
     database.close();
 }
 
+void writerAdmissionFailureReleasesTheLane() {
+    auto state = std::make_shared<FailingAllocatorState>();
+    FailingAllocator<std::byte> allocator{state};
+    auto file = std::make_unique<miare::testing::MemoryDurableFile>();
+    auto database = miare::testing::DatabaseAccess::create<
+        FailingAllocator<std::byte>, SmallChunkLimits>(
+        std::move(file),
+        miare::EncryptionKeyView{encryptionKey},
+        deterministicProviders(22),
+        {},
+        allocator);
+    auto warmup = database.beginWrite();
+    warmup.rollback();
+
+    const auto exerciseFailure = [&](bool blocking) {
+        state->failAllocations.store(true, std::memory_order_relaxed);
+        bool failed = false;
+        try {
+            if (blocking) {
+                (void)database.beginWrite();
+            } else {
+                (void)database.tryBeginWrite();
+            }
+        } catch (const std::bad_alloc&) {
+            failed = true;
+        }
+        state->failAllocations.store(false, std::memory_order_relaxed);
+        assert(failed);
+
+        const auto diagnostics = database.diagnostics();
+        assert(!diagnostics.writerActive);
+        assert(diagnostics.writerQueueDepth == 0);
+        auto retry = database.tryBeginWrite();
+        assert(retry);
+        retry.value().rollback();
+    };
+
+    exerciseFailure(true);
+    exerciseFailure(false);
+    database.close();
+}
+
 } // namespace
 
 int main() {
@@ -941,4 +983,5 @@ int main() {
     stagingAllocatorCorruptionMakesChildrenTerminal();
     writerConstructionFailurePreservesTransactionContents();
     abortUsesPreallocatedStagingBookkeeping();
+    writerAdmissionFailureReleasesTheLane();
 }

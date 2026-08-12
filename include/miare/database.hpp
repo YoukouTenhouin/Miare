@@ -936,7 +936,8 @@ public:
             std::shared_ptr<ChildLifetime> lifetime,
             OrderedKeyValues values,
             MutableTree tree,
-            std::shared_ptr<CursorLifetime> cursorLifetime)
+            std::shared_ptr<CursorLifetime> cursorLifetime,
+            bool active = true)
             : session_(&session),
               lifetime_(std::move(lifetime)),
               values_(std::move(values)),
@@ -948,7 +949,7 @@ public:
               keyMutations_(0),
               changed_(false),
               treeCurrent_(true),
-              active_(true) {
+              active_(active) {
             cursorLifetime_->root = &tree_;
         }
 
@@ -1286,14 +1287,21 @@ public:
             session.writerAvailable.notify_all();
             requireOpen(session);
         }
-        OrderedKeyValues snapshot = detail::makeOrderedKeyValues(session.allocator);
-        MutableTree tree{session.allocator};
-        std::shared_ptr<CursorLifetime> cursorLifetime;
+        std::optional<WriteTransaction> transaction;
         try {
+            auto snapshot = detail::makeOrderedKeyValues(session.allocator);
+            MutableTree tree{session.allocator};
             snapshot = session.values;
             tree = snapshotCursorTree(session);
-            cursorLifetime = detail::makeOrderedCursorLifetime(
+            auto cursorLifetime = detail::makeOrderedCursorLifetime(
                 tree, lifetime_, session.allocator);
+            transaction.emplace(WriteTransaction{
+                session,
+                lifetime_,
+                std::move(snapshot),
+                std::move(tree),
+                std::move(cursorLifetime),
+                false});
         } catch (...) {
             --session.waitingWriters;
             ++session.servingWriterTicket;
@@ -1303,12 +1311,8 @@ public:
         --session.waitingWriters;
         session.writerActive = true;
         ++session.liveTransactions;
-        return WriteTransaction{
-            session,
-            lifetime_,
-            std::move(snapshot),
-            std::move(tree),
-            std::move(cursorLifetime)};
+        transaction->active_ = true;
+        return std::move(*transaction);
     }
 
     [[nodiscard]] Result<WriteTransaction, WriterBusy> tryBeginWrite() {
@@ -1330,16 +1334,19 @@ public:
         auto tree = snapshotCursorTree(session);
         auto cursorLifetime = detail::makeOrderedCursorLifetime(
             tree, lifetime_, session.allocator);
-        ++session.nextWriterTicket;
-        session.writerActive = true;
-        ++session.liveTransactions;
-        return Result<WriteTransaction, WriterBusy>::success(
+        auto result = Result<WriteTransaction, WriterBusy>::success(
             WriteTransaction{
                 session,
                 lifetime_,
                 std::move(snapshot),
                 std::move(tree),
-                std::move(cursorLifetime)});
+                std::move(cursorLifetime),
+                false});
+        ++session.nextWriterTicket;
+        session.writerActive = true;
+        ++session.liveTransactions;
+        result.value().active_ = true;
+        return result;
     }
 
     void close() {
