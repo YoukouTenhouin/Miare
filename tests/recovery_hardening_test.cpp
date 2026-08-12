@@ -160,6 +160,33 @@ void assertPredecessor(
     database.close();
 }
 
+void assertCandidate(
+    const std::vector<std::byte>& image,
+    miare::BlobId blobId,
+    std::uint64_t providerSeed) {
+    auto database = reopen(image, providerSeed);
+    auto read = database.beginRead();
+    const auto state = read.get(bytes("state"));
+    assert(state && std::equal(
+        state->begin(), state->end(),
+        bytes("after").begin(), bytes("after").end()));
+    const auto overflow = read.get(bytes("overflow"));
+    assert(overflow && overflow->size() == 12'289);
+    assert(read.contains(bytes("tree-0")));
+    assert(read.contains(bytes("tree-95")));
+    auto blob = read.openBlob(blobId);
+    assert(blob);
+    std::vector<std::byte> content(
+        RecoveryLimits::blobChunkBytes + 17);
+    assert(blob->read(content) == content.size());
+    assert(std::all_of(content.begin(), content.end(), [](std::byte byte) {
+        return byte == std::byte{0x52};
+    }));
+    blob->close();
+    read.end();
+    database.close();
+}
+
 void everyPersistenceOperationCanBeInterruptedBeforeMutation() {
     const auto fixture = predecessorFixture();
     auto baselineFile = std::make_unique<miare::testing::MemoryDurableFile>();
@@ -227,8 +254,72 @@ void everyPersistenceOperationCanBeInterruptedBeforeMutation() {
     }
 }
 
+void everyPublicationSectorSubsetSelectsOneCompleteGeneration() {
+    const auto fixture = predecessorFixture();
+    auto traceFile = std::make_unique<miare::testing::MemoryDurableFile>();
+    auto* traceFileView = traceFile.get();
+    traceFile->replaceStableBytes(fixture.image);
+    auto traceOpened = miare::testing::DatabaseAccess::open<
+        std::allocator<std::byte>, RecoveryLimits>(
+        std::move(traceFile),
+        miare::EncryptionKeyView{encryptionKey},
+        deterministicProviders(100));
+    assert(traceOpened);
+    auto traceDatabase = std::move(traceOpened).value();
+    traceFileView->clearOperations();
+    const auto trace = applyCandidate(
+        traceDatabase, *traceFileView, fixture.blobId);
+    traceDatabase.close();
+
+    constexpr std::size_t sectorBytes = 512;
+    constexpr std::size_t sectorCount =
+        miare::detail::publicationSlotBytes / sectorBytes;
+    static_assert(sectorCount == 8);
+    std::uint64_t providerSeed = 200;
+    for (std::uint16_t retainedMask = 0;
+         retainedMask != (1U << sectorCount);
+         ++retainedMask) {
+        auto file = std::make_unique<miare::testing::MemoryDurableFile>();
+        auto* fileView = file.get();
+        file->replaceStableBytes(fixture.image);
+        auto opened = miare::testing::DatabaseAccess::open<
+            std::allocator<std::byte>, RecoveryLimits>(
+            std::move(file),
+            miare::EncryptionKeyView{encryptionKey},
+            deterministicProviders(providerSeed++));
+        assert(opened);
+        auto database = std::move(opened).value();
+        fileView->clearOperations();
+        fileView->setMaxTransferBytes(sectorBytes);
+        fileView->failOperation(trace.publicationOperation + 1);
+        try {
+            (void)applyCandidate(database, *fileView, fixture.blobId);
+            assert(false);
+        } catch (const miare::DatabaseError& error) {
+            assert(error.code() == miare::Errc::CommitOutcomeUnknown);
+        }
+        assert(fileView->unbarrieredMutationCount() == sectorCount);
+        std::array<std::size_t, sectorCount> retained{};
+        std::size_t retainedCount = 0;
+        for (std::size_t sector = 0; sector != sectorCount; ++sector) {
+            if ((retainedMask & (1U << sector)) != 0) {
+                retained[retainedCount++] = sector;
+            }
+        }
+        fileView->simulateCrash(
+            std::span<const std::size_t>{retained}.first(retainedCount));
+        const auto crashImage = fileView->bytes();
+        if (retainedCount == sectorCount) {
+            assertCandidate(crashImage, fixture.blobId, providerSeed++);
+        } else {
+            assertPredecessor(crashImage, fixture.blobId, providerSeed++);
+        }
+    }
+}
+
 } // namespace
 
 int main() {
     everyPersistenceOperationCanBeInterruptedBeforeMutation();
+    everyPublicationSectorSubsetSelectsOneCompleteGeneration();
 }
