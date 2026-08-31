@@ -13,18 +13,41 @@ jobs:
       - name: Install build dependencies
         run: >-
           zypper --non-interactive install --no-recommends
-          git cmake gcc-c++ libsodium-devel libzstd-devel
+          git cmake doxygen gcc-c++ libsodium-devel libzstd-devel
 
       - uses: actions/checkout@v4
 
       - name: Configure
-        run: cmake -S . -B build -DMIARE_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
+        run: >-
+          cmake -S . -B build
+          -DMIARE_BUILD_DOCS=ON
+          -DMIARE_BUILD_EXAMPLES=ON
+          -DMIARE_BUILD_TESTS=ON
+          -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
         run: cmake --build build --config Release --parallel
 
+      - name: Build documentation
+        run: cmake --build build --target miare_docs
+
       - name: Test
         run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Install package
+        run: cmake --install build --prefix "$GITHUB_WORKSPACE/build/install"
+
+      - name: Configure package consumer
+        run: >-
+          cmake -S tests/package_consumer -B build/package-consumer
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/build/install"
+
+      - name: Build package consumer
+        run: cmake --build build/package-consumer --config Release --parallel
+
+      - name: Run package consumer
+        run: build/package-consumer/miare_package_consumer
 
   linux-sanitizers:
     runs-on: ubuntu-latest
