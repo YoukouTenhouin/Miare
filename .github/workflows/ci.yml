@@ -101,6 +101,66 @@ jobs:
           -R '^miare\.concurrent_snapshot_thread_sanitizer_smoke$'
           --output-on-failure
 
+  optional-providers:
+    runs-on: ubuntu-latest
+    container: registry.opensuse.org/opensuse/tumbleweed:latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: neither
+            sodium: 'OFF'
+            zstd: 'OFF'
+            packages: ''
+          - name: sodium-only
+            sodium: 'ON'
+            zstd: 'OFF'
+            packages: libsodium-devel
+          - name: zstd-only
+            sodium: 'OFF'
+            zstd: 'ON'
+            packages: libzstd-devel
+          - name: both
+            sodium: 'ON'
+            zstd: 'ON'
+            packages: libsodium-devel libzstd-devel
+
+    steps:
+      - name: Install build dependencies
+        run: >-
+          zypper --non-interactive install --no-recommends
+          git cmake gcc-c++ ${{ matrix.packages }}
+
+      - uses: actions/checkout@v4
+
+      - name: Configure ${{ matrix.name }} package
+        run: >-
+          cmake -S . -B build
+          -DMIARE_ENABLE_SODIUM=${{ matrix.sodium }}
+          -DMIARE_ENABLE_ZSTD=${{ matrix.zstd }}
+          -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build ${{ matrix.name }} project
+        run: cmake --build build --parallel
+
+      - name: Test ${{ matrix.name }} project
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Install ${{ matrix.name }} package
+        run: cmake --install build --prefix "$GITHUB_WORKSPACE/build/install"
+
+      - name: Configure ${{ matrix.name }} consumer
+        run: >-
+          cmake -S tests/package_consumer -B build/package-consumer
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/build/install"
+
+      - name: Build ${{ matrix.name }} consumer
+        run: cmake --build build/package-consumer --parallel
+
+      - name: Run ${{ matrix.name }} consumer
+        run: build/package-consumer/miare_package_consumer
+
   build:
     strategy:
       fail-fast: false
