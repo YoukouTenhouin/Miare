@@ -26,12 +26,19 @@ results and handle state; they do not assert allocation order or page layout.
 ## Six-target fixture interchange
 
 `.github/workflows/qualification.yml` builds on Linux, Windows, and macOS for
-x86-64 and ARM64. Every target creates encrypted `None` and `ZStd` fixtures plus
-an unsupported-feature fixture. A second six-target matrix downloads the whole
+x86-64 and ARM64. Every target creates the complete encryption
+`None`/`XChaCha20Poly1305Ietf` by compression `None`/`ZStd` fixture matrix plus
+unsupported-feature fixtures. A second six-target matrix downloads the whole
 corpus and verifies, opens, reads, mutates, cleanly closes, backs up, and reopens
-every producer's valid files. It also checks wrong-key authentication rejection
-and unsupported-feature classification. Workflow artifacts are retained for 30
-days; promoted release corpora belong in version control.
+every producer's valid files. It also checks keyed/keyless API mismatch,
+wrong-key authentication rejection, suite-0 corruption checksums, suite-1 byte
+compatibility, and unsupported-feature classification. Workflow artifacts are
+retained for 30 days; promoted release corpora belong in version control.
+
+Installed-package qualification additionally configures consumers with no
+optional provider dependencies, libsodium only, Zstandard only, and both. Each
+consumer exercises exactly the modes its capabilities support and proves that
+disabled capabilities are neither included, linked, initialized, nor invoked.
 
 ## Fuzzing and sanitizers
 

@@ -1,6 +1,6 @@
 # Recovery, maintenance, and verification contract
 
-Status: v1 frozen
+Status: v1 frozen, corrected for optional storage protection
 
 This document is the canonical executable behavior for recovery, maintenance, verification, and v1 qualification. It deepens the [public and transactional contract](./public-transaction-contract.md) over the bytes frozen by the [portable B+ tree and Blob format](./portable-btree-blob-format.md). A conforming implementation may choose private algorithms and caches, but it may not choose a different durable outcome, public failure, maintenance effect, report value, or qualification threshold.
 
@@ -10,7 +10,7 @@ V1 has exactly one automatic recovery operation: Crash recovery selects and vali
 
 V1 provides no repair, Salvage, or degraded read-only continuation. `verify()` and `verifyFile()` diagnose without mutation. A future separately named offline salvage tool may use Structural metadata, but is not part of the database API and may not weaken normal open behavior.
 
-The B+ tree backend has no data-bearing sidecar. Its authoritative state is always in the main file. A lock sidecar has no recovery meaning. The general public allowance for encrypted recovery sidecars remains available to future backends, whose backend-specific contracts must preserve every public outcome defined here.
+The B+ tree backend has no data-bearing sidecar. Its authoritative state is always in the main file. A lock sidecar has no recovery meaning. The general public allowance for recovery sidecars protected according to the selected database suite remains available to future backends, whose backend-specific contracts must preserve every public outcome defined here.
 
 The durability promise applies to an already-open, validated local regular file when the filesystem, device, firmware, hypervisor, and host truthfully honor the required stable-storage barrier. V1 cannot detect or correct a storage stack that acknowledges stability falsely. Whole-file replacement by an older internally valid snapshot remains outside the threat model.
 
@@ -71,7 +71,8 @@ enum class VerificationFindingCode : std::uint16_t {
     AllocationOverlap,
     AllocationGap,
     AllocationCountMismatch,
-    DuplicateReachability
+    DuplicateReachability,
+    ExtentChecksumFailed
 };
 
 enum class RecoveryCause : std::uint8_t {
@@ -128,16 +129,18 @@ The incomplete-publication field means that inactive slot bytes were rejected wh
 
 ### Selection algorithm
 
-`open()` performs these steps in order:
+The keyed `open()` and keyless `openUnencrypted()` perform these steps in
+order:
 
 1. Resolve file identity, enforce the one-session registry, and acquire the strongest practical exclusive lock. Locking detects cooperative misuse but does not make unsupported simultaneous processes correct.
 2. Read only the fixed visible bootstrap envelope under its canonical bounds. Unknown magic, envelope version, or common format is `UnsupportedFormat`; an unknown required envelope feature or encryption suite is `UnsupportedFeature`; an unsupported KDF or derivation identity is `IncompatibleProfile`.
-3. Require the selected cryptographic capabilities and derive the database keys. Missing or operationally failed capabilities are `ProviderUnavailable` and never become authentication rejection.
-4. Parse and authenticate both fixed publication slots independently. A structurally invalid, torn, or unauthenticated slot is rejected without releasing plaintext. If neither authenticates under an otherwise supported bootstrap, return `AuthenticationFailed`, intentionally conflating the wrong key with encrypted-header corruption.
-5. Canonically validate every authenticated plaintext. Authenticated noncanonical fields, contradictory slots, impossible generation relationships, or unequal semantic content at an equal generation are `Corrupt`. Unknown identities in the newest authenticated publication produce their assigned `UnsupportedFormat`, `UnsupportedFeature`, or `IncompatibleProfile`; they never cause predecessor fallback.
-6. Select the highest valid authenticated generation. One authenticating slot is sufficient. Adjacent generations require the newer slot's designated index and predecessor link. A rejected designated newer slot permits selection of the authentic predecessor.
-7. Require the physical file to cover the selected committed high-water boundary. Authenticate, decode, and shallowly validate every non-null selected root, including framing, physical reference, role, generation context, canonical root header, and allocator high-water agreement. I/O and provider failures retain their category. Any authenticated-format or reachable-root defect is `Corrupt` and never causes fallback.
-8. Record but ignore physical bytes beyond the selected high-water boundary as the Abandoned tail. Establish an in-memory allocator view in which every retired run with no possible surviving process-local snapshot is reusable. Do not write, resize, publish, or issue a barrier.
+3. Require the API shape to agree with the suite. A keyed operation on suite 0 is `UnexpectedKey`; a keyless operation on suite 1 is `KeyRequired`.
+4. For suite 1 only, require the crypto capability and derive the database keys. Missing or operationally failed capabilities are `ProviderUnavailable` and never become authentication rejection. Suite 0 derives no keys and performs no crypto-provider operation.
+5. Parse and protection-check both fixed publication slots independently. A structurally invalid, torn, unauthenticated, or checksum-invalid slot is rejected without releasing decoded content. If neither suite-1 slot authenticates, return `AuthenticationFailed`, intentionally conflating the wrong key with encrypted-slot corruption. If neither suite-0 slot has a valid checksum, report `Corrupt`.
+6. Canonically validate every protected payload. Protected noncanonical fields, contradictory slots, impossible generation relationships, or unequal semantic content at an equal generation are `Corrupt`. Unknown identities in the newest protected publication produce their assigned `UnsupportedFormat`, `UnsupportedFeature`, or `IncompatibleProfile`; they never cause predecessor fallback.
+7. Select the highest valid protected generation. One valid slot is sufficient. Adjacent generations require the newer slot's designated index and predecessor link. A rejected designated newer slot permits selection of the valid predecessor.
+8. Require the physical file to cover the selected committed high-water boundary. Protection-check, decode, and shallowly validate every non-null selected root, including framing, physical reference, role, generation context, canonical root header, and allocator high-water agreement. I/O and provider failures retain their category. Any protected-format or reachable-root defect is `Corrupt` and never causes fallback.
+9. Record but ignore physical bytes beyond the selected high-water boundary as the Abandoned tail. Establish an in-memory allocator view in which every retired run with no possible surviving process-local snapshot is reusable. Do not write, resize, publish, or issue a barrier.
 
 Open is deliberately not a full verification traversal. A deeper reachable defect discovered later is `Corrupt` and atomically enters recovery-required state under the public contract.
 
@@ -145,13 +148,16 @@ Open is deliberately not a full verification traversal. A deeper reachable defec
 
 | Durable state | Reopen outcome |
 |---|---|
-| Supported bootstrap and neither slot authenticates | `AuthenticationFailed` |
-| One slot authenticates; the other is invalid, torn, or unauthenticated | Select the authentic slot |
-| Two canonical adjacent slots authenticate | Select the newer generation |
-| Two equal slots authenticate with equal semantics | Select that generation |
-| Authenticated slots contradict | `Corrupt` |
-| Newest authenticated slot requires an unsupported identity | Assigned compatibility error; no fallback |
-| Newest authenticated slot has a missing, truncated, unauthenticated, or invalid reachable root | `Corrupt`; no fallback |
+| Keyed entry point and suite 0 | `UnexpectedKey` |
+| Keyless entry point and suite 1 | `KeyRequired` |
+| Suite 1 and neither slot authenticates | `AuthenticationFailed` |
+| Suite 0 and neither slot checksum validates | `Corrupt` |
+| One slot protection-checks; the other is invalid, torn, or protection-invalid | Select the valid slot |
+| Two canonical adjacent slots protection-check | Select the newer generation |
+| Two equal slots protection-check with equal semantics | Select that generation |
+| Protected slots contradict | `Corrupt` |
+| Newest protected slot requires an unsupported identity | Assigned compatibility error; no fallback |
+| Newest protected slot has a missing, truncated, protection-invalid, or invalid reachable root | `Corrupt`; no fallback |
 | File ends before selected high-water boundary | `Corrupt` |
 | File extends beyond selected high-water boundary | Open selected generation and ignore the tail |
 | Complete older internally valid file replaces the database | Opens normally; rollback detection is out of scope |
@@ -161,7 +167,7 @@ Open is deliberately not a full verification traversal. A deeper reachable defec
 Creation never exposes a partially initialized requested path:
 
 1. Reject an existing target and create a unique exclusive sibling temporary file.
-2. Generate the database identity, salt, initial nonces, bootstrap, and both canonical generation-one publication slots completely before durable output. The two slots have equal semantics, their own physical slot indices, and independent nonces.
+2. Generate the database identity and both canonical generation-one publication slots completely before durable output. Suite 1 additionally generates its salt and independent initial nonces; suite 0 writes zero salt and nonce fields and computes unkeyed checksums. The two slots have equal semantics and their own physical slot indices.
 3. Write the complete common region and initial backend state, resize to its exact committed boundary, and perform one stable-storage barrier. Any write, resize, provider, space, or barrier failure leaves the requested path absent and removes the temporary file best-effort.
 4. Close and reopen-validate the temporary file, then install it exclusively at the requested name and perform the strongest available namespace stabilization.
 5. Reopen-validate the requested path before returning the session.
@@ -170,20 +176,20 @@ Before exclusive installation, interruption leaves the requested path absent and
 
 ## Transaction publication and interruption
 
-Commit preflight fixes every logical mutation, representation, nonce, allocation, allocator-metadata reservation, byte count, capacity check, and provider result before persistence. Persistence performs no planned allocation.
+Commit preflight fixes every logical mutation, representation, protection trailer, allocation, allocator-metadata reservation, byte count, capacity check, and provider result before persistence. Suite 1 additionally fixes fresh nonces. Persistence performs no planned allocation.
 
 | Phase | Required action | Failure returned by `commit()` | Reopen boundary |
 |---|---|---|---|
 | 0 | Preflight only | Original category; writer remains active where the public contract permits | Predecessor; file unchanged |
 | 1 | Write candidate extents and allocator state; publication slot untouched | `CommitFailed`; writer terminal, session recovery-required | Predecessor |
 | 2 | First stable-storage barrier | `CommitFailed`; writer terminal, session recovery-required | Predecessor |
-| 3 | First attempted byte of designated publication-slot write through completion | `CommitOutcomeUnknown`; writer terminal, session recovery-required | Predecessor if slot rejects; candidate if it authenticates and validates |
-| 4 | Second stable-storage barrier until successful return | `CommitOutcomeUnknown`; writer terminal, session recovery-required | Predecessor or candidate by authenticated bytes |
+| 3 | First attempted byte of designated publication-slot write through completion | `CommitOutcomeUnknown`; writer terminal, session recovery-required | Predecessor if slot rejects; candidate if its protection check and validation succeed |
+| 4 | Second stable-storage barrier until successful return | `CommitOutcomeUnknown`; writer terminal, session recovery-required | Predecessor or candidate by protected bytes |
 | 5 | Barrier succeeded | `commit()` succeeds after non-failing in-memory finalization | Candidate |
 
 The first attempted publication-slot write is the exact uncertainty boundary even when the operating system reports that zero or only some bytes transferred. Failure before it is known unpublished. After it, only recovery can decide.
 
-If a candidate publication authenticates but a referenced unit is damaged, reopen returns `Corrupt` rather than the predecessor. If `std::bad_alloc` unexpectedly escapes after persistence starts, the public contract's terminal-writer and `CommitOutcomeUnknown` rule applies.
+If a candidate publication passes its protection check but a referenced unit is damaged, reopen returns `Corrupt` rather than the predecessor. If `std::bad_alloc` unexpectedly escapes after persistence starts, the public contract's terminal-writer and `CommitOutcomeUnknown` rule applies.
 
 ## Common maintenance rules
 
@@ -214,7 +220,7 @@ Compaction is online, in-place, snapshot-safe copy-on-write relocation:
 1. Capture the selected roots, eligible retired runs, and source physical length under writer admission. Reclassify eligible retired runs into the planned free set exactly as checkpoint does.
 2. Authenticate every extent needed to plan relocation. Confirmed corruption follows the ordinary corruption transition.
 3. Compute a bounded fixed-point plan using lowest-address first-fit destinations. Current reachable extents are considered from highest source block downward; child-bearing structures are rebuilt bottom-up whenever a moved child changes a direct reference. A move is retained only when its final destination is below its source and advances the lowest-address layout. Ties use physical block, extent role identifier, and encoded reference bytes.
-4. The plan includes every rewritten ancestor, allocator page, fresh nonce, encoded representation, temporary appended span, retained-reader span, resulting partition, and candidate high-water mark. Failure to prove sufficient profile capacity and workspace is preflight `ResourceLimit`.
+4. The plan includes every rewritten ancestor, allocator page, protection trailer, encoded representation, temporary appended span, retained-reader span, resulting partition, and candidate high-water mark; suite 1 additionally fixes a fresh nonce for every rewritten unit. Failure to prove sufficient profile capacity and workspace is preflight `ResourceLimit`.
 5. Immediately before sealing allocator metadata, briefly close reader admission, capture and internally pin every existing snapshot generation, and finalize retained ranges. Existing readers continue; new readers wait until publication succeeds or fails. This gate prevents a reader from acquiring the predecessor after the plan has omitted its extents.
 6. If either allocator semantics or physical placement changed, write the plan without modifying predecessor-reachable extents, perform the first barrier, and publish exactly one compacted generation through the designated slot and second barrier. Otherwise publish nothing.
 7. Extents needed by the pinned older snapshots remain retired below the candidate high-water mark. Without such readers, relocated source spans below the boundary become free and a now-unreachable suffix lies outside the candidate boundary. Release reader admission after the publication outcome has been recorded.
@@ -242,29 +248,29 @@ Success returns the frozen `BackupReport`. A smaller backup requires explicit co
 
 ### Authoritative scope
 
-Online `verify()` validates the selected committed graph and every older graph retained by a live read snapshot. At admission it internally pins the then-live snapshot roots; because writers are excluded, a later reader observes the already-pinned selected generation. Offline `verifyFile()` validates the selected committed graph; no process-local snapshot survives offline.
+Online `verify()` validates the selected committed graph and every older graph retained by a live read snapshot. At admission it internally pins the then-live snapshot roots; because writers are excluded, a later reader observes the already-pinned selected generation. Offline keyed `verifyFile()` and keyless `verifyUnencryptedFile()` validate the selected committed graph; no process-local snapshot survives offline.
 
 Both validate:
 
 - bootstrap and publication selection, recording a rejected inactive slot as an observation;
-- framing, bounds, authentication, role, owner context without reporting identity, generation relationships, codec envelope, bounded decompression, and canonical decoded bytes for every reachable extent;
+- framing, bounds, suite-selected protection, role, owner context without reporting identity, generation relationships, codec envelope, bounded decompression, and canonical decoded bytes for every reachable extent;
 - all B+ tree topology, levels, child counts, separators, key ordering, prefix compression, slot packing, entry schema, empty-root, split-independent canonical representation, and reference invariants;
 - ordered-keyspace Value representation and overflow length invariants;
 - Blob catalog uniqueness, manifest identity and length, dense chunk ordinals, index ownership, content generation, chunk size, and final-chunk length;
-- free and retired ordering, coalescing, disjointness, retirement eligibility representation, complete high-water partition, duplicate reachability, and authenticated counters;
+- free and retired ordering, coalescing, disjointness, retirement eligibility representation, complete high-water partition, duplicate reachability, and protected counters;
 - physical file length relative to the committed high-water boundary.
 
-They classify but do not authenticate or interpret payload bytes in free runs, offline-obsolete retired runs, or the Abandoned tail. Those ranges have no authoritative content. Online retired extents still reachable by a live snapshot are authenticated through that snapshot's graph.
+They do not protection-check or interpret payload bytes in free runs, offline-obsolete retired runs, or the Abandoned tail. Those ranges have no authoritative content. Online retired extents still reachable by a live snapshot are protection-checked through that snapshot's graph.
 
 ### Outcomes
 
-Structural or authentication defects discovered after a publication establishes identity are retained as `Corruption` findings rather than thrown merely to report the first defect. Verification safely continues independent branches, returns an invalid report, and online verification atomically enters `RecoveryRequired` and invalidates subordinate handles before returning. Offline verification has no session to mutate.
+Structural, authentication, or checksum defects discovered after a publication establishes identity are retained as `Corruption` findings rather than thrown merely to report the first defect. Verification safely continues independent branches, returns an invalid report, and online verification atomically enters `RecoveryRequired` and invalidates subordinate handles before returning. Offline verification has no session to mutate. A valid suite-0 report proves checksum and structural consistency only, not cryptographic authenticity or tamper resistance.
 
-`verifyFile()` uses the same publication authentication and selection rules as open, but after one publication establishes identity it converts selected-root truncation, framing, authentication, and structural failure into report findings so the offline diagnostic operation can return an invalid report. Normal `open()` continues to throw `Corrupt` for the same selected-root condition. A defect that prevents bounded bootstrap parsing or leaves no authentic publication follows the bootstrap outcomes rather than fabricating a report.
+Each offline verification entry point uses the same suite-selected publication and selection rules as its open counterpart, but after one publication establishes identity it converts selected-root truncation, framing, protection, and structural failure into report findings so the offline diagnostic operation can return an invalid report. Normal open continues to throw `Corrupt` for the same selected-root condition. A defect that prevents bounded bootstrap parsing or leaves no protection-valid publication follows the bootstrap outcomes rather than fabricating a report.
 
-An incomplete inactive slot and Abandoned tail are `Observation` findings and do not make the report invalid. Wrong key or inability to establish any encrypted publication makes `verifyFile()` return `AuthenticationFailed`. I/O, allocation, unavailable-provider, and operational-provider failures throw because verification could not decide validity. They do not poison an online session unless corruption was positively established.
+An incomplete inactive slot and Abandoned tail are `Observation` findings and do not make the report invalid. Wrong key or inability to establish any encrypted publication makes keyed `verifyFile()` return `AuthenticationFailed`. Inability to establish either suite-0 publication produces an invalid corruption report when bounded format dispatch is possible. I/O, allocation, unavailable-provider, and operational-provider failures throw because verification could not decide validity. They do not poison an online session unless corruption was positively established.
 
-`verify()` and `verifyFile()` never write, repair, truncate, reclaim, normalize, or salvage.
+`verify()`, `verifyFile()`, and `verifyUnencryptedFile()` never write, repair, truncate, reclaim, normalize, or salvage.
 
 ## Close and destruction
 
@@ -309,19 +315,19 @@ Instrument every durable-file write, resize, and barrier. Minimal fixtures inter
 
 Exhaustively enumerate publication-slot sector subsets for both slots. Exercise transactions, checkpoint, compaction, close-time checkpoint, creation, and backup installation. Reopen every resulting file through the public API.
 
-Passing requires successful operations to survive; pre-publication interruption to select the predecessor; publication interruption to select predecessor or complete candidate; damage beneath an authenticated candidate to return `Corrupt`; and no mixed state, unauthenticated plaintext, silent stale fallback, or unexpected writable session. Minimal deterministic campaigns run on all supported targets; larger seeded campaigns run continuously.
+Passing requires successful operations to survive; pre-publication interruption to select the predecessor; publication interruption to select predecessor or complete candidate; damage beneath a protection-valid candidate to return `Corrupt`; and no mixed state, unchecked decoded content, silent stale fallback, or unexpected writable session. The campaign runs for all four encryption/compression combinations. Minimal deterministic campaigns run on all supported targets; larger seeded campaigns run continuously.
 
 ### Corruption and authentication
 
-Version-controlled byte fixtures cover empty, multi-level, overflow-Value, multi-Blob, compressed, fragmented, retired, checkpointed, compacted, and backed-up files. Mutate every visible and authenticated field at zero, one-bit, boundary, unknown-identifier, and noncanonical-reserved values. For every extent role, mutate preamble, ciphertext, tag, padding, compressed frame, decoded canonical field, and parent reference. Test truncation at every common-region byte and every framing, ciphertext, tag, quantum, and high-water boundary, plus duplication, relocation, swapping, replay, cross-role, cross-Blob, and cross-database substitution.
+Version-controlled byte fixtures cover all four encryption/compression combinations and empty, multi-level, overflow-Value, multi-Blob, fragmented, retired, checkpointed, compacted, and backed-up files. Mutate every visible and protected field at zero, one-bit, boundary, unknown-identifier, and noncanonical-reserved values. For every extent role, mutate preamble, payload, protection trailer, padding, compressed frame, decoded canonical field, and parent reference. Test truncation at every common-region byte and every framing, payload, trailer, quantum, and high-water boundary, plus duplication, relocation, swapping, replay, cross-role, cross-Blob, and cross-database substitution.
 
-Passing requires the exact compatibility, `AuthenticationFailed`, predecessor-selection, `Corrupt`, or ignored-residue outcome defined above; sentinel output proves authentication or decode failure releases no plaintext. Missing capabilities and operational provider failures remain distinct. There may be no crash, hang, overread, uncontrolled allocation, or sensitive diagnostic. Whole-file rollback remains accepted by design.
+Passing requires the exact compatibility, key/suite mismatch, `AuthenticationFailed`, predecessor-selection, `Corrupt`, or ignored-residue outcome defined above; sentinel output proves protection or decode failure releases no decoded payload. Tests explicitly demonstrate that suite-0 application data is plaintext and its checksum is publicly recomputable. Missing capabilities and operational provider failures remain distinct. There may be no crash, hang, overread, uncontrolled allocation, or sensitive diagnostic. Whole-file rollback remains accepted by design.
 
 ### Portability and providers
 
-The release matrix is Windows, Linux, and macOS on x86-64 and ARM64. Each of the six targets produces fixtures that every target must open, verify, mutate, close, back up, and reopen. Fixtures span compression `None` and `ZStd`, every permitted Allocation quantum and Blob chunk size, zero/default/maximum inline cutoff, all structural states listed above, unsupported identities, and permitted interrupted publication.
+The release matrix is Windows, Linux, and macOS on x86-64 and ARM64. Each of the six targets produces fixtures that every target must open, verify, mutate, close, back up, and reopen. Fixtures span the complete encryption `None`/`XChaCha20Poly1305Ietf` by compression `None`/`ZStd` matrix, every permitted Allocation quantum and Blob chunk size, zero/default/maximum inline cutoff, all structural states listed above, unsupported identities, and permitted interrupted publication.
 
-Canonical KDF, AEAD, associated-data, page, codec-decode, and format fixtures are byte-exact. Vendored and system `libzstd` builds cross-read; compressed output need not match, but decoded content and the allocation-quantum savings decision must. Cryptography passes upstream libsodium vectors and an independent BLAKE2b/XChaCha fixture implementation. Missing capabilities never silently substitute. No platform or provider update ships if canonical bytes change or any prior fixture loses readability.
+Canonical suite-0 checksum, suite-1 KDF/AEAD/associated-data, page, codec-decode, and format fixtures are byte-exact. Existing suite-1 fixtures remain byte-identical and readable. Vendored and system `libzstd` builds cross-read; compressed output need not match, but decoded content and the allocation-quantum savings decision must. Cryptography passes upstream libsodium vectors and an independent BLAKE2b/XChaCha fixture implementation. Provider spies prove suite 0 performs zero crypto calls and `Compression::None` performs zero compression calls. Installed-package consumers cover neither dependency, crypto only, compression only, and both dependencies. Missing capabilities never silently substitute. No platform or provider update ships if canonical bytes change or any prior fixture loses readability.
 
 ### Fuzzing and sanitizers
 
