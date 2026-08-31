@@ -845,7 +845,7 @@ template<class Mutator>
         opened,
         miare::ByteView{extent}.first(miare::detail::ExtentLayout::bytes));
     crypto.encryptDetached(
-        opened.keys.mainData.view(),
+        opened.keys->mainData.view(),
         nonce,
         payload,
         associatedData,

@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <random>
 #include <string>
 
 namespace miare::detail {
@@ -34,6 +35,12 @@ inline constexpr std::size_t aeadNonceBytes = 24;
 inline constexpr std::size_t authenticationTagBytes = 16;
 inline constexpr std::size_t maxProviderUnitBytes = 16U * 1024U * 1024U;
 inline constexpr std::size_t maxRandomRequestBytes = 1024U * 1024U;
+
+class EntropySource {
+public:
+    virtual ~EntropySource() = default;
+    virtual void randomBytes(MutableByteView output) = 0;
+};
 
 class CryptoProvider {
 public:
@@ -71,6 +78,31 @@ public:
         ByteView tag,
         ByteView associatedData,
         MutableByteView plaintext) = 0;
+};
+
+class SystemEntropySource final : public EntropySource {
+public:
+    void randomBytes(MutableByteView output) override {
+        if (output.size() > maxRandomRequestBytes) {
+            throw ContractError{Errc::InvalidArgument, "randomness request exceeds its bound"};
+        }
+        std::random_device random;
+        for (auto& byte : output) {
+            byte = std::byte{static_cast<unsigned char>(random())};
+        }
+    }
+};
+
+class CryptoEntropySource final : public EntropySource {
+public:
+    explicit CryptoEntropySource(CryptoProvider& crypto) noexcept : crypto_(&crypto) {}
+
+    void randomBytes(MutableByteView output) override {
+        crypto_->randomBytes(output);
+    }
+
+private:
+    CryptoProvider* crypto_;
 };
 
 class CompressionProvider {
@@ -399,6 +431,11 @@ namespace miare {
 /// move-only and becomes inert after being moved into a database operation.
 class ProviderSet {
 public:
+    /// Creates a provider set with no optional crypto or compression capability.
+    [[nodiscard]] static ProviderSet none() {
+        return ProviderSet{nullptr, nullptr};
+    }
+
     /// Creates the production provider set backed by libsodium and Zstandard.
     [[nodiscard]] static ProviderSet system() {
         return ProviderSet{
@@ -418,15 +455,19 @@ private:
 
     ProviderSet(
         std::unique_ptr<detail::CryptoProvider> crypto,
-        std::unique_ptr<detail::CompressionProvider> compression)
+        std::unique_ptr<detail::CompressionProvider> compression,
+        std::unique_ptr<detail::EntropySource> entropy = nullptr)
         : crypto_(std::move(crypto)), compression_(std::move(compression)) {
-        if (!crypto_) {
-            throw ContractError{Errc::InvalidArgument, "crypto provider is missing"};
+        if (entropy) {
+            entropy_ = std::move(entropy);
+        } else {
+            entropy_ = std::make_unique<detail::SystemEntropySource>();
         }
     }
 
     std::unique_ptr<detail::CryptoProvider> crypto_;
     std::unique_ptr<detail::CompressionProvider> compression_;
+    std::unique_ptr<detail::EntropySource> entropy_;
 };
 
 namespace detail {
@@ -435,15 +476,26 @@ class ProviderAccess {
 public:
     [[nodiscard]] static ProviderSet make(
         std::unique_ptr<CryptoProvider> crypto,
-        std::unique_ptr<CompressionProvider> compression) {
-        return ProviderSet{std::move(crypto), std::move(compression)};
+        std::unique_ptr<CompressionProvider> compression,
+        std::unique_ptr<EntropySource> entropy = nullptr) {
+        return ProviderSet{
+            std::move(crypto), std::move(compression), std::move(entropy)};
     }
 
     static CryptoProvider& crypto(ProviderSet& providers) {
         if (!providers.crypto_) {
-            throw ContractError{Errc::InvalidState, "provider set is inert"};
+            throw DatabaseError{
+                Errc::ProviderUnavailable,
+                "cryptographic provider is missing"};
         }
         return *providers.crypto_;
+    }
+
+    static EntropySource& entropy(ProviderSet& providers) {
+        if (!providers.entropy_) {
+            throw ContractError{Errc::InvalidState, "provider set is inert"};
+        }
+        return *providers.entropy_;
     }
 
     static CompressionProvider& compression(ProviderSet& providers) {

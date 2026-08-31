@@ -46,13 +46,84 @@ private:
     bool failProvider_ = false;
 };
 
+class DeterministicEntropySource final : public detail::EntropySource {
+public:
+    explicit DeterministicEntropySource(std::uint64_t seed) : state_(seed) {}
+
+    void randomBytes(MutableByteView output) override {
+        {
+            std::unique_lock lock{mutex_};
+            if (blockNext_) {
+                entered_ = true;
+                condition_.notify_all();
+                condition_.wait(lock, [&] { return released_; });
+                blockNext_ = false;
+            }
+        }
+        ++operationCount_;
+        if (failNext_) {
+            failNext_ = false;
+            throw DatabaseError{
+                Errc::ProviderUnavailable,
+                "injected entropy failure"};
+        }
+        if (output.size() > detail::maxRandomRequestBytes) {
+            throw ContractError{
+                Errc::InvalidArgument,
+                "randomness request exceeds its bound"};
+        }
+        for (auto& byte : output) {
+            state_ ^= state_ << 13U;
+            state_ ^= state_ >> 7U;
+            state_ ^= state_ << 17U;
+            byte = std::byte{static_cast<unsigned char>(state_)};
+        }
+    }
+
+    void failNextOperation() noexcept { failNext_ = true; }
+    void blockNextOperation() {
+        std::lock_guard lock{mutex_};
+        blockNext_ = true;
+        entered_ = false;
+        released_ = false;
+    }
+    void waitUntilBlocked() {
+        std::unique_lock lock{mutex_};
+        condition_.wait(lock, [&] { return entered_; });
+    }
+    void release() {
+        std::lock_guard lock{mutex_};
+        released_ = true;
+        condition_.notify_all();
+    }
+
+    [[nodiscard]] std::size_t operationCount() const noexcept {
+        return operationCount_;
+    }
+
+private:
+    std::uint64_t state_;
+    std::size_t operationCount_ = 0;
+    bool failNext_ = false;
+    std::mutex mutex_;
+    std::condition_variable condition_;
+    bool blockNext_ = false;
+    bool entered_ = false;
+    bool released_ = false;
+};
+
 class DeterministicCryptoProvider final
     : public detail::CryptoProvider,
       private ProviderFailureInjection {
 public:
-    explicit DeterministicCryptoProvider(std::uint64_t seed) : state_(seed) {}
+    explicit DeterministicCryptoProvider(
+        std::uint64_t seed,
+        std::shared_ptr<std::atomic<std::size_t>> operationCount =
+            std::make_shared<std::atomic<std::size_t>>(0))
+        : operationCount_(std::move(operationCount)), state_(seed) {}
 
     void randomBytes(MutableByteView output) override {
+        operationCount_->fetch_add(1, std::memory_order_relaxed);
         {
             std::unique_lock lock{randomMutex_};
             if (blockRandom_) {
@@ -84,6 +155,7 @@ public:
         std::uint32_t encryptionSuite,
         std::uint32_t derivationVersion,
         MutableByteView output) override {
+        operationCount_->fetch_add(1, std::memory_order_relaxed);
         failProviderIfRequested();
         delegate_.deriveDatabaseRoot(
             callerKey,
@@ -98,11 +170,13 @@ public:
         ByteView databaseRoot,
         std::uint64_t subkeyId,
         MutableByteView output) override {
+        operationCount_->fetch_add(1, std::memory_order_relaxed);
         failProviderIfRequested();
         delegate_.deriveSubkey(databaseRoot, subkeyId, output);
     }
 
     void hashBlake2b256(ByteView input, MutableByteView output) override {
+        operationCount_->fetch_add(1, std::memory_order_relaxed);
         failProviderIfRequested();
         delegate_.hashBlake2b256(input, output);
     }
@@ -114,6 +188,7 @@ public:
         ByteView associatedData,
         MutableByteView ciphertext,
         MutableByteView tag) override {
+        operationCount_->fetch_add(1, std::memory_order_relaxed);
         failProviderIfRequested();
         delegate_.encryptDetached(
             key, nonce, plaintext, associatedData, ciphertext, tag);
@@ -130,6 +205,7 @@ public:
         ByteView tag,
         ByteView associatedData,
         MutableByteView plaintext) override {
+        operationCount_->fetch_add(1, std::memory_order_relaxed);
         failProviderIfRequested();
         return delegate_.decryptDetached(
             key, nonce, ciphertext, tag, associatedData, plaintext);
@@ -138,6 +214,9 @@ public:
     void failNextRandom() noexcept { failRandom_ = true; }
     void failNextProviderOperation() noexcept {
         ProviderFailureInjection::failNextProviderOperation();
+    }
+    [[nodiscard]] std::size_t operationCount() const noexcept {
+        return operationCount_->load(std::memory_order_relaxed);
     }
     void corruptNextCiphertext() noexcept { corruptCiphertext_ = true; }
     void blockNextRandom() {
@@ -158,6 +237,7 @@ public:
 
 private:
     detail::SodiumCryptoProvider delegate_;
+    std::shared_ptr<std::atomic<std::size_t>> operationCount_;
     std::uint64_t state_;
     bool failRandom_ = false;
     bool corruptCiphertext_ = false;
@@ -546,8 +626,15 @@ public:
                 [](std::byte byte) { return byte == std::byte{0}; });
         };
         const auto& keys = database.session_->opened.keys;
-        return erased(keys.header) && erased(keys.mainData) &&
-            erased(keys.recovery) && erased(keys.blob);
+        return !keys ||
+            (erased(keys->header) && erased(keys->mainData) &&
+             erased(keys->recovery) && erased(keys->blob));
+    }
+
+    template<class Allocator, class Limits>
+    [[nodiscard]] static bool sessionHasKeys(
+        Database<Allocator, Limits>& database) {
+        return database.session_->opened.keys.has_value();
     }
 
     template<class Allocator = std::allocator<std::byte>, class Limits = DefaultLimits>

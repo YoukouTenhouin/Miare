@@ -57,9 +57,14 @@ private:
 }
 
 [[nodiscard]] miare::ProviderSet deterministicProviders(std::uint64_t seed) {
+    auto crypto =
+        std::make_unique<miare::testing::DeterministicCryptoProvider>(seed);
+    auto entropy =
+        std::make_unique<miare::detail::CryptoEntropySource>(*crypto);
     return miare::detail::ProviderAccess::make(
-        std::make_unique<miare::testing::DeterministicCryptoProvider>(seed),
-        std::make_unique<miare::testing::FaultInjectingCompressionProvider>());
+        std::move(crypto),
+        std::make_unique<miare::testing::FaultInjectingCompressionProvider>(),
+        std::move(entropy));
 }
 
 void createFixture(

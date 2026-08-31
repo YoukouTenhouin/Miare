@@ -1270,10 +1270,13 @@ void blobIdentifierGenerationHoldsInflightLease() {
     auto file = std::make_unique<miare::testing::MemoryDurableFile>();
     auto crypto =
         std::make_unique<miare::testing::DeterministicCryptoProvider>(54);
-    auto* cryptoView = crypto.get();
+    auto entropy =
+        std::make_unique<miare::testing::DeterministicEntropySource>(54);
+    auto* entropyView = entropy.get();
     auto providers = miare::detail::ProviderAccess::make(
         std::move(crypto),
-        std::make_unique<miare::testing::FaultInjectingCompressionProvider>());
+        std::make_unique<miare::testing::FaultInjectingCompressionProvider>(),
+        std::move(entropy));
     auto database = miare::testing::DatabaseAccess::create(
         std::move(file),
         miare::EncryptionKeyView{encryptionKey},
@@ -1293,11 +1296,11 @@ void blobIdentifierGenerationHoldsInflightLease() {
     while (!ready.load(std::memory_order_acquire)) {
         std::this_thread::yield();
     }
-    cryptoView->blockNextRandom();
+    entropyView->blockNextOperation();
     start.store(true, std::memory_order_release);
-    cryptoView->waitUntilRandomBlocked();
+    entropyView->waitUntilBlocked();
     assert(!miare::testing::DatabaseAccess::operationsAreQuiescent(database));
-    cryptoView->releaseRandom();
+    entropyView->release();
     creating.join();
     database.close();
 }

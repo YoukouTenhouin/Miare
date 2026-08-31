@@ -597,7 +597,8 @@ template<class Limits, class Allocator, class Runs>
     writeLittleEndian<std::uint32_t>(commonFormatVersion, data, 32);
     writeLittleEndian<std::uint32_t>(btreeBackendIdentifier, data, 36);
     writeLittleEndian<std::uint32_t>(1, data, 40);
-    writeLittleEndian<std::uint32_t>(xchachaSuiteIdentifier, data, 44);
+    writeLittleEndian<std::uint32_t>(
+        encryptionSuiteIdentifier(opened.format.encryptionSuite), data, 44);
     writeBytes(
         data,
         48,
@@ -605,6 +606,17 @@ template<class Limits, class Allocator, class Runs>
             PublicationLayout::capacityProfileDigest, cryptoKeyBytes));
     writeBytes(data, 80, preamble);
     return data;
+}
+
+[[nodiscard]] inline std::array<std::byte, authenticationTagBytes>
+extentChecksum(ByteView protectionContext, ByteView storedPlaintext) {
+    constexpr std::array<std::byte, 16> domain{
+        std::byte{'M'}, std::byte{'i'}, std::byte{'a'}, std::byte{'r'},
+        std::byte{'e'}, std::byte{'E'}, std::byte{'x'}, std::byte{'t'},
+        std::byte{'e'}, std::byte{'n'}, std::byte{'t'}, std::byte{'C'},
+        std::byte{'h'}, std::byte{'k'}, std::byte{'V'}, std::byte{'1'}};
+    return blake2b<authenticationTagBytes>(
+        domain, protectionContext, storedPlaintext);
 }
 
 template<class Allocator>
@@ -725,7 +737,6 @@ template<class Limits, class Allocator>
     ByteView owner) {
     using ByteAllocator = typename std::allocator_traits<Allocator>::
         template rebind_alloc<std::byte>;
-    auto& crypto = ProviderAccess::crypto(providers);
     const auto encodedLength =
         ExtentLayout::bytes + payload.stored.size() + authenticationTagBytes;
     const auto blockCount =
@@ -744,7 +755,9 @@ template<class Limits, class Allocator>
     writeLittleEndian<std::uint16_t>(unitKind, output, ExtentLayout::unitKind);
     writeLittleEndian<std::uint32_t>(payload.flags, output, ExtentLayout::flags);
     writeLittleEndian<std::uint32_t>(
-        keyDomain, output, ExtentLayout::keyDomain);
+        opened.format.encryptionSuite == EncryptionSuite::None ? 0 : keyDomain,
+        output,
+        ExtentLayout::keyDomain);
     writeLittleEndian<std::uint32_t>(payload.codec, output, ExtentLayout::codec);
     writeLittleEndian<std::uint32_t>(
         payload.codec, output, ExtentLayout::codecProfile);
@@ -768,19 +781,33 @@ template<class Limits, class Allocator>
         writeBytes(output, ExtentLayout::owner, owner);
     }
     std::array<std::byte, aeadNonceBytes> nonce{};
-    crypto.randomBytes(nonce);
-    writeBytes(output, ExtentLayout::nonce, nonce);
+    if (opened.format.encryptionSuite != EncryptionSuite::None) {
+        ProviderAccess::crypto(providers).randomBytes(nonce);
+        writeBytes(output, ExtentLayout::nonce, nonce);
+    }
     const auto associatedData = extentAssociatedData(
         opened, ByteView{extent}.first(ExtentLayout::bytes));
-    crypto.encryptDetached(
-        keyDomain == 4 ? opened.keys.blob.view() : opened.keys.mainData.view(),
-        nonce,
-        payload.stored,
-        associatedData,
-        MutableByteView{extent}.subspan(
-            ExtentLayout::bytes, payload.stored.size()),
-        MutableByteView{extent}.subspan(
-            ExtentLayout::bytes + payload.stored.size(), authenticationTagBytes));
+    if (opened.format.encryptionSuite == EncryptionSuite::None) {
+        writeBytes(output, ExtentLayout::bytes, payload.stored);
+        const auto checksum = extentChecksum(associatedData, payload.stored);
+        writeBytes(
+            output,
+            ExtentLayout::bytes + payload.stored.size(),
+            checksum);
+    } else {
+        auto& crypto = ProviderAccess::crypto(providers);
+        crypto.encryptDetached(
+            keyDomain == 4
+                ? opened.keys->blob.view()
+                : opened.keys->mainData.view(),
+            nonce,
+            payload.stored,
+            associatedData,
+            MutableByteView{extent}.subspan(
+                ExtentLayout::bytes, payload.stored.size()),
+            MutableByteView{extent}.subspan(
+                ExtentLayout::bytes + payload.stored.size(), authenticationTagBytes));
+    }
     return PreparedExactExtent<Allocator>{reference, std::move(extent)};
 }
 
@@ -1124,7 +1151,9 @@ template<class Limits, class Allocator>
         readLittleEndian<std::uint16_t>(input, ExtentLayout::version) != 1 ||
         readLittleEndian<std::uint16_t>(input, ExtentLayout::unitKind) != expectedKind ||
         readLittleEndian<std::uint32_t>(input, ExtentLayout::keyDomain) !=
-            keyDomain ||
+            (opened.format.encryptionSuite == EncryptionSuite::None
+                 ? 0
+                 : keyDomain) ||
         readLittleEndian<std::uint32_t>(input, ExtentLayout::preambleLength) !=
             ExtentLayout::bytes ||
         readLittleEndian<std::uint64_t>(input, ExtentLayout::blockIndex) !=
@@ -1144,6 +1173,8 @@ template<class Limits, class Allocator>
                     owner.begin(),
                     owner.end(),
                     input.begin() + ExtentLayout::owner))) ||
+        (opened.format.encryptionSuite == EncryptionSuite::None &&
+         !allZero(input, ExtentLayout::nonce, ExtentLayout::reserved)) ||
         !allZero(input, ExtentLayout::reserved, ExtentLayout::bytes) ||
         !allZero(input, reference.encodedLength, extent.size())) {
         throwCorrupt("authenticated extent is noncanonical");
@@ -1182,15 +1213,34 @@ template<class Limits, class Allocator>
     stored.resize(storedLength);
     const auto associatedData = extentAssociatedData(
         opened, input.first(ExtentLayout::bytes));
-    auto& crypto = ProviderAccess::crypto(providers);
-    if (!crypto.decryptDetached(
-        keyDomain == 4 ? opened.keys.blob.view() : opened.keys.mainData.view(),
-            input.subspan(ExtentLayout::nonce, aeadNonceBytes),
-            input.subspan(ExtentLayout::bytes, storedLength),
-            input.subspan(ExtentLayout::bytes + storedLength, authenticationTagBytes),
-            associatedData,
-            stored)) {
-        throwCorrupt("authenticated extent authentication failed");
+    if (opened.format.encryptionSuite == EncryptionSuite::None) {
+        std::copy_n(
+            input.begin() + ExtentLayout::bytes,
+            storedLength,
+            stored.begin());
+        const auto expected = extentChecksum(associatedData, stored);
+        if (!constantTimeEqual(
+                expected,
+                input.subspan(
+                    ExtentLayout::bytes + storedLength,
+                    authenticationTagBytes))) {
+            throwCorrupt("unencrypted extent checksum failed");
+        }
+    } else {
+        auto& crypto = ProviderAccess::crypto(providers);
+        if (!crypto.decryptDetached(
+                keyDomain == 4
+                    ? opened.keys->blob.view()
+                    : opened.keys->mainData.view(),
+                input.subspan(ExtentLayout::nonce, aeadNonceBytes),
+                input.subspan(ExtentLayout::bytes, storedLength),
+                input.subspan(
+                    ExtentLayout::bytes + storedLength,
+                    authenticationTagBytes),
+                associatedData,
+                stored)) {
+            throwCorrupt("authenticated extent authentication failed");
+        }
     }
     StoredBytes<Allocator> decoded{ByteAllocator{allocator}};
     decoded.resize(decodedLength);
@@ -3395,20 +3445,29 @@ struct PreparedPublication {
     writeLittleEndian<std::uint32_t>(
         publicationPlaintextBytes, output, SlotEnvelopeLayout::ciphertextLength);
     std::array<std::byte, aeadNonceBytes> nonce{};
-    auto& crypto = ProviderAccess::crypto(providers);
-    crypto.randomBytes(nonce);
-    writeBytes(output, SlotEnvelopeLayout::nonce, nonce);
-    const auto associatedData = publicationAssociatedData(
-        opened.bootstrap, ByteView{slot}.first(publicationEnvelopeBytes));
-    crypto.encryptDetached(
-        opened.keys.header.view(),
-        nonce,
-        plaintext,
-        associatedData,
-        MutableByteView{slot}.subspan(
-            SlotEnvelopeLayout::ciphertext, publicationPlaintextBytes),
-        MutableByteView{slot}.subspan(
-            SlotEnvelopeLayout::tag, authenticationTagBytes));
+    if (opened.format.encryptionSuite == EncryptionSuite::None) {
+        writeBytes(output, SlotEnvelopeLayout::ciphertext, plaintext);
+        const auto checksum = publicationChecksum(
+            opened.bootstrap,
+            ByteView{slot}.first(publicationEnvelopeBytes),
+            plaintext);
+        writeBytes(output, SlotEnvelopeLayout::tag, checksum);
+    } else {
+        auto& crypto = ProviderAccess::crypto(providers);
+        crypto.randomBytes(nonce);
+        writeBytes(output, SlotEnvelopeLayout::nonce, nonce);
+        const auto associatedData = publicationAssociatedData(
+            opened.bootstrap, ByteView{slot}.first(publicationEnvelopeBytes));
+        crypto.encryptDetached(
+            opened.keys->header.view(),
+            nonce,
+            plaintext,
+            associatedData,
+            MutableByteView{slot}.subspan(
+                SlotEnvelopeLayout::ciphertext, publicationPlaintextBytes),
+            MutableByteView{slot}.subspan(
+                SlotEnvelopeLayout::tag, authenticationTagBytes));
+    }
     return slot;
 }
 

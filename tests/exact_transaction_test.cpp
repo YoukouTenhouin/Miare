@@ -442,7 +442,7 @@ void expectImageDatabaseError(
         sourceView.first(miare::detail::ExtentLayout::bytes));
     auto& crypto = miare::detail::ProviderAccess::crypto(providers);
     const bool decrypted = crypto.decryptDetached(
-        opened.keys.mainData.view(),
+        opened.keys->mainData.view(),
         sourceView.subspan(
             miare::detail::ExtentLayout::nonce,
             miare::detail::aeadNonceBytes),
@@ -513,7 +513,7 @@ void expectImageDatabaseError(
         opened,
         miare::ByteView{extent}.first(miare::detail::ExtentLayout::bytes));
     crypto.encryptDetached(
-        opened.keys.mainData.view(),
+        opened.keys->mainData.view(),
         nonce,
         compressed,
         associatedData,

@@ -119,7 +119,7 @@ template<class MutatePreamble, class MutateStored>
         miare::ByteView{extent}.first(miare::detail::ExtentLayout::bytes));
     auto& crypto = miare::detail::ProviderAccess::crypto(providers);
     assert(crypto.decryptDetached(
-        opened.keys.mainData.view(),
+        opened.keys->mainData.view(),
         miare::ByteView{extent}.subspan(
             miare::detail::ExtentLayout::nonce,
             miare::detail::aeadNonceBytes),
@@ -137,7 +137,7 @@ template<class MutatePreamble, class MutateStored>
         opened,
         miare::ByteView{extent}.first(miare::detail::ExtentLayout::bytes));
     crypto.encryptDetached(
-        opened.keys.mainData.view(),
+        opened.keys->mainData.view(),
         miare::ByteView{extent}.subspan(
             miare::detail::ExtentLayout::nonce,
             miare::detail::aeadNonceBytes),
