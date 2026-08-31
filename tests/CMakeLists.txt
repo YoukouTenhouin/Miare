@@ -55,6 +55,15 @@ target_link_libraries(miare_recovery_hardening_test PRIVATE miare::miare)
 add_test(NAME miare.recovery_hardening COMMAND miare_recovery_hardening_test)
 set_tests_properties(miare.recovery_hardening PROPERTIES TIMEOUT 60)
 
+add_executable(
+    miare_storage_mode_durability_test storage_mode_durability_test.cpp)
+target_link_libraries(
+    miare_storage_mode_durability_test PRIVATE miare::miare)
+add_test(
+    NAME miare.storage_mode_durability
+    COMMAND miare_storage_mode_durability_test)
+set_tests_properties(miare.storage_mode_durability PROPERTIES TIMEOUT 60)
+
 add_executable(miare_maintenance_test maintenance_test.cpp)
 target_link_libraries(miare_maintenance_test PRIVATE miare::miare)
 add_test(NAME miare.maintenance COMMAND miare_maintenance_test)
@@ -62,6 +71,10 @@ set_tests_properties(miare.maintenance PROPERTIES TIMEOUT 60)
 
 add_executable(miare_portability_fixture_test portability_fixture_test.cpp)
 target_link_libraries(miare_portability_fixture_test PRIVATE miare::miare)
+target_compile_definitions(
+    miare_portability_fixture_test
+    PRIVATE
+        "MIARE_VERSIONED_FIXTURE_DIRECTORY=\"${CMAKE_CURRENT_SOURCE_DIR}/fixtures/v1\"")
 add_test(NAME miare.portability_fixture COMMAND miare_portability_fixture_test)
 set_tests_properties(miare.portability_fixture PROPERTIES TIMEOUT 120)
 

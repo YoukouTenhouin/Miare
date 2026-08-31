@@ -699,6 +699,48 @@ public:
                 64U * 1024U * 1024U,
                 256});
     }
+
+    template<class Allocator = std::allocator<std::byte>, class Limits = DefaultLimits>
+    [[nodiscard]] static Database<Allocator, Limits> createUnencrypted(
+        std::unique_ptr<MemoryDurableFile> file,
+        ProviderSet providers,
+        UnencryptedCreateOptions options = {},
+        Allocator allocator = {}) {
+        detail::validateCreateOptions(options);
+        const auto commonRegion = detail::makeInitialUnencryptedCommonRegion<Limits>(
+            detail::ProviderAccess::entropy(providers), options.compression);
+        file->writeExactAt(0, commonRegion);
+        file->resize(detail::commonRegionBytes);
+        file->stableStorageBarrier();
+        return openUnencrypted<Allocator, Limits>(
+            std::move(file), std::move(providers), std::move(allocator));
+    }
+
+    template<class Allocator = std::allocator<std::byte>, class Limits = DefaultLimits>
+    [[nodiscard]] static Database<Allocator, Limits> openUnencrypted(
+        std::unique_ptr<MemoryDurableFile> file,
+        ProviderSet providers,
+        Allocator allocator = {}) {
+        auto openedDatabase = detail::openUnencryptedFormat<Limits>(
+            *file, providers);
+        (void)detail::shallowValidateOrderedRoot<Limits>(
+            *file, openedDatabase, providers, allocator);
+        auto blobs = detail::loadBlobCatalog<Limits>(
+            *file, openedDatabase, providers, allocator);
+        (void)detail::shallowValidateAllocatorRoot<Limits>(
+            *file, openedDatabase, providers, allocator);
+        auto values = detail::makeOrderedKeyValues(allocator);
+        std::unique_ptr<detail::DurableFile> durableFile = std::move(file);
+        return Database<Allocator, Limits>{
+            std::move(durableFile),
+            std::move(providers),
+            std::move(allocator),
+            std::move(openedDatabase),
+            std::move(values),
+            std::move(blobs),
+            64U * 1024U * 1024U,
+            256};
+    }
 };
 
 } // namespace miare::testing
