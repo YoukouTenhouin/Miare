@@ -392,15 +392,23 @@ private:
 
 namespace miare {
 
+/// Owns the cryptographic and compression capabilities used by one session.
+///
+/// Provider identity is never stored in the database file; only frozen
+/// algorithm and profile identifiers are persistent. A provider set is
+/// move-only and becomes inert after being moved into a database operation.
 class ProviderSet {
 public:
+    /// Creates the production provider set backed by libsodium and Zstandard.
     [[nodiscard]] static ProviderSet system() {
         return ProviderSet{
             std::make_unique<detail::SodiumCryptoProvider>(),
             std::make_unique<detail::ZstdCompressionProvider>()};
     }
 
+    /// Moves ownership of every provider capability.
     ProviderSet(ProviderSet&&) noexcept = default;
+    /// Replaces this set by moving provider ownership from another set.
     ProviderSet& operator=(ProviderSet&&) noexcept = default;
     ProviderSet(const ProviderSet&) = delete;
     ProviderSet& operator=(const ProviderSet&) = delete;

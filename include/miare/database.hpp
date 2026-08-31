@@ -29,12 +29,23 @@ namespace testing {
 class DatabaseAccess;
 }
 
+/// Sole owner of one open Miare database session.
+///
+/// Database methods are safe for concurrent calls. The handle is
+/// move-constructible and non-copyable; moving leaves the source closed.
+/// `Allocator` controls project-owned allocation and `Limits` fixes the
+/// persistent capacity profile required to open the file.
 template<class Allocator, class Limits>
 requires DatabaseAllocator<Allocator> && LimitPolicy<Limits>
 class Database;
 
+/// Borrowed description of an ordered cursor range.
+///
+/// Range bytes need remain valid only for the call to `scan()`; the returned
+/// cursor copies its bounds with the database allocator.
 class KeyRangeView {
 public:
+    /// Selects every key in unsigned-byte lexicographic order.
     [[nodiscard]] static KeyRangeView all() noexcept {
         return KeyRangeView{
             detail::OrderedRangeKind::All,
@@ -42,6 +53,8 @@ public:
             std::nullopt};
     }
 
+    /// Selects the half-open interval `[lowerInclusive, upperExclusive)`.
+    /// Either missing bound leaves that side unbounded.
     [[nodiscard]] static KeyRangeView halfOpen(
         std::optional<ByteView> lowerInclusive,
         std::optional<ByteView> upperExclusive) noexcept {
@@ -51,6 +64,7 @@ public:
             upperExclusive};
     }
 
+    /// Selects every key beginning with `prefix`.
     [[nodiscard]] static KeyRangeView prefix(ByteView prefix) noexcept {
         return KeyRangeView{
             detail::OrderedRangeKind::Prefix,
@@ -121,20 +135,28 @@ private:
     }
 
 public:
+    /// Allocator-aware owned byte buffer returned by point reads.
     using OwnedBytes = std::vector<
         std::byte,
         typename std::allocator_traits<Allocator>::template rebind_alloc<std::byte>>;
+    /// Allocator-aware integrity-verification report for this database type.
     using VerificationReport = BasicVerificationReport<Allocator>;
 
 public:
+    /// Thread-affine navigation handle over a read transaction snapshot.
+    /// See @ref cursor_navigation "cursor navigation" for its operations.
     using ReadCursor = detail::OrderedCursor<Allocator, Limits, false>;
+    /// Thread-affine navigation handle invalidated by key mutations.
+    /// See @ref cursor_navigation "cursor navigation" for its operations.
     using WriteCursor = detail::OrderedCursor<Allocator, Limits, true>;
 
+    /// Seekable reader for one Blob content version in a transaction snapshot.
     class BlobReader {
     public:
         BlobReader(const BlobReader&) = delete;
         BlobReader& operator=(const BlobReader&) = delete;
 
+        /// Moves this handle without transferring its thread affinity.
         BlobReader(BlobReader&& other) noexcept
             : session_(std::exchange(other.session_, nullptr)),
               sessionLifetime_(std::move(other.sessionLifetime_)),
@@ -150,21 +172,26 @@ public:
 
         ~BlobReader() { close(); }
 
+        /// Returns the database-local identity of this Blob.
         [[nodiscard]] BlobId id() const {
             requireFunctional();
             return version_->id;
         }
 
+        /// Returns the logical Blob length in bytes.
         [[nodiscard]] std::uint64_t size() const {
             requireFunctional();
             return version_->size;
         }
 
+        /// Returns the absolute offset of the next read.
         [[nodiscard]] std::uint64_t position() const {
             requireFunctional();
             return position_;
         }
 
+        /// Reads up to `destination.size()` bytes and advances the position.
+        /// @return Bytes read, or zero at end-of-Blob.
         std::size_t read(MutableByteView destination) {
             requireFunctional();
             try {
@@ -192,6 +219,7 @@ public:
             }
         }
 
+        /// Sets the next-read position from zero through `size()`.
         void seek(std::uint64_t absoluteOffset) {
             requireFunctional();
             if (absoluteOffset > version_->size) {
@@ -202,6 +230,7 @@ public:
             position_ = absoluteOffset;
         }
 
+        /// Releases this reader. Repeated calls are harmless.
         void close() noexcept {
             if (!active_) {
                 return;
@@ -222,6 +251,7 @@ public:
             session_ = nullptr;
         }
 
+        /// Returns whether this reader remains usable.
         [[nodiscard]] bool active() const noexcept {
             return active_ && lifetime_ && sessionLifetime_ &&
                 !lifetime_->invalidated.load(std::memory_order_acquire) &&
@@ -299,11 +329,13 @@ private:
 
 public:
 
+    /// Sequential writer for a new or replacement Blob version.
     class BlobWriter {
     public:
         BlobWriter(const BlobWriter&) = delete;
         BlobWriter& operator=(const BlobWriter&) = delete;
 
+        /// Moves this handle without transferring its thread affinity.
         BlobWriter(BlobWriter&& other) noexcept
             : state_(std::move(other.state_)),
               sessionLifetime_(std::move(other.sessionLifetime_)),
@@ -317,16 +349,19 @@ public:
 
         ~BlobWriter() { abort(); }
 
+        /// Returns the database-local identity reserved for this Blob.
         [[nodiscard]] BlobId id() const {
             requireFunctional();
             return id_;
         }
 
+        /// Returns the total logical bytes accepted so far.
         [[nodiscard]] std::uint64_t position() const {
             requireFunctional();
             return position_;
         }
 
+        /// Appends `source` to the staged Blob content.
         void write(ByteView source) {
             requireFunctional();
             using ByteAllocator = typename std::allocator_traits<Allocator>::
@@ -399,6 +434,7 @@ public:
             }
         }
 
+        /// Finalizes this Blob mutation in the write transaction's view.
         void finish() {
             requireFunctional();
             using ReferenceAllocator = typename std::allocator_traits<Allocator>::
@@ -467,6 +503,7 @@ public:
             sessionLifetime_.reset();
         }
 
+        /// Cancels only this Blob creation or replacement.
         void abort() noexcept {
             if (!active_) {
                 return;
@@ -488,6 +525,7 @@ public:
             sessionLifetime_.reset();
         }
 
+        /// Returns whether this writer remains unfinished and usable.
         [[nodiscard]] bool active() const noexcept {
             return active_ && state_ && sessionLifetime_ &&
                 !sessionLifetime_->invalidated.load(std::memory_order_acquire) &&
@@ -552,11 +590,13 @@ public:
         bool active_;
     };
 
+    /// Stable read-only snapshot bound to its creating thread.
     class ReadTransaction {
     public:
         ReadTransaction(const ReadTransaction&) = delete;
         ReadTransaction& operator=(const ReadTransaction&) = delete;
 
+        /// Moves this handle without transferring its thread affinity.
         ReadTransaction(ReadTransaction&& other) noexcept
             : session_(std::exchange(other.session_, nullptr)),
               lifetime_(std::move(other.lifetime_)),
@@ -586,24 +626,28 @@ public:
             end();
         }
 
+        /// Copies the value for `key`, or returns an empty optional.
         [[nodiscard]] std::optional<OwnedBytes> get(ByteView key) {
             requireFunctional();
             requireKey(key);
             return copyValue(*session_, values_, key);
         }
 
+        /// Returns whether `key` exists in this snapshot.
         [[nodiscard]] bool contains(ByteView key) {
             requireFunctional();
             requireKey(key);
             return values_.contains(key);
         }
 
+        /// Creates an initially unpositioned cursor over `range`.
         [[nodiscard]] ReadCursor scan(
             KeyRangeView range = KeyRangeView::all()) {
             requireFunctional();
             return makeCursor<false>(*session_, cursorLifetime_, range);
         }
 
+        /// Opens a version-retaining reader, or returns absence.
         [[nodiscard]] std::optional<BlobReader> openBlob(BlobId id) {
             requireFunctional();
             const auto found = blobs_.find(id);
@@ -614,6 +658,7 @@ public:
                 *session_, lifetime_, blobReaderLifetime_, found->second, thread_);
         }
 
+        /// Ends the transaction and invalidates its cursors and Blob readers.
         void end() noexcept {
             if (!active_) {
                 return;
@@ -633,6 +678,7 @@ public:
             lifetime_.reset();
         }
 
+        /// Returns whether this transaction remains usable.
         [[nodiscard]] bool active() const noexcept {
             return active_ && lifetime_ &&
                 !lifetime_->invalidated.load(std::memory_order_acquire);
@@ -694,11 +740,13 @@ public:
         bool active_;
     };
 
+    /// Atomic mutation set and read-your-writes snapshot bound to one thread.
     class WriteTransaction {
     public:
         WriteTransaction(const WriteTransaction&) = delete;
         WriteTransaction& operator=(const WriteTransaction&) = delete;
 
+        /// Moves this handle without transferring its thread affinity.
         WriteTransaction(WriteTransaction&& other) noexcept
             : session_(std::exchange(other.session_, nullptr)),
               lifetime_(std::move(other.lifetime_)),
@@ -731,18 +779,21 @@ public:
             rollback();
         }
 
+        /// Copies the current transaction-view value, or returns absence.
         [[nodiscard]] std::optional<OwnedBytes> get(ByteView key) {
             requireFunctional();
             requireKey(key);
             return copyValue(*session_, values_, key);
         }
 
+        /// Returns whether `key` exists in the current transaction view.
         [[nodiscard]] bool contains(ByteView key) {
             requireFunctional();
             requireKey(key);
             return values_.contains(key);
         }
 
+        /// Creates an initially unpositioned cursor over `range`.
         [[nodiscard]] WriteCursor scan(
             KeyRangeView range = KeyRangeView::all()) {
             requireFunctional();
@@ -750,6 +801,7 @@ public:
             return makeCursor<true>(*session_, cursorLifetime_, range);
         }
 
+        /// Opens a reader for the current finalized Blob version, if present.
         [[nodiscard]] std::optional<BlobReader> openBlob(BlobId id) {
             requireFunctional();
             const auto found = blobState_->blobs.find(id);
@@ -760,6 +812,7 @@ public:
                 *session_, lifetime_, blobReaderLifetime_, found->second, thread_);
         }
 
+        /// Reserves a fresh Blob identity and returns its sequential writer.
         [[nodiscard]] BlobWriter createBlob() {
             requireFunctional();
             std::shared_lock operation{session_->operationMutex};
@@ -798,6 +851,7 @@ public:
             return writer;
         }
 
+        /// Starts complete replacement of `id`, or returns absence.
         [[nodiscard]] std::optional<BlobWriter> replaceBlob(BlobId id) {
             requireFunctional();
             const auto found = blobState_->blobs.find(id);
@@ -818,6 +872,8 @@ public:
             return writer;
         }
 
+        /// Removes `id` from the transaction view.
+        /// @return Whether the Blob existed.
         [[nodiscard]] bool eraseBlob(BlobId id) {
             requireFunctional();
             if (blobState_->openWriterIds.contains(id)) {
@@ -841,6 +897,7 @@ public:
             return true;
         }
 
+        /// Unconditionally inserts or replaces `key` with `value`.
         void put(ByteView key, ByteView value) {
             requireFunctional();
             requireKey(key);
@@ -861,6 +918,8 @@ public:
             treeCurrent_ = false;
         }
 
+        /// Removes `key` from the transaction view.
+        /// @return Whether the key existed.
         [[nodiscard]] bool erase(ByteView key) {
             requireFunctional();
             requireKey(key);
@@ -877,6 +936,7 @@ public:
             return true;
         }
 
+        /// Returns current mutation and capacity accounting.
         [[nodiscard]] WriteTransactionStats stats() const {
             requireFunctional();
             const auto keyGrowth = changed_ && !values_.empty()
@@ -904,6 +964,7 @@ public:
                 blobState_->openWriters};
         }
 
+        /// Atomically and durably publishes every transaction mutation.
         void commit() {
             requireFunctional();
             if (blobState_->openWriters != 0) {
@@ -957,6 +1018,7 @@ public:
             releaseTransaction(*session_, *lifetime_, true);
         }
 
+        /// Discards all uncommitted changes and invalidates child handles.
         void rollback() noexcept {
             if (!active_) {
                 return;
@@ -972,6 +1034,7 @@ public:
             lifetime_.reset();
         }
 
+        /// Returns whether this transaction remains usable.
         [[nodiscard]] bool active() const noexcept {
             return active_ && lifetime_ &&
                 !lifetime_->invalidated.load(std::memory_order_acquire);
@@ -1092,6 +1155,10 @@ public:
         bool active_;
     };
 
+    /// Creates and opens a new database without overwriting `path`.
+    ///
+    /// `key` must contain exactly 32 high-entropy bytes for the V1 suite.
+    /// `providers` and `allocator` are moved into the new session.
     [[nodiscard]] static Database create(
         const std::filesystem::path& path,
         EncryptionKeyView key,
@@ -1144,6 +1211,8 @@ public:
         }
     }
 
+    /// Opens an existing database and performs deterministic recovery if needed.
+    /// @return `AuthenticationFailed` when no encrypted publication authenticates.
     [[nodiscard]] static Result<Database, AuthenticationFailed> open(
         const std::filesystem::path& path,
         EncryptionKeyView key,
@@ -1176,6 +1245,8 @@ public:
             options.maxReaders});
     }
 
+    /// Verifies an exclusively owned database file without modifying it.
+    /// @return A report, or `AuthenticationFailed` when identity cannot be established.
     [[nodiscard]] static Result<VerificationReport, AuthenticationFailed>
     verifyFile(
         const std::filesystem::path& path,
@@ -1228,6 +1299,7 @@ public:
     Database(const Database&) = delete;
     Database& operator=(const Database&) = delete;
 
+    /// Moves sole session ownership and leaves `other` closed.
     Database(Database&& other) noexcept
         : lifetime_(std::move(other.lifetime_)),
           session_(std::move(other.session_)) {}
@@ -1247,12 +1319,14 @@ public:
         }
     }
 
+    /// Returns the current lifecycle state; moved-from handles report `Closed`.
     [[nodiscard]] DatabaseState state() const noexcept {
         return session_
             ? session_->state.load(std::memory_order_acquire)
             : DatabaseState::Closed;
     }
 
+    /// Returns content-free, internally consistent operational diagnostics.
     [[nodiscard]] DiagnosticsSnapshot diagnostics() const {
         auto& session = requireSession();
         try {
@@ -1366,6 +1440,7 @@ public:
         return result;
     }
 
+    /// Captures and returns a stable snapshot of the latest committed state.
     [[nodiscard]] ReadTransaction beginRead() {
         auto& session = requireSession();
         try {
@@ -1413,6 +1488,7 @@ public:
             readerIdentity};
     }
 
+    /// Waits for fair FIFO admission and returns the sole write transaction.
     [[nodiscard]] WriteTransaction beginWrite() {
         auto& session = requireSession();
         try {
@@ -1477,6 +1553,8 @@ public:
         return std::move(*transaction);
     }
 
+    /// Attempts immediate fair writer admission without waiting.
+    /// @return `WriterBusy` when a writer or queued operation has priority.
     [[nodiscard]] Result<WriteTransaction, WriterBusy> tryBeginWrite() {
         auto& session = requireSession();
         try {
@@ -1521,6 +1599,7 @@ public:
         return result;
     }
 
+    /// Persists eligible reclamation and removes an abandoned physical tail.
     void checkpoint() {
         auto& session = requireSession();
         std::shared_lock operation{session.operationMutex};
@@ -1546,10 +1625,12 @@ public:
         releaseMaintenance(session);
     }
 
+    /// Performs snapshot-safe online compaction.
     void compact() {
         checkpoint();
     }
 
+    /// Verifies authoritative online state and currently retained snapshots.
     [[nodiscard]] VerificationReport verify() {
         auto& session = requireSession();
         std::shared_lock operation{session.operationMutex};
@@ -1580,6 +1661,7 @@ public:
         }
     }
 
+    /// Creates a verified portable physical snapshot at a nonexistent path.
     [[nodiscard]] BackupReport backupTo(
         const std::filesystem::path& destination) {
         auto& session = requireSession();
@@ -1680,6 +1762,10 @@ public:
         }
     }
 
+    /// Establishes clean single-file portability and releases the session.
+    ///
+    /// Live subordinate handles cause `Errc::LiveChildren` without invalidating
+    /// them. Successful close leaves this database handle inert.
     void close() {
         auto& session = requireSession();
         std::unique_lock operation{session.operationMutex};

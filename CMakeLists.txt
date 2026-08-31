@@ -4,6 +4,7 @@ project(miare VERSION 0.1.0 LANGUAGES CXX)
 
 option(MIARE_BUILD_TESTS "Build the Miare test suite" ${PROJECT_IS_TOP_LEVEL})
 option(MIARE_BUILD_EXAMPLES "Build the Miare examples" ${PROJECT_IS_TOP_LEVEL})
+option(MIARE_BUILD_DOCS "Build the Miare documentation" OFF)
 option(
     MIARE_BUILD_QUALIFICATION_TESTS
     "Register long-running backend qualification tests"
@@ -76,6 +77,20 @@ endif()
 
 if(MIARE_BUILD_EXAMPLES)
     add_subdirectory(examples)
+endif()
+
+if(MIARE_BUILD_DOCS)
+    find_package(Doxygen REQUIRED)
+    configure_file(
+        docs/Doxyfile.in
+        ${CMAKE_CURRENT_BINARY_DIR}/Doxyfile
+        @ONLY)
+    add_custom_target(
+        miare_docs
+        COMMAND ${DOXYGEN_EXECUTABLE} ${CMAKE_CURRENT_BINARY_DIR}/Doxyfile
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        COMMENT "Generating Miare API documentation"
+        VERBATIM)
 endif()
 
 if(MIARE_BUILD_FUZZERS)
