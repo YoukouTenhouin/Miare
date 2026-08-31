@@ -9,11 +9,8 @@
 int main() {
     const example::TemporaryDirectory directory{"miare-key-value-example"};
     const auto databasePath = directory.path() / "people.miare";
-    const auto keyBytes = example::randomKey();
-    const miare::EncryptionKeyView key{keyBytes};
 
-    auto database = miare::Database<>::create(
-        databasePath, key, miare::ProviderSet::system());
+    auto database = miare::Database<>::createUnencrypted(databasePath);
 
     {
         auto write = database.beginWrite();
@@ -44,10 +41,7 @@ int main() {
 
     database.close();
 
-    auto opened = miare::Database<>::open(
-        databasePath, key, miare::ProviderSet::system());
-    assert(opened);
-    auto reopened = std::move(opened).value();
+    auto reopened = miare::Database<>::openUnencrypted(databasePath);
     {
         auto read = reopened.beginRead();
         assert(read.contains(example::bytes("setting:theme")));

@@ -31,7 +31,7 @@ enum class StorageBackend : std::uint32_t {
 
 /// Selects whether backend units may be compressed.
 enum class Compression : std::uint32_t {
-    /// Store authenticated units without compression.
+    /// Store protected units without compression or a compression provider.
     None,
     /// Use the frozen V1 Zstandard profile where eligible.
     ZStd,
@@ -39,8 +39,10 @@ enum class Compression : std::uint32_t {
 
 /// Selects the persistent storage-protection construction.
 enum class EncryptionSuite : std::uint32_t {
-    /// Plaintext protected by the frozen V1 unkeyed checksum profile.
+    /// Plaintext with publicly recomputable corruption checksums; no
+    /// confidentiality, authentication, origin, or tamper-resistance claim.
     None,
+    /// Confidential, authenticated protected units using
     /// XChaCha20-Poly1305-IETF with the V1 key derivation profile.
     XChaCha20Poly1305Ietf,
 };
@@ -137,7 +139,7 @@ enum class VerificationFindingCode : std::uint16_t {
     DecodeFailed,
     /// Decoded structural bytes are not canonical.
     CanonicalEncodingInvalid,
-    /// A child or owner reference disagrees with authenticated metadata.
+    /// A child or owner reference disagrees with protected metadata.
     ReferenceMismatch,
     /// An extent appears in a structural role other than the expected role.
     RoleMismatch,
@@ -153,7 +155,7 @@ enum class VerificationFindingCode : std::uint16_t {
     AllocationOverlap,
     /// The authoritative high-water partition has an unclassified gap.
     AllocationGap,
-    /// Authenticated allocation counters disagree with the partition.
+    /// Protected allocation counters disagree with the partition.
     AllocationCountMismatch,
     /// One physical extent is reachable through incompatible paths.
     DuplicateReachability,
@@ -193,7 +195,7 @@ struct BasicVerificationReport {
     bool valid = true;
     /// Authoritative generation selected for verification.
     std::uint64_t selectedGeneration = 0;
-    /// Number of authenticated extents examined.
+    /// Number of protected extents examined.
     std::uint64_t extentsChecked = 0;
     /// Total encoded extent bytes examined.
     std::uint64_t encodedBytesChecked = 0;
@@ -228,9 +230,9 @@ struct BackupReport {
     std::uint64_t sourceGeneration = 0;
     /// Installed destination file size.
     std::uint64_t destinationFileBytes = 0;
-    /// Source extents authenticated before copying.
+    /// Source extents protection-checked before copying.
     std::uint64_t extentsVerified = 0;
-    /// Encoded source bytes authenticated before copying.
+    /// Encoded source bytes protection-checked before copying.
     std::uint64_t encodedBytesVerified = 0;
     /// Live blocks in the selected source partition.
     std::uint64_t liveBlocks = 0;
@@ -248,7 +250,7 @@ struct BackupReport {
 struct CreateOptions {
     /// Storage backend fixed for the database lifetime.
     StorageBackend storageBackend = StorageBackend::BTree;
-    /// Persistent compression policy.
+    /// Persistent compression policy; compression adds no security guarantee.
     Compression compression = Compression::ZStd;
     /// Persistent authenticated-encryption suite.
     EncryptionSuite encryptionSuite = EncryptionSuite::XChaCha20Poly1305Ietf;
@@ -258,7 +260,7 @@ struct CreateOptions {
 struct UnencryptedCreateOptions {
     /// Storage backend fixed for the database lifetime.
     StorageBackend storageBackend = StorageBackend::BTree;
-    /// Persistent compression policy.
+    /// Persistent compression policy, which does not add confidentiality.
     Compression compression = Compression::None;
 };
 

@@ -30,10 +30,14 @@ x86-64 and ARM64. Every target creates the complete encryption
 `None`/`XChaCha20Poly1305Ietf` by compression `None`/`ZStd` fixture matrix plus
 unsupported-feature fixtures. A second six-target matrix downloads the whole
 corpus and verifies, opens, reads, mutates, cleanly closes, backs up, and reopens
-every producer's valid files. It also checks keyed/keyless API mismatch,
-wrong-key authentication rejection, suite-0 corruption checksums, suite-1 byte
-compatibility, and unsupported-feature classification. Workflow artifacts are
-retained for 30 days; promoted release corpora belong in version control.
+every producer's valid files. Each mode is byte-classified from its bootstrap
+and protected publication, then subjected to reachable-extent corruption,
+torn-inactive-publication recovery, checkpoint, compaction, physical backup,
+and post-maintenance reopen. The gate distinguishes suite-0 checksum findings
+from suite-1 authentication findings and also checks keyed/keyless API mismatch,
+wrong-key rejection, the frozen encrypted/no-compression digest, and
+unsupported-feature classification. Workflow artifacts are retained for 30
+days; promoted release corpora belong in version control.
 
 Installed-package qualification additionally configures consumers with no
 optional provider dependencies, libsodium only, Zstandard only, and both. Each

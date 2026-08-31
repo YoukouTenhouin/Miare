@@ -11,6 +11,9 @@ application worker threads.
 - `open()` and `verifyFile()` return `AuthenticationFailed` when no encrypted
   publication can authenticate. This intentionally does not distinguish a
   wrong key from bootstrap tampering.
+- Keyless `openUnencrypted()` and `verifyUnencryptedFile()` return suite-0
+  corruption as stable findings or `Errc::Corrupt`; they never imply
+  cryptographic authentication.
 - `tryBeginWrite()` returns `WriterBusy` when immediate fair admission is not
   available.
 - `get()`, `openBlob()`, and `replaceBlob()` use empty `std::optional` for
@@ -74,8 +77,10 @@ V1 has no progress callback, cancellation, or asynchronous maintenance API.
 ## Portable backup
 
 `backupTo(destination)` creates a verified physical snapshot of one committed
-generation. It preserves database identity, encryption, nonces, layout, and
-generation; it is not an export or logical rebuild.
+generation. It preserves database identity, encryption suite, compression,
+nonces or checksums, layout, and generation; it is not an export or logical
+rebuild. A backup has exactly the source file's confidentiality and integrity
+properties.
 
 The destination must not exist. Failure before installation leaves it absent;
 a namespace-durability failure after installation may leave a complete backup
@@ -85,18 +90,37 @@ snapshot is desired.
 
 ## Verification
 
-`verify()` authenticates and structurally validates the selected committed
-state plus generations retained by current readers. It returns a bounded
-`VerificationReport`. Corruption findings make `valid` false and place the
-online session in recovery-required state; observation findings such as an
+`verify()` checks the selected committed state plus generations retained by
+current readers and returns a bounded `VerificationReport`. Suite 1
+cryptographically authenticates protected units; suite 0 validates unkeyed
+checksums and structure only. Corruption findings make `valid` false and place
+the online session in recovery-required state; observation findings such as an
 abandoned tail do not.
 
 `Database<>::verifyFile(path, key, providers)` performs offline verification
 without modifying the file. Bootstrap rejection returns `AuthenticationFailed`;
 once identity is established, structural defects are returned as findings.
+Use `verifyUnencryptedFile(path, providers)` for a keyless file.
 
 Verification never exposes application content in findings and never writes,
 repairs, truncates, normalizes, or salvages the database.
+
+Checksums detect accidental corruption but are publicly recomputable. For an
+unencrypted database, a valid report is not evidence against malicious
+modification, does not authenticate the file's origin, and provides no
+confidentiality. Compression changes representation, not any security
+guarantee.
+
+## Provider deployment
+
+Configure `MIARE_ENABLE_SODIUM` and `MIARE_ENABLE_ZSTD` independently. A
+disabled provider is absent from the installed package's headers and link
+interface. At runtime, `ProviderSet::none()`, `systemCrypto()`,
+`systemCompression()`, and `system()` expose none, one, or both capabilities.
+A file that requires a capability missing from its provider set fails with
+`Errc::ProviderUnavailable`; Miare never silently substitutes a different
+suite or codec. `Compression::None` performs no compression-provider operation,
+and suite 0 performs no crypto-provider operation.
 
 ## Shutdown and portability
 

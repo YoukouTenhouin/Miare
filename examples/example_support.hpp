@@ -2,7 +2,9 @@
 
 #include <miare/database.hpp>
 
+#if MIARE_HAS_SODIUM
 #include <sodium.h>
+#endif
 
 #include <array>
 #include <chrono>
@@ -28,6 +30,7 @@ inline std::string text(miare::ByteView bytes) {
         bytes.size()};
 }
 
+#if MIARE_HAS_SODIUM
 inline std::array<std::byte, 32> randomKey() {
     if (sodium_init() < 0) {
         throw std::runtime_error{"libsodium initialization failed"};
@@ -36,6 +39,7 @@ inline std::array<std::byte, 32> randomKey() {
     randombytes_buf(key.data(), key.size());
     return key;
 }
+#endif
 
 class TemporaryDirectory {
 public:

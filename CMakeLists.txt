@@ -95,11 +95,7 @@ if(MIARE_BUILD_TESTS)
 endif()
 
 if(MIARE_BUILD_EXAMPLES)
-    if(MIARE_HAS_SODIUM AND MIARE_HAS_ZSTD)
-        add_subdirectory(examples)
-    else()
-        message(STATUS "Miare examples require both system providers; skipping")
-    endif()
+    add_subdirectory(examples)
 endif()
 
 if(MIARE_BUILD_DOCS)
