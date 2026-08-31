@@ -14,6 +14,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -27,6 +28,34 @@ constexpr std::array<std::byte, 32> encryptionKey{
     std::byte{0x15}, std::byte{0x16}, std::byte{0x17}, std::byte{0x18},
     std::byte{0x19}, std::byte{0x1a}, std::byte{0x1b}, std::byte{0x1c},
     std::byte{0x1d}, std::byte{0x1e}, std::byte{0x1f}, std::byte{0x20}};
+
+enum class FixtureProtection {
+    Unencrypted,
+    Encrypted,
+};
+
+struct FixtureMode {
+    FixtureProtection protection;
+    miare::Compression compression;
+    std::string_view suffix;
+    std::size_t index;
+    std::uint64_t seed;
+
+    [[nodiscard]] bool encrypted() const noexcept {
+        return protection == FixtureProtection::Encrypted;
+    }
+};
+
+constexpr std::array fixtureModes{
+    FixtureMode{FixtureProtection::Unencrypted, miare::Compression::None,
+                "suite0-none", 0, 3},
+    FixtureMode{FixtureProtection::Unencrypted, miare::Compression::ZStd,
+                "suite0-zstd", 1, 4},
+    FixtureMode{FixtureProtection::Encrypted, miare::Compression::None,
+                "suite1-none", 2, 1},
+    FixtureMode{FixtureProtection::Encrypted, miare::Compression::ZStd,
+                "suite1-zstd", 3, 2},
+};
 
 class TemporaryDirectory {
 public:
@@ -69,15 +98,22 @@ private:
 
 void createFixture(
     const std::filesystem::path& path,
-    miare::Compression compression,
-    std::uint64_t seed) {
-    miare::CreateOptions options;
-    options.compression = compression;
-    auto database = miare::Database<>::create(
-        path,
-        miare::EncryptionKeyView{encryptionKey},
-        deterministicProviders(seed),
-        options);
+    const FixtureMode& mode) {
+    auto database = [&] {
+        if (mode.encrypted()) {
+            miare::CreateOptions options;
+            options.compression = mode.compression;
+            return miare::Database<>::create(
+                path,
+                miare::EncryptionKeyView{encryptionKey},
+                deterministicProviders(mode.seed),
+                options);
+        }
+        miare::UnencryptedCreateOptions options;
+        options.compression = mode.compression;
+        return miare::Database<>::createUnencrypted(
+            path, options, deterministicProviders(mode.seed));
+    }();
     auto write = database.beginWrite();
     write.put(bytes("empty"), miare::ByteView{});
     write.put(bytes("inline"), bytes("portable-value"));
@@ -121,12 +157,26 @@ void produceFixtures(
     std::string_view producer) {
     std::filesystem::create_directories(directory);
     const auto prefix = std::string{producer};
-    const auto none = directory / (prefix + "-none.miare");
-    const auto zstd = directory / (prefix + "-zstd.miare");
-    createFixture(none, miare::Compression::None, 1);
-    createFixture(zstd, miare::Compression::ZStd, 2);
+    for (const auto& mode : fixtureModes) {
+        createFixture(
+            directory / (prefix + "-" + std::string{mode.suffix} + ".miare"),
+            mode);
+    }
     createUnsupportedFeatureFixture(
-        zstd, directory / (prefix + "-unsupported.miare"));
+        directory / (prefix + "-suite1-zstd.miare"),
+        directory / (prefix + "-unsupported.miare"));
+}
+
+void copyFixtureCorpus(
+    const std::filesystem::path& source,
+    const std::filesystem::path& destination) {
+    assert(std::filesystem::create_directory(destination));
+    for (const auto& entry : std::filesystem::directory_iterator{source}) {
+        if (entry.is_regular_file() && entry.path().extension() == ".miare") {
+            assert(std::filesystem::copy_file(
+                entry.path(), destination / entry.path().filename()));
+        }
+    }
 }
 
 void encryptedNoneFixtureRemainsByteCompatible(
@@ -157,28 +207,198 @@ void encryptedNoneFixtureRemainsByteCompatible(
     assert(digest == expected);
 }
 
-void consumeValidFixture(const std::filesystem::path& path) {
-    const auto verified = miare::Database<>::verifyFile(
-        path,
-        miare::EncryptionKeyView{encryptionKey},
-        deterministicProviders(10));
-    assert(verified && verified.value().valid);
+[[nodiscard]] std::vector<std::byte> readFile(
+    const std::filesystem::path& path) {
+    std::ifstream file{path, std::ios::binary | std::ios::ate};
+    assert(file);
+    const auto size = file.tellg();
+    assert(size > 0);
+    std::vector<std::byte> image(static_cast<std::size_t>(size));
+    file.seekg(0);
+    file.read(
+        reinterpret_cast<char*>(image.data()),
+        static_cast<std::streamsize>(image.size()));
+    assert(file);
+    return image;
+}
 
-    auto wrongKey = encryptionKey;
-    wrongKey.front() ^= std::byte{1};
-    const auto rejected = miare::Database<>::open(
-        path,
-        miare::EncryptionKeyView{wrongKey},
-        deterministicProviders(11));
-    assert(!rejected);
-    assert(rejected.error() == miare::AuthenticationFailed{});
+void qualifyFixtureBytes(
+    const std::filesystem::path& path,
+    const FixtureMode& mode) {
+    const auto image = readFile(path);
+    const miare::ByteView fileBytes{image};
+    const auto expectedSuite = mode.encrypted()
+        ? miare::detail::xchachaSuiteIdentifier
+        : miare::detail::unencryptedSuiteIdentifier;
+    assert(miare::detail::readLittleEndian<std::uint32_t>(
+               fileBytes, miare::detail::BootstrapLayout::encryptionSuite) ==
+           expectedSuite);
+    assert(miare::detail::matches(fileBytes, 0, "MIAREDB\0"));
 
+    const auto plaintext = std::string_view{"portable-value"};
+    const auto foundPlaintext = std::search(
+        image.begin(), image.end(),
+        reinterpret_cast<const std::byte*>(plaintext.data()),
+        reinterpret_cast<const std::byte*>(plaintext.data() + plaintext.size()));
+    if (mode.encrypted()) {
+        assert(foundPlaintext == image.end());
+    } else if (mode.compression == miare::Compression::None) {
+        assert(foundPlaintext != image.end());
+    }
+
+    if (!mode.encrypted()) {
+        assert(miare::detail::readLittleEndian<std::uint32_t>(
+                   fileBytes, miare::detail::BootstrapLayout::kdf) == 0);
+        assert(miare::detail::readLittleEndian<std::uint32_t>(
+                   fileBytes, miare::detail::BootstrapLayout::derivation) == 0);
+        assert(miare::detail::allZero(
+            fileBytes,
+            miare::detail::BootstrapLayout::salt,
+            miare::detail::BootstrapLayout::commonRegionLength));
+        bool checkedPublication = false;
+        for (std::size_t slot = 0; slot != 2; ++slot) {
+            const auto offset = miare::detail::bootstrapBytes +
+                slot * miare::detail::publicationSlotBytes;
+            const auto plaintextOffset = offset +
+                miare::detail::SlotEnvelopeLayout::ciphertext;
+            if (!miare::detail::matches(
+                    fileBytes, plaintextOffset, "MIAREPUB")) {
+                continue;
+            }
+            assert(miare::detail::allZero(
+                fileBytes,
+                offset + miare::detail::SlotEnvelopeLayout::nonce,
+                offset + miare::detail::SlotEnvelopeLayout::reserved));
+            assert(miare::detail::readLittleEndian<std::uint32_t>(
+                       fileBytes,
+                       plaintextOffset +
+                           miare::detail::PublicationLayout::compression) ==
+                   static_cast<std::uint32_t>(mode.compression));
+            checkedPublication = true;
+        }
+        assert(checkedPublication);
+    }
+}
+
+[[nodiscard]] miare::Database<> openFixture(
+    const std::filesystem::path& path,
+    const FixtureMode& mode,
+    std::uint64_t seed) {
+    if (!mode.encrypted()) {
+        return miare::Database<>::openUnencrypted(
+            path, deterministicProviders(seed));
+    }
     auto opened = miare::Database<>::open(
         path,
         miare::EncryptionKeyView{encryptionKey},
-        deterministicProviders(12));
+        deterministicProviders(seed));
     assert(opened);
-    auto database = std::move(opened).value();
+    return std::move(opened).value();
+}
+
+void qualifyCorruption(
+    const std::filesystem::path& path,
+    const FixtureMode& mode) {
+    auto corruptPath = path;
+    corruptPath += ".corrupt";
+    assert(std::filesystem::copy_file(path, corruptPath));
+    {
+        std::fstream file{
+            corruptPath, std::ios::binary | std::ios::in | std::ios::out};
+        const auto offset = miare::detail::commonRegionBytes +
+            miare::detail::ExtentLayout::bytes;
+        file.seekg(static_cast<std::streamoff>(offset));
+        char original = 0;
+        file.get(original);
+        file.seekp(static_cast<std::streamoff>(offset));
+        file.put(static_cast<char>(original ^ 1));
+        assert(file);
+    }
+    if (mode.encrypted()) {
+        const auto report = miare::Database<>::verifyFile(
+            corruptPath,
+            miare::EncryptionKeyView{encryptionKey},
+            deterministicProviders(30));
+        assert(report && !report.value().valid);
+        assert(report.value().findings.front().code ==
+               miare::VerificationFindingCode::ExtentAuthenticationFailed);
+    } else {
+        const auto report = miare::Database<>::verifyUnencryptedFile(
+            corruptPath, deterministicProviders(30));
+        assert(!report.valid);
+        assert(report.findings.front().code ==
+               miare::VerificationFindingCode::ExtentChecksumFailed);
+    }
+    assert(std::filesystem::remove(corruptPath));
+}
+
+void qualifyTornInactivePublication(
+    const std::filesystem::path& path,
+    const FixtureMode& mode) {
+    auto recoveryPath = path;
+    recoveryPath += ".recovery";
+    assert(std::filesystem::copy_file(path, recoveryPath));
+    {
+        constexpr auto offset = miare::detail::bootstrapBytes +
+            miare::detail::publicationSlotBytes +
+            miare::detail::SlotEnvelopeLayout::ciphertext + 127;
+        std::fstream file{
+            recoveryPath, std::ios::binary | std::ios::in | std::ios::out};
+        std::array<char, 31> tornBytes{};
+        tornBytes.fill(static_cast<char>(0xa5));
+        file.seekp(static_cast<std::streamoff>(offset));
+        file.write(tornBytes.data(), tornBytes.size());
+        assert(file);
+    }
+    auto database = openFixture(recoveryPath, mode, 31);
+    assert(database.diagnostics().rejectedInactivePublication);
+    auto read = database.beginRead();
+    assert(read.contains(bytes("inline")));
+    read.end();
+    database.close();
+    assert(std::filesystem::remove(recoveryPath));
+}
+
+void consumeValidFixture(
+    const std::filesystem::path& path,
+    const FixtureMode& mode) {
+    qualifyFixtureBytes(path, mode);
+    qualifyCorruption(path, mode);
+    qualifyTornInactivePublication(path, mode);
+
+    if (mode.encrypted()) {
+        const auto verified = miare::Database<>::verifyFile(
+            path,
+            miare::EncryptionKeyView{encryptionKey},
+            deterministicProviders(10));
+        assert(verified && verified.value().valid);
+    } else {
+        assert(miare::Database<>::verifyUnencryptedFile(
+            path, deterministicProviders(10)).valid);
+    }
+
+    if (mode.encrypted()) {
+        auto wrongKey = encryptionKey;
+        wrongKey.front() ^= std::byte{1};
+        const auto rejected = miare::Database<>::open(
+            path,
+            miare::EncryptionKeyView{wrongKey},
+            deterministicProviders(11));
+        assert(!rejected);
+        assert(rejected.error() == miare::AuthenticationFailed{});
+    } else {
+        try {
+            (void)miare::Database<>::open(
+                path,
+                miare::EncryptionKeyView{encryptionKey},
+                deterministicProviders(11));
+            assert(false);
+        } catch (const miare::DatabaseError& error) {
+            assert(error.code() == miare::Errc::UnexpectedKey);
+        }
+    }
+
+    auto database = openFixture(path, mode, 12);
     auto read = database.beginRead();
     const auto inlineValue = read.get(bytes("inline"));
     assert(inlineValue && std::equal(
@@ -203,18 +423,15 @@ void consumeValidFixture(const std::filesystem::path& path) {
     auto write = database.beginWrite();
     write.put(bytes("consumer"), bytes("mutated"));
     write.commit();
+    database.checkpoint();
+    database.compact();
     auto backup = path;
     backup += ".backup";
     const auto report = database.backupTo(backup);
     assert(report.sourceGeneration != 0);
     database.close();
 
-    auto reopened = miare::Database<>::open(
-        path,
-        miare::EncryptionKeyView{encryptionKey},
-        deterministicProviders(13));
-    assert(reopened);
-    auto reopenedDatabase = std::move(reopened).value();
+    auto reopenedDatabase = openFixture(path, mode, 13);
     auto reopenedRead = reopenedDatabase.beginRead();
     const auto mutation = reopenedRead.get(bytes("consumer"));
     assert(mutation && std::equal(
@@ -223,16 +440,21 @@ void consumeValidFixture(const std::filesystem::path& path) {
     reopenedRead.end();
     reopenedDatabase.close();
 
-    const auto backupVerification = miare::Database<>::verifyFile(
-        backup,
-        miare::EncryptionKeyView{encryptionKey},
-        deterministicProviders(14));
-    assert(backupVerification && backupVerification.value().valid);
+    if (mode.encrypted()) {
+        const auto backupVerification = miare::Database<>::verifyFile(
+            backup,
+            miare::EncryptionKeyView{encryptionKey},
+            deterministicProviders(14));
+        assert(backupVerification && backupVerification.value().valid);
+    } else {
+        assert(miare::Database<>::verifyUnencryptedFile(
+            backup, deterministicProviders(14)).valid);
+    }
     assert(std::filesystem::remove(backup));
 }
 
 void consumeFixtures(const std::filesystem::path& directory) {
-    std::size_t validFixtures = 0;
+    std::array<std::size_t, 4> validFixtures{};
     std::size_t unsupportedFixtures = 0;
     for (const auto& entry :
          std::filesystem::recursive_directory_iterator{directory}) {
@@ -252,10 +474,19 @@ void consumeFixtures(const std::filesystem::path& directory) {
             ++unsupportedFixtures;
             continue;
         }
-        consumeValidFixture(entry.path());
-        ++validFixtures;
+        const auto name = entry.path().stem().string();
+        const auto mode = std::find_if(
+            fixtureModes.begin(), fixtureModes.end(),
+            [&](const FixtureMode& candidate) {
+                return name.ends_with(candidate.suffix);
+            });
+        assert(mode != fixtureModes.end());
+        consumeValidFixture(entry.path(), *mode);
+        ++validFixtures[mode->index];
     }
-    assert(validFixtures != 0);
+    assert(std::all_of(
+        validFixtures.begin(), validFixtures.end(),
+        [](std::size_t count) { return count != 0; }));
     assert(unsupportedFixtures != 0);
 }
 
@@ -276,6 +507,9 @@ int main(int argc, char** argv) {
     TemporaryDirectory temporary;
     produceFixtures(temporary.path(), "local");
     encryptedNoneFixtureRemainsByteCompatible(
-        temporary.path() / "local-none.miare");
+        temporary.path() / "local-suite1-none.miare");
     consumeFixtures(temporary.path());
+    const auto versioned = temporary.path() / "versioned";
+    copyFixtureCorpus(MIARE_VERSIONED_FIXTURE_DIRECTORY, versioned);
+    consumeFixtures(versioned);
 }
