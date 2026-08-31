@@ -25,7 +25,7 @@ The stable database-local identity of a Blob. Blob content may be transactionall
 _Avoid_: File path, external URL
 
 **Blob chunk**:
-One independently authenticated and optionally compressed contiguous portion of a Blob. Its logical size is fixed by the database's capacity profile except for the final chunk.
+One independently protected and optionally compressed contiguous portion of a Blob. Its logical size is fixed by the database's capacity profile except for the final chunk.
 _Avoid_: Blob page, stream buffer, file block
 
 **Storage backend**:
@@ -37,19 +37,27 @@ The v1 Storage backend, organized as immutable committed generations of an order
 _Avoid_: B-Tree, in-place tree
 
 **Extent reference**:
-The authenticated physical address and bounds of one immutable unit in the portable database file. References are embedded directly in parent structures rather than resolved through a separate object-location map.
+The protected physical address and bounds of one immutable unit in the portable database file. References are embedded directly in parent structures rather than resolved through a separate object-location map.
 _Avoid_: Page ID, object pointer, file pointer
 
 **Allocation quantum**:
 The smallest addressable span of backend-owned file space. It is fixed by the database's capacity profile, and extent positions and allocation spans are expressed in whole quanta.
 _Avoid_: Filesystem block size, page size, sector size
 
+**Protected extent**:
+A self-framing immutable unit whose physical bounds, role, generation, representation, and content are checked together before decoding. An encrypted Protected extent is cryptographically authenticated; an unencrypted Protected extent has only a publicly recomputable corruption checksum. Parent structures also carry the expected Extent reference and role.
+_Avoid_: Raw page, trusted record, allocation block, Authenticated extent as an umbrella term
+
 **Authenticated extent**:
-A self-framing immutable unit whose physical bounds, role, generation, representation, and content are validated together before its plaintext is exposed. Parent structures also carry the expected Extent reference and role.
-_Avoid_: Raw page, trusted record, allocation block
+An encrypted Protected extent whose XChaCha20-Poly1305 tag provides cryptographic authentication before plaintext is exposed. This term does not include unencrypted checksummed extents.
+_Avoid_: Checksummed extent, all Protected extents
+
+**Checksummed extent**:
+An unencrypted Protected extent whose unkeyed checksum detects accidental corruption but provides no confidentiality, authentication, origin guarantee, or adversarial tamper resistance.
+_Avoid_: Authenticated extent, tamper-proof extent
 
 **Framed-page ceiling**:
-The maximum physical span of one B+ tree page including its authenticated framing. It is derived from the Allocation quantum and may bound compressed pages to a smaller whole-quantum span.
+The maximum physical span of one B+ tree page including its Protected framing. It is derived from the Allocation quantum and may bound compressed pages to a smaller whole-quantum span.
 _Avoid_: Plaintext page size, cache page size
 
 **Compression policy**:
@@ -57,7 +65,7 @@ The database-creation choice that permits transparent compression by the selecte
 _Avoid_: Compression codec callback, application-managed compression
 
 **Encryption suite**:
-The authenticated-encryption construction fixed when a database is created and identified by its portable format. It cannot be changed for an existing database.
+The creation-time choice between no encryption and the authenticated-encryption construction identified by the portable format. It cannot be changed for an existing database.
 _Avoid_: Runtime cipher, provider algorithm
 
 **Encryption key material**:
@@ -65,11 +73,11 @@ The high-entropy secret supplied by the embedding application as the root of a d
 _Avoid_: Password, stored database key
 
 **Structural metadata**:
-The visible physical facts needed to classify and bound the portable file's authenticated units, including their roles, sizes, generations, compression representation, and Blob ownership. It excludes application keys, Values, and Blob content.
+The visible physical facts needed to classify and bound the portable file's Protected units, including their roles, sizes, generations, compression representation, and Blob ownership. It excludes application keys, Values, and Blob content.
 _Avoid_: Plaintext content, deniable metadata
 
 **Portable database file**:
-The single file that contains a database's complete committed state after a clean close and can be moved without auxiliary files. Recovery after an unclean shutdown may additionally require encrypted journal or write-ahead-log files.
+The single file that contains a database's complete committed state after a clean close and can be moved without auxiliary files. Recovery after an unclean shutdown may additionally require journal or write-ahead-log files protected according to the database's selected suite.
 _Avoid_: Sidecar-free database, database directory
 
 **Provider**:
@@ -121,5 +129,5 @@ A verified physical snapshot ending at one selected Committed state's high-water
 _Avoid_: Export, replica, compacted copy
 
 **Integrity verification**:
-Validation of every authenticated structure reachable from authoritative Committed state, plus the allocation partition that bounds it. It does not assign meaning to bytes in free space, obsolete retirement state, or an Abandoned tail.
+Validation of every Protected structure reachable from authoritative Committed state, plus the allocation partition that bounds it. It proves cryptographic authentication only for encrypted files; for unencrypted files it reports checksum and structural validity without a tamper-resistance claim. It does not assign meaning to bytes in free space, obsolete retirement state, or an Abandoned tail.
 _Avoid_: Raw byte scan, repair, salvage
