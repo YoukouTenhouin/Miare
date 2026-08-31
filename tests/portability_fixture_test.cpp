@@ -124,6 +124,34 @@ void produceFixtures(
         zstd, directory / (prefix + "-unsupported.miare"));
 }
 
+void encryptedNoneFixtureRemainsByteCompatible(
+    const std::filesystem::path& path) {
+    std::ifstream file{path, std::ios::binary | std::ios::ate};
+    assert(file);
+    const auto size = file.tellg();
+    assert(size == 1'191'936);
+    std::vector<std::byte> image(static_cast<std::size_t>(size));
+    file.seekg(0);
+    file.read(
+        reinterpret_cast<char*>(image.data()),
+        static_cast<std::streamsize>(image.size()));
+    assert(file);
+
+    miare::detail::SodiumCryptoProvider crypto;
+    std::array<std::byte, 32> digest{};
+    crypto.hashBlake2b256(image, digest);
+    constexpr std::array<std::byte, 32> expected{
+        std::byte{0x3e}, std::byte{0xec}, std::byte{0x0d}, std::byte{0xc2},
+        std::byte{0x8a}, std::byte{0xf7}, std::byte{0x19}, std::byte{0xf4},
+        std::byte{0x83}, std::byte{0x27}, std::byte{0x28}, std::byte{0x7a},
+        std::byte{0xf2}, std::byte{0x8c}, std::byte{0xdb}, std::byte{0xf7},
+        std::byte{0x5f}, std::byte{0xa5}, std::byte{0xbd}, std::byte{0xba},
+        std::byte{0x9b}, std::byte{0x1a}, std::byte{0xfa}, std::byte{0xca},
+        std::byte{0xb7}, std::byte{0x61}, std::byte{0xe1}, std::byte{0xdf},
+        std::byte{0xf7}, std::byte{0x59}, std::byte{0x4b}, std::byte{0x44}};
+    assert(digest == expected);
+}
+
 void consumeValidFixture(const std::filesystem::path& path) {
     const auto verified = miare::Database<>::verifyFile(
         path,
@@ -242,5 +270,7 @@ int main(int argc, char** argv) {
     }
     TemporaryDirectory temporary;
     produceFixtures(temporary.path(), "local");
+    encryptedNoneFixtureRemainsByteCompatible(
+        temporary.path() / "local-none.miare");
     consumeFixtures(temporary.path());
 }
