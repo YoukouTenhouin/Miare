@@ -45,6 +45,10 @@ enum class Errc : std::uint16_t {
     CommitOutcomeUnknown = 15,
     /// Another process or session already owns the database file.
     InUse = 16,
+    /// A keyless entry point was used for an encrypted database.
+    KeyRequired = 17,
+    /// A keyed entry point was used for a keyless database.
+    UnexpectedKey = 18,
 };
 
 /// Reports a caller contract violation or invalid handle use.

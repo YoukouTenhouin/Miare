@@ -20,6 +20,10 @@ add_executable(miare_provider_test provider_test.cpp)
 target_link_libraries(miare_provider_test PRIVATE miare::miare)
 add_test(NAME miare.provider COMMAND miare_provider_test)
 
+add_executable(miare_unencrypted_database_test unencrypted_database_test.cpp)
+target_link_libraries(miare_unencrypted_database_test PRIVATE miare::miare)
+add_test(NAME miare.unencrypted_database COMMAND miare_unencrypted_database_test)
+
 add_executable(miare_backend_compression_test backend_compression_test.cpp)
 target_link_libraries(miare_backend_compression_test PRIVATE miare::miare)
 add_test(NAME miare.backend_compression COMMAND miare_backend_compression_test)

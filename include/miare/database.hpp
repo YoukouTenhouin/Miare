@@ -821,7 +821,7 @@ public:
             std::array<std::byte, BlobId::encodedSize> randomBytes{};
             std::optional<BlobId> selected;
             for (unsigned attempt = 0; attempt != 256; ++attempt) {
-                detail::ProviderAccess::crypto(*session_->providers)
+                detail::ProviderAccess::entropy(*session_->providers)
                     .randomBytes(randomBytes);
                 const auto candidate = BlobId::fromBytes(randomBytes);
                 if (!blobState_->blobs.contains(candidate) &&
@@ -1165,8 +1165,8 @@ public:
         ProviderSet providers,
         CreateOptions options = {},
         Allocator allocator = {}) {
-        detail::requireCallerKey(key);
         detail::validateCreateOptions(options);
+        detail::requireCallerKey(key);
         validateTargetDoesNotExist(path);
         if (options.compression == Compression::ZStd) {
             (void)detail::ProviderAccess::compression(providers);
@@ -1211,6 +1211,52 @@ public:
         }
     }
 
+    /// Creates and opens a new unencrypted database without overwriting `path`.
+    [[nodiscard]] static Database createUnencrypted(
+        const std::filesystem::path& path,
+        UnencryptedCreateOptions options = {},
+        ProviderSet providers = ProviderSet::none(),
+        Allocator allocator = {}) {
+        detail::validateCreateOptions(options);
+        validateTargetDoesNotExist(path);
+        if (options.compression == Compression::ZStd) {
+            (void)detail::ProviderAccess::compression(providers);
+        }
+
+        const auto commonRegion = detail::makeInitialUnencryptedCommonRegion<Limits>(
+            detail::ProviderAccess::entropy(providers), options.compression);
+        const auto temporaryPath = createTemporaryPath(path);
+        try {
+            {
+                auto file = detail::NativeDurableFile::createNew(temporaryPath);
+                file->writeExactAt(0, commonRegion);
+                file->resize(detail::commonRegionBytes);
+                file->stableStorageBarrier();
+            }
+            {
+                auto validated = openValidatedUnencrypted(
+                    temporaryPath, providers, allocator);
+                (void)validated;
+            }
+            detail::NativeDurableFile::installExclusive(temporaryPath, path);
+
+            auto validated = openValidatedUnencrypted(path, providers, allocator);
+            return Database{
+                std::move(validated.file),
+                std::move(providers),
+                std::move(allocator),
+                std::move(validated.opened),
+                std::move(validated.values),
+                std::move(validated.blobs),
+                64U * 1024U * 1024U,
+                256};
+        } catch (...) {
+            std::error_code ignored;
+            std::filesystem::remove(temporaryPath, ignored);
+            throw;
+        }
+    }
+
     /// Opens an existing database and performs deterministic recovery if needed.
     /// @return `AuthenticationFailed` when no encrypted publication authenticates.
     [[nodiscard]] static Result<Database, AuthenticationFailed> open(
@@ -1219,15 +1265,7 @@ public:
         ProviderSet providers,
         OpenOptions options = {},
         Allocator allocator = {}) {
-        constexpr std::uint64_t minCacheBytes = 4ULL * 1024ULL * 1024ULL;
-        constexpr std::uint64_t maxCacheBytes = 64ULL * 1024ULL * 1024ULL * 1024ULL;
-        if (options.cacheCapacityBytes < minCacheBytes ||
-            options.cacheCapacityBytes > maxCacheBytes ||
-            options.maxReaders == 0 || options.maxReaders > 65'535) {
-            throw ContractError{
-                Errc::InvalidConfiguration,
-                "open runtime budgets are outside their supported bounds"};
-        }
+        validateOpenOptions(options);
         auto validation = openValidated(path, key, providers, allocator);
         if (!validation) {
             return Result<Database, AuthenticationFailed>::failure(
@@ -1243,6 +1281,25 @@ public:
             std::move(validated.blobs),
             options.cacheCapacityBytes,
             options.maxReaders});
+    }
+
+    /// Opens an existing unencrypted database and performs recovery if needed.
+    [[nodiscard]] static Database openUnencrypted(
+        const std::filesystem::path& path,
+        ProviderSet providers = ProviderSet::none(),
+        OpenOptions options = {},
+        Allocator allocator = {}) {
+        validateOpenOptions(options);
+        auto validated = openValidatedUnencrypted(path, providers, allocator);
+        return Database{
+            std::move(validated.file),
+            std::move(providers),
+            std::move(allocator),
+            std::move(validated.opened),
+            std::move(validated.values),
+            std::move(validated.blobs),
+            options.cacheCapacityBytes,
+            options.maxReaders};
     }
 
     /// Verifies an exclusively owned database file without modifying it.
@@ -1293,6 +1350,41 @@ public:
             report.findings.push_back(verificationFinding(error));
             return Result<VerificationReport, AuthenticationFailed>::success(
                 std::move(report));
+        }
+    }
+
+    /// Verifies an exclusively owned unencrypted database file without modifying it.
+    [[nodiscard]] static VerificationReport verifyUnencryptedFile(
+        const std::filesystem::path& path,
+        ProviderSet providers = ProviderSet::none(),
+        Allocator allocator = {}) {
+        auto file = detail::NativeDurableFile::openExisting(path);
+        std::optional<VerificationReport> openingCorruption;
+        std::optional<detail::OpenedDatabase> opened;
+        try {
+            opened.emplace(detail::openUnencryptedFormat<Limits>(*file, providers));
+        } catch (const DatabaseError& error) {
+            if (error.code() != Errc::Corrupt) {
+                throw;
+            }
+            openingCorruption.emplace(allocator);
+            openingCorruption->valid = false;
+            openingCorruption->findings.push_back(verificationFinding(error));
+        }
+        if (openingCorruption) {
+            return std::move(*openingCorruption);
+        }
+        try {
+            return verifyOpened(*file, *opened, providers, allocator);
+        } catch (const DatabaseError& error) {
+            if (error.code() != Errc::Corrupt) {
+                throw;
+            }
+            VerificationReport report{allocator};
+            report.valid = false;
+            report.selectedGeneration = opened->format.generation;
+            report.findings.push_back(verificationFinding(error));
+            return report;
         }
     }
 
@@ -1405,7 +1497,7 @@ public:
             result.capacityProfileDigest.begin());
         result.storageBackend = StorageBackend::BTree;
         result.compression = session.opened.format.compression;
-        result.encryptionSuite = EncryptionSuite::XChaCha20Poly1305Ietf;
+        result.encryptionSuite = session.opened.format.encryptionSuite;
         result.lastCommittedGeneration = session.opened.format.generation;
         result.mainFileBytes = session.opened.format.highWaterBytes +
             session.opened.abandonedTailBytes;
@@ -2004,10 +2096,12 @@ private:
     }
 
     static void eraseSessionKeys(Session& session) noexcept {
-        session.opened.keys.header.erase();
-        session.opened.keys.mainData.erase();
-        session.opened.keys.recovery.erase();
-        session.opened.keys.blob.erase();
+        if (session.opened.keys) {
+            session.opened.keys->header.erase();
+            session.opened.keys->mainData.erase();
+            session.opened.keys->recovery.erase();
+            session.opened.keys->blob.erase();
+        }
     }
 
     static void enterRecoveryAfterCorruptionLocked(
@@ -2103,7 +2197,9 @@ private:
 
     static void reselectSessionForClose(Session& session) {
         auto selected = detail::selectPublication<Limits>(
-            *session.file, session.opened.keys, *session.providers);
+            *session.file,
+            session.opened.keys ? &*session.opened.keys : nullptr,
+            *session.providers);
         if (!selected) {
             detail::throwCorrupt(
                 "recovery close could not authenticate a committed publication");
@@ -2250,7 +2346,9 @@ private:
             return message.find(text) != std::string_view::npos;
         };
         auto code = VerificationFindingCode::CanonicalEncodingInvalid;
-        if (contains("authentication failed")) {
+        if (contains("checksum failed")) {
+            code = VerificationFindingCode::ExtentChecksumFailed;
+        } else if (contains("authentication failed")) {
             code = VerificationFindingCode::ExtentAuthenticationFailed;
         } else if (contains("shorter than") || contains("ends before")) {
             code = VerificationFindingCode::FileTruncated;
@@ -2473,6 +2571,19 @@ private:
         }
     }
 
+    static void validateOpenOptions(const OpenOptions& options) {
+        constexpr std::uint64_t minCacheBytes = 4ULL * 1024ULL * 1024ULL;
+        constexpr std::uint64_t maxCacheBytes =
+            64ULL * 1024ULL * 1024ULL * 1024ULL;
+        if (options.cacheCapacityBytes < minCacheBytes ||
+            options.cacheCapacityBytes > maxCacheBytes ||
+            options.maxReaders == 0 || options.maxReaders > 65'535) {
+            throw ContractError{
+                Errc::InvalidConfiguration,
+                "open runtime budgets are outside their supported bounds"};
+        }
+    }
+
     [[nodiscard]] static std::filesystem::path createTemporaryPath(
         const std::filesystem::path& target) {
         static std::atomic<std::uint64_t> sequence{0};
@@ -2506,7 +2617,33 @@ private:
             return Result<ValidatedFile, AuthenticationFailed>::failure(
                 AuthenticationFailed{});
         }
-        auto openedDatabase = std::move(opened).value();
+        return Result<ValidatedFile, AuthenticationFailed>::success(ValidatedFile{
+            validateOpenedFile(
+                std::move(file),
+                std::move(opened).value(),
+                providers,
+                allocator)});
+    }
+
+    [[nodiscard]] static ValidatedFile openValidatedUnencrypted(
+        const std::filesystem::path& path,
+        ProviderSet& providers,
+        const Allocator& allocator) {
+        std::unique_ptr<detail::DurableFile> file =
+            detail::NativeDurableFile::openExisting(path);
+        auto openedDatabase = detail::openUnencryptedFormat<Limits>(*file, providers);
+        return validateOpenedFile(
+            std::move(file),
+            std::move(openedDatabase),
+            providers,
+            allocator);
+    }
+
+    [[nodiscard]] static ValidatedFile validateOpenedFile(
+        std::unique_ptr<detail::DurableFile> file,
+        detail::OpenedDatabase openedDatabase,
+        ProviderSet& providers,
+        const Allocator& allocator) {
         (void)detail::shallowValidateOrderedRoot<Limits>(
             *file, openedDatabase, providers, allocator);
         auto blobs = detail::loadBlobCatalog<Limits>(
@@ -2514,11 +2651,11 @@ private:
         (void)detail::shallowValidateAllocatorRoot<Limits>(
             *file, openedDatabase, providers, allocator);
         auto values = detail::makeOrderedKeyValues(allocator);
-        return Result<ValidatedFile, AuthenticationFailed>::success(ValidatedFile{
+        return ValidatedFile{
             std::move(file),
             std::move(openedDatabase),
             std::move(values),
-            std::move(blobs)});
+            std::move(blobs)};
     }
 
     [[nodiscard]] static ValidatedFile requireCreatedAuthentication(

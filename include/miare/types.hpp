@@ -37,8 +37,10 @@ enum class Compression : std::uint32_t {
     ZStd,
 };
 
-/// Selects the authenticated-encryption construction.
+/// Selects the persistent storage-protection construction.
 enum class EncryptionSuite : std::uint32_t {
+    /// Plaintext protected by the frozen V1 unkeyed checksum profile.
+    None,
     /// XChaCha20-Poly1305-IETF with the V1 key derivation profile.
     XChaCha20Poly1305Ietf,
 };
@@ -155,6 +157,8 @@ enum class VerificationFindingCode : std::uint16_t {
     AllocationCountMismatch,
     /// One physical extent is reachable through incompatible paths.
     DuplicateReachability,
+    /// An unencrypted extent failed its suite-0 checksum.
+    ExtentChecksumFailed,
 };
 
 /// One bounded, content-free integrity-verification finding.
@@ -250,6 +254,14 @@ struct CreateOptions {
     EncryptionSuite encryptionSuite = EncryptionSuite::XChaCha20Poly1305Ietf;
 };
 
+/// Persistent choices used only when creating an unencrypted database.
+struct UnencryptedCreateOptions {
+    /// Storage backend fixed for the database lifetime.
+    StorageBackend storageBackend = StorageBackend::BTree;
+    /// Persistent compression policy.
+    Compression compression = Compression::None;
+};
+
 /// Runtime budgets applied when opening a database.
 struct OpenOptions {
     /// Budget for retained decoded pages and Blob chunks.
@@ -287,8 +299,7 @@ struct DiagnosticsSnapshot {
     /// Selected persistent compression policy.
     Compression compression = Compression::None;
     /// Selected persistent encryption suite.
-    EncryptionSuite encryptionSuite =
-        EncryptionSuite::XChaCha20Poly1305Ietf;
+    EncryptionSuite encryptionSuite = EncryptionSuite::None;
     /// Last generation known to be committed.
     std::uint64_t lastCommittedGeneration = 0;
     /// Current main database file size.

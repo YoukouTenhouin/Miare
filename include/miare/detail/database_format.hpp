@@ -1,5 +1,6 @@
 #pragma once
 
+#include <miare/detail/blake2b.hpp>
 #include <miare/detail/durable_file.hpp>
 #include <miare/detail/providers.hpp>
 #include <miare/result.hpp>
@@ -24,6 +25,7 @@ inline constexpr std::size_t publicationPlaintextBytes = 4016;
 inline constexpr std::size_t commonRegionBytes = 64U * 1024U;
 inline constexpr std::uint32_t commonFormatVersion = 1;
 inline constexpr std::uint32_t btreeBackendIdentifier = 1;
+inline constexpr std::uint32_t unencryptedSuiteIdentifier = 0;
 inline constexpr std::uint32_t xchachaSuiteIdentifier = 1;
 inline constexpr std::uint32_t blake2bKdfIdentifier = 1;
 inline constexpr std::uint32_t derivationVersion = 1;
@@ -157,6 +159,17 @@ template<std::size_t Size>
         [](std::byte byte) { return byte == std::byte{0}; });
 }
 
+[[nodiscard]] inline bool constantTimeEqual(ByteView left, ByteView right) noexcept {
+    if (left.size() != right.size()) {
+        return false;
+    }
+    unsigned char difference = 0;
+    for (std::size_t index = 0; index != left.size(); ++index) {
+        difference |= std::to_integer<unsigned char>(left[index] ^ right[index]);
+    }
+    return difference == 0;
+}
+
 class Secret32 {
 public:
     Secret32() = default;
@@ -231,11 +244,28 @@ capacityProfileDigest(CryptoProvider& crypto, ByteView profile) {
     return digest;
 }
 
+[[nodiscard]] inline std::array<std::byte, cryptoKeyBytes>
+capacityProfileDigest(ByteView profile) {
+    std::array<std::byte, 24> prefix{};
+    writeBytes(prefix, 0, "MiareLimitsV1");
+    writeLittleEndian<std::uint32_t>(capacityProfileVersion, prefix, 16);
+    writeLittleEndian<std::uint32_t>(capacityProfileBytes, prefix, 20);
+    return blake2b<cryptoKeyBytes>(prefix, profile);
+}
+
 template<class Limits>
 [[nodiscard]] inline std::array<std::byte, cryptoKeyBytes>
 capacityProfileDigest(CryptoProvider& crypto) {
     const auto profile = encodeCapacityProfile<Limits>();
     return capacityProfileDigest(crypto, profile);
+}
+
+
+template<class Limits>
+[[nodiscard]] inline std::array<std::byte, cryptoKeyBytes>
+capacityProfileDigest() {
+    const auto profile = encodeCapacityProfile<Limits>();
+    return capacityProfileDigest(profile);
 }
 
 inline void requireCallerKey(EncryptionKeyView key) {
@@ -256,12 +286,36 @@ inline void requireCallerKey(EncryptionKeyView key) {
     throw ContractError{Errc::InvalidConfiguration, "unsupported compression choice"};
 }
 
+[[nodiscard]] constexpr std::uint32_t encryptionSuiteIdentifier(
+    EncryptionSuite encryptionSuite) {
+    switch (encryptionSuite) {
+    case EncryptionSuite::None:
+        return 0;
+    case EncryptionSuite::XChaCha20Poly1305Ietf:
+        return 1;
+    }
+    throw ContractError{
+        Errc::InvalidConfiguration, "unsupported encryption suite"};
+}
+
 inline void validateCreateOptions(const CreateOptions& options) {
     if (options.storageBackend != StorageBackend::BTree) {
         throw ContractError{Errc::InvalidConfiguration, "unsupported storage backend"};
     }
+    if (options.encryptionSuite == EncryptionSuite::None) {
+        throw DatabaseError{
+            Errc::UnexpectedKey,
+            "suite 0 must be created through the keyless entry point"};
+    }
     if (options.encryptionSuite != EncryptionSuite::XChaCha20Poly1305Ietf) {
         throw ContractError{Errc::InvalidConfiguration, "unsupported encryption suite"};
+    }
+    (void)compressionIdentifier(options.compression);
+}
+
+inline void validateCreateOptions(const UnencryptedCreateOptions& options) {
+    if (options.storageBackend != StorageBackend::BTree) {
+        throw ContractError{Errc::InvalidConfiguration, "unsupported storage backend"};
     }
     (void)compressionIdentifier(options.compression);
 }
@@ -297,12 +351,26 @@ inline void validateCreateOptions(const CreateOptions& options) {
     return associatedData;
 }
 
+[[nodiscard]] inline std::array<std::byte, authenticationTagBytes>
+publicationChecksum(
+    const Bootstrap& bootstrap,
+    ByteView envelope,
+    const PublicationPlaintext& plaintext) {
+    constexpr std::array<std::byte, 16> domain{
+        std::byte{'M'}, std::byte{'i'}, std::byte{'a'}, std::byte{'r'},
+        std::byte{'e'}, std::byte{'S'}, std::byte{'l'}, std::byte{'o'},
+        std::byte{'t'}, std::byte{'C'}, std::byte{'h'}, std::byte{'e'},
+        std::byte{'c'}, std::byte{'k'}, std::byte{'V'}, std::byte{'1'}};
+    return blake2b<authenticationTagBytes>(domain, bootstrap, envelope, plaintext);
+}
+
 template<class Limits>
 [[nodiscard]] inline PublicationPlaintext makeInitialPublicationPlaintext(
     std::uint16_t slotIndex,
     ByteView databaseIdentity,
     Compression compression,
-    CryptoProvider& crypto) {
+    EncryptionSuite encryptionSuite,
+    CryptoProvider* crypto) {
     PublicationPlaintext plaintext{};
     MutableByteView output{plaintext};
     writeBytes(output, PublicationLayout::magic, "MIAREPUB");
@@ -320,7 +388,9 @@ template<class Limits>
         btreeBackendIdentifier, output, PublicationLayout::storageBackend);
     writeLittleEndian<std::uint32_t>(1, output, PublicationLayout::backendFormat);
     writeLittleEndian<std::uint32_t>(
-        xchachaSuiteIdentifier, output, PublicationLayout::encryptionSuite);
+        encryptionSuiteIdentifier(encryptionSuite),
+        output,
+        PublicationLayout::encryptionSuite);
     const auto compressionId = compressionIdentifier(compression);
     writeLittleEndian<std::uint32_t>(
         compressionId, output, PublicationLayout::compression);
@@ -331,7 +401,9 @@ template<class Limits>
         capacityProfileVersion, output, PublicationLayout::capacityProfileVersion);
     writeLittleEndian<std::uint32_t>(
         capacityProfileBytes, output, PublicationLayout::capacityProfileLength);
-    const auto digest = capacityProfileDigest<Limits>(crypto);
+    const auto digest = crypto
+        ? capacityProfileDigest<Limits>(*crypto)
+        : capacityProfileDigest<Limits>();
     writeBytes(output, PublicationLayout::capacityProfileDigest, digest);
     const auto profile = encodeCapacityProfile<Limits>();
     writeBytes(output, PublicationLayout::capacityProfile, profile);
@@ -398,7 +470,11 @@ template<class Limits>
         crypto.randomBytes(nonce);
         writeBytes(slotOutput, SlotEnvelopeLayout::nonce, nonce);
         const auto plaintext = makeInitialPublicationPlaintext<Limits>(
-            slotIndex, databaseIdentity, compression, crypto);
+            slotIndex,
+            databaseIdentity,
+            compression,
+            EncryptionSuite::XChaCha20Poly1305Ietf,
+            &crypto);
         const auto associatedData = publicationAssociatedData(
             bootstrap, ByteView{slot}.first(publicationEnvelopeBytes));
         crypto.encryptDetached(
@@ -418,8 +494,70 @@ template<class Limits>
     return region;
 }
 
+template<class Limits>
+[[nodiscard]] inline CommonRegion makeInitialUnencryptedCommonRegion(
+    EntropySource& entropy,
+    Compression compression) {
+    CommonRegion region{};
+    Bootstrap bootstrap{};
+    std::array<std::byte, databaseIdentityBytes> databaseIdentity{};
+    entropy.randomBytes(databaseIdentity);
+
+    MutableByteView bootstrapOutput{bootstrap};
+    writeBytes(bootstrapOutput, BootstrapLayout::magic, "MIAREDB\0");
+    writeLittleEndian<std::uint16_t>(
+        1, bootstrapOutput, BootstrapLayout::envelopeVersion);
+    writeLittleEndian<std::uint32_t>(
+        bootstrapBytes, bootstrapOutput, BootstrapLayout::length);
+    writeLittleEndian<std::uint32_t>(
+        commonFormatVersion, bootstrapOutput, BootstrapLayout::commonFormat);
+    writeLittleEndian<std::uint32_t>(
+        unencryptedSuiteIdentifier,
+        bootstrapOutput,
+        BootstrapLayout::encryptionSuite);
+    writeBytes(bootstrapOutput, BootstrapLayout::databaseIdentity, databaseIdentity);
+    writeLittleEndian<std::uint64_t>(
+        commonRegionBytes, bootstrapOutput, BootstrapLayout::commonRegionLength);
+    writeLittleEndian<std::uint32_t>(
+        publicationSlotBytes, bootstrapOutput, BootstrapLayout::slotLength);
+    writeLittleEndian<std::uint32_t>(2, bootstrapOutput, BootstrapLayout::slotCount);
+    writeLittleEndian<std::uint64_t>(
+        commonRegionBytes, bootstrapOutput, BootstrapLayout::backendDataOffset);
+    writeBytes(region, 0, bootstrap);
+
+    for (std::uint16_t slotIndex = 0; slotIndex != 2; ++slotIndex) {
+        PublicationSlot slot{};
+        MutableByteView slotOutput{slot};
+        writeBytes(slotOutput, SlotEnvelopeLayout::magic, "MIARESLT");
+        writeLittleEndian<std::uint16_t>(1, slotOutput, SlotEnvelopeLayout::version);
+        writeLittleEndian<std::uint16_t>(
+            slotIndex, slotOutput, SlotEnvelopeLayout::index);
+        writeLittleEndian<std::uint32_t>(
+            publicationEnvelopeBytes, slotOutput, SlotEnvelopeLayout::length);
+        writeLittleEndian<std::uint32_t>(
+            publicationPlaintextBytes,
+            slotOutput,
+            SlotEnvelopeLayout::ciphertextLength);
+        const auto plaintext = makeInitialPublicationPlaintext<Limits>(
+            slotIndex,
+            databaseIdentity,
+            compression,
+            EncryptionSuite::None,
+            nullptr);
+        writeBytes(slotOutput, SlotEnvelopeLayout::ciphertext, plaintext);
+        const auto checksum = publicationChecksum(
+            bootstrap,
+            ByteView{slot}.first(publicationEnvelopeBytes),
+            plaintext);
+        writeBytes(slotOutput, SlotEnvelopeLayout::tag, checksum);
+        writeBytes(region, bootstrapBytes + slotIndex * publicationSlotBytes, slot);
+    }
+    return region;
+}
+
 struct OpenedFormat {
     Compression compression;
+    EncryptionSuite encryptionSuite;
     std::uint64_t generation;
     std::uint64_t highWaterBytes;
     std::uint64_t optionalFeatures;
@@ -430,7 +568,7 @@ struct OpenedFormat {
 
 struct OpenedDatabase {
     OpenedFormat format;
-    SessionKeys keys;
+    std::optional<SessionKeys> keys;
     Bootstrap bootstrap;
     PublicationPlaintext publication;
     bool rejectedInactivePublication = false;
@@ -459,18 +597,33 @@ inline void validateVisibleBootstrapDispatch(const Bootstrap& bootstrap) {
             commonFormatVersion) {
         throw DatabaseError{Errc::UnsupportedFormat, "unsupported database envelope"};
     }
+    const auto suite = readLittleEndian<std::uint32_t>(
+        input, BootstrapLayout::encryptionSuite);
     if (readLittleEndian<std::uint32_t>(input, BootstrapLayout::requiredFeatures) !=
             0 ||
-        readLittleEndian<std::uint32_t>(input, BootstrapLayout::encryptionSuite) !=
-            xchachaSuiteIdentifier) {
+        suite > xchachaSuiteIdentifier) {
         throw DatabaseError{Errc::UnsupportedFeature, "unsupported database feature"};
     }
-    if (readLittleEndian<std::uint32_t>(input, BootstrapLayout::kdf) !=
-            blake2bKdfIdentifier ||
+    const auto expectedKdf = suite == unencryptedSuiteIdentifier
+        ? unencryptedSuiteIdentifier
+        : blake2bKdfIdentifier;
+    const auto expectedDerivation = suite == unencryptedSuiteIdentifier
+        ? unencryptedSuiteIdentifier
+        : derivationVersion;
+    if (readLittleEndian<std::uint32_t>(input, BootstrapLayout::kdf) != expectedKdf ||
         readLittleEndian<std::uint32_t>(input, BootstrapLayout::derivation) !=
-            derivationVersion) {
+            expectedDerivation) {
         throw DatabaseError{Errc::IncompatibleProfile, "unsupported key derivation profile"};
     }
+}
+
+[[nodiscard]] inline EncryptionSuite visibleEncryptionSuite(
+    const Bootstrap& bootstrap) noexcept {
+    return readLittleEndian<std::uint32_t>(
+               bootstrap, BootstrapLayout::encryptionSuite) ==
+            unencryptedSuiteIdentifier
+        ? EncryptionSuite::None
+        : EncryptionSuite::XChaCha20Poly1305Ietf;
 }
 
 [[nodiscard]] inline bool canonicalSlotEnvelope(
@@ -515,12 +668,38 @@ inline void validateVisibleBootstrapDispatch(const Bootstrap& bootstrap) {
     return plaintext;
 }
 
+[[nodiscard]] inline std::optional<PublicationPlaintext> checksumSlot(
+    const PublicationSlot& slot,
+    std::uint16_t physicalIndex,
+    const Bootstrap& bootstrap) {
+    if (!canonicalSlotEnvelope(slot, physicalIndex) ||
+        !allZero(slot, SlotEnvelopeLayout::nonce, SlotEnvelopeLayout::reserved)) {
+        return std::nullopt;
+    }
+    PublicationPlaintext plaintext{};
+    std::copy_n(
+        slot.begin() + SlotEnvelopeLayout::ciphertext,
+        plaintext.size(),
+        plaintext.begin());
+    const auto expected = publicationChecksum(
+        bootstrap,
+        ByteView{slot}.first(publicationEnvelopeBytes),
+        plaintext);
+    if (!constantTimeEqual(
+            expected,
+            ByteView{slot}.subspan(
+                SlotEnvelopeLayout::tag, authenticationTagBytes))) {
+        return std::nullopt;
+    }
+    return plaintext;
+}
+
 template<class Limits>
 [[nodiscard]] inline OpenedFormat validatePublication(
     const PublicationPlaintext& plaintext,
     std::uint16_t physicalIndex,
     const Bootstrap& bootstrap,
-    CryptoProvider& crypto,
+    CryptoProvider* crypto,
     ProviderSet& providers) {
     const ByteView input{plaintext};
     if (!matches(input, PublicationLayout::magic, "MIAREPUB") ||
@@ -556,9 +735,10 @@ template<class Limits>
         commonFormatVersion) {
         throw DatabaseError{Errc::UnsupportedFormat, "unsupported common format"};
     }
+    const auto encryptionSuite = visibleEncryptionSuite(bootstrap);
     if (readLittleEndian<std::uint32_t>(input, PublicationLayout::encryptionSuite) !=
-        xchachaSuiteIdentifier) {
-        throw DatabaseError{Errc::UnsupportedFeature, "unsupported encryption suite"};
+        encryptionSuiteIdentifier(encryptionSuite)) {
+        throwCorrupt("publication protection contradicts its bootstrap");
     }
     if (readLittleEndian<std::uint32_t>(input, PublicationLayout::storageBackend) !=
             btreeBackendIdentifier ||
@@ -592,7 +772,9 @@ template<class Limits>
     }
     const auto storedProfile = input.subspan(
         PublicationLayout::capacityProfile, capacityProfileBytes);
-    const auto canonicalDigest = capacityProfileDigest(crypto, storedProfile);
+    const auto canonicalDigest = crypto
+        ? capacityProfileDigest(*crypto, storedProfile)
+        : capacityProfileDigest(storedProfile);
     const auto expectedProfile = encodeCapacityProfile<Limits>();
     if (!std::equal(
             canonicalDigest.begin(),
@@ -639,6 +821,7 @@ template<class Limits>
         allocatorRoot.begin());
     return OpenedFormat{
         compressionId == 0 ? Compression::None : Compression::ZStd,
+        encryptionSuite,
         generation,
         highWaterBlocks * Limits::allocationQuantumBytes,
         readLittleEndian<std::uint64_t>(
@@ -650,6 +833,7 @@ template<class Limits>
 
 inline void validateCanonicalBootstrap(const Bootstrap& bootstrap) {
     const ByteView input{bootstrap};
+    const auto suite = visibleEncryptionSuite(bootstrap);
     if (readLittleEndian<std::uint16_t>(input, BootstrapLayout::reserved16) != 0 ||
         readLittleEndian<std::uint32_t>(input, BootstrapLayout::reserved32) != 0 ||
         readLittleEndian<std::uint64_t>(
@@ -659,7 +843,12 @@ inline void validateCanonicalBootstrap(const Bootstrap& bootstrap) {
         readLittleEndian<std::uint32_t>(input, BootstrapLayout::slotCount) != 2 ||
         readLittleEndian<std::uint64_t>(input, BootstrapLayout::backendDataOffset) !=
             commonRegionBytes ||
-        !allZero(input, BootstrapLayout::reserved, bootstrapBytes)) {
+        !allZero(input, BootstrapLayout::reserved, bootstrapBytes) ||
+        (suite == EncryptionSuite::None &&
+         !allZero(
+             input,
+             BootstrapLayout::salt,
+             BootstrapLayout::commonRegionLength))) {
         throwCorrupt("authenticated bootstrap is noncanonical");
     }
 }
@@ -678,7 +867,7 @@ template<class Limits>
 [[nodiscard]] inline Result<SelectedPublication, AuthenticationFailed>
 selectPublication(
     DurableFile& file,
-    const SessionKeys& keys,
+    const SessionKeys* keys,
     ProviderSet& providers,
     const Bootstrap* alreadyReadBootstrap = nullptr) {
     Bootstrap bootstrap = alreadyReadBootstrap
@@ -688,7 +877,10 @@ selectPublication(
         file.readExactAt(0, bootstrap);
     }
     validateVisibleBootstrapDispatch(bootstrap);
-    auto& crypto = ProviderAccess::crypto(providers);
+    const auto encryptionSuite = visibleEncryptionSuite(bootstrap);
+    CryptoProvider* crypto = encryptionSuite == EncryptionSuite::None
+        ? nullptr
+        : &ProviderAccess::crypto(providers);
 
     std::array<PublicationSlot, 2> slots{};
     std::array<std::optional<PublicationPlaintext>, 2> plaintexts{};
@@ -698,8 +890,10 @@ selectPublication(
         if (physicalBytes >= slotEnd) {
             file.readExactAt(
                 bootstrapBytes + index * publicationSlotBytes, slots[index]);
-            plaintexts[index] = authenticateSlot(
-                slots[index], index, bootstrap, crypto, keys.header);
+            plaintexts[index] = encryptionSuite == EncryptionSuite::None
+                ? checksumSlot(slots[index], index, bootstrap)
+                : authenticateSlot(
+                      slots[index], index, bootstrap, *crypto, keys->header);
         }
     }
     if (!plaintexts[0] && !plaintexts[1]) {
@@ -756,6 +950,11 @@ template<class Limits>
     Bootstrap bootstrap{};
     file.readExactAt(0, bootstrap);
     validateVisibleBootstrapDispatch(bootstrap);
+    if (visibleEncryptionSuite(bootstrap) == EncryptionSuite::None) {
+        throw DatabaseError{
+            Errc::UnexpectedKey,
+            "unencrypted database requires a keyless entry point"};
+    }
     requireCallerKey(callerKey);
 
     auto& crypto = ProviderAccess::crypto(providers);
@@ -766,7 +965,7 @@ template<class Limits>
             BootstrapLayout::databaseIdentity, databaseIdentityBytes),
         ByteView{bootstrap}.subspan(BootstrapLayout::salt, kdfSaltBytes));
     auto selected = selectPublication<Limits>(
-        file, keys, providers, &bootstrap);
+        file, &keys, providers, &bootstrap);
     if (!selected) {
         return Result<OpenedDatabase, AuthenticationFailed>::failure(
             AuthenticationFailed{});
@@ -780,6 +979,33 @@ template<class Limits>
             publication.publication,
             publication.rejectedInactivePublication,
             publication.abandonedTailBytes});
+}
+
+template<class Limits>
+[[nodiscard]] inline OpenedDatabase openUnencryptedFormat(
+    DurableFile& file,
+    ProviderSet& providers) {
+    Bootstrap bootstrap{};
+    file.readExactAt(0, bootstrap);
+    validateVisibleBootstrapDispatch(bootstrap);
+    if (visibleEncryptionSuite(bootstrap) != EncryptionSuite::None) {
+        throw DatabaseError{
+            Errc::KeyRequired,
+            "encrypted database requires a keyed entry point"};
+    }
+    auto selected = selectPublication<Limits>(
+        file, nullptr, providers, &bootstrap);
+    if (!selected) {
+        throwCorrupt("no unencrypted publication checksum is valid");
+    }
+    auto publication = std::move(selected).value();
+    return OpenedDatabase{
+        publication.format,
+        std::nullopt,
+        publication.bootstrap,
+        publication.publication,
+        publication.rejectedInactivePublication,
+        publication.abandonedTailBytes};
 }
 
 } // namespace miare::detail

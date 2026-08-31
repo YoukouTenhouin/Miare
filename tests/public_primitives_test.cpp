@@ -61,6 +61,20 @@ int main() {
 
     static_assert(CreateOptions{}.storageBackend == StorageBackend::BTree);
     static_assert(CreateOptions{}.compression == Compression::ZStd);
+    static_assert(CreateOptions{}.encryptionSuite ==
+                  EncryptionSuite::XChaCha20Poly1305Ietf);
+    static_assert(UnencryptedCreateOptions{}.storageBackend ==
+                  StorageBackend::BTree);
+    static_assert(UnencryptedCreateOptions{}.compression == Compression::None);
+    static_assert(detail::encryptionSuiteIdentifier(EncryptionSuite::None) == 0);
+    static_assert(detail::encryptionSuiteIdentifier(
+                      EncryptionSuite::XChaCha20Poly1305Ietf) == 1);
+    static_assert(static_cast<std::uint16_t>(Errc::KeyRequired) == 17);
+    static_assert(static_cast<std::uint16_t>(Errc::UnexpectedKey) == 18);
+    static_assert(static_cast<std::uint16_t>(
+                      VerificationFindingCode::ExtentChecksumFailed) >
+                  static_cast<std::uint16_t>(
+                      VerificationFindingCode::DuplicateReachability));
     static_assert(OpenOptions{}.maxReaders == 256);
     static_assert(DefaultLimits::allocationQuantumBytes == 4096);
     static_assert(std::same_as<
