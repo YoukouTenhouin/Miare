@@ -671,7 +671,7 @@ template<class Limits, class Allocator>
         auto& compression = ProviderAccess::compression(providers);
         StoredBytes<Allocator> candidate{ByteAllocator{allocator}};
         const auto candidateBytes = compression.compressBound(decoded.size());
-        if (candidateBytes > ZSTD_compressBound(decoded.size())) {
+        if (candidateBytes > zstdCompressBound(decoded.size())) {
             throw DatabaseError{
                 Errc::ProviderUnavailable,
                 "compression provider requested excessive output storage"};

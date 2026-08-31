@@ -46,11 +46,13 @@ private:
         value.size()};
 }
 
+#if MIARE_HAS_ZSTD
 [[nodiscard]] miare::ProviderSet compressionOnlyProviders() {
     return miare::detail::ProviderAccess::make(
         nullptr,
         std::make_unique<miare::testing::FaultInjectingCompressionProvider>());
 }
+#endif
 
 [[nodiscard]] std::string text(miare::ByteView value) {
     return {
@@ -104,9 +106,15 @@ void portableBlake2bChecksumsMatchKnownVectors() {
         input[index] = std::byte{static_cast<unsigned char>(index)};
     }
     const auto portable = miare::detail::blake2b<32>(input);
+#if MIARE_HAS_SODIUM
     std::array<std::byte, 32> provider{};
     miare::detail::SodiumCryptoProvider{}.hashBlake2b256(input, provider);
     assert(portable == provider);
+#else
+    assert(hex(portable) ==
+        "c636324d47d89f2b2434dc2c99410066"
+        "3fbbaea880ff020fc5de89dd0f77a1ec");
+#endif
 }
 
 void deterministicSuiteZeroBytesAreCanonical(
@@ -176,6 +184,7 @@ void entropyFailureLeavesNoFile(const TemporaryDirectory& directory) {
     assert(!std::filesystem::exists(path));
 }
 
+#if MIARE_HAS_SODIUM
 void cryptoCapabilityIsNeverUsedBySuiteZero(
     const TemporaryDirectory& directory) {
     const auto path = directory.path() / "crypto-spy-plain.miare";
@@ -211,7 +220,9 @@ void cryptoCapabilityIsNeverUsedBySuiteZero(
         backupPath, providersWithSpy()).valid);
     assert(calls->load(std::memory_order_relaxed) == 0);
 }
+#endif
 
+#if MIARE_HAS_ZSTD
 void compressionFailuresAreExplicit(const TemporaryDirectory& directory) {
     miare::UnencryptedCreateOptions options;
     options.compression = miare::Compression::ZStd;
@@ -239,6 +250,7 @@ void compressionFailuresAreExplicit(const TemporaryDirectory& directory) {
     });
     database.close();
 }
+#endif
 
 void keylessDatabaseNeedsNoOptionalProvider(const TemporaryDirectory& directory) {
     const auto path = directory.path() / "plain.miare";
@@ -320,6 +332,7 @@ void suiteMismatchIsRejectedBeforeProviderUse(const TemporaryDirectory& director
     });
     assert(!std::filesystem::exists(rejectedCreate));
 
+#if MIARE_HAS_SODIUM && MIARE_HAS_ZSTD
     const auto encryptedPath = directory.path() / "mismatch-encrypted.miare";
     auto encrypted = miare::Database<>::create(
         encryptedPath,
@@ -334,8 +347,10 @@ void suiteMismatchIsRejectedBeforeProviderUse(const TemporaryDirectory& director
         (void)miare::Database<>::verifyUnencryptedFile(
             encryptedPath, miare::ProviderSet::none());
     });
+#endif
 }
 
+#if MIARE_HAS_ZSTD
 void unencryptedCompressionDoesNotRequireCrypto(const TemporaryDirectory& directory) {
     const auto path = directory.path() / "compressed-plain.miare";
     miare::UnencryptedCreateOptions options;
@@ -361,6 +376,7 @@ void unencryptedCompressionDoesNotRequireCrypto(const TemporaryDirectory& direct
     assert(miare::Database<>::verifyUnencryptedFile(
         path, compressionOnlyProviders()).valid);
 }
+#endif
 
 void checksumCorruptionIsReported(const TemporaryDirectory& directory) {
     const auto path = directory.path() / "corrupt.miare";
@@ -451,11 +467,17 @@ int main() {
     const TemporaryDirectory directory;
     deterministicSuiteZeroBytesAreCanonical(directory);
     entropyFailureLeavesNoFile(directory);
+#if MIARE_HAS_SODIUM
     cryptoCapabilityIsNeverUsedBySuiteZero(directory);
+#endif
+#if MIARE_HAS_ZSTD
     compressionFailuresAreExplicit(directory);
+#endif
     keylessDatabaseNeedsNoOptionalProvider(directory);
     suiteMismatchIsRejectedBeforeProviderUse(directory);
+#if MIARE_HAS_ZSTD
     unencryptedCompressionDoesNotRequireCrypto(directory);
+#endif
     checksumCorruptionIsReported(directory);
     bothPublicationChecksumLossIsCorruption(directory);
     recoveryRejectsTornInactivePublication(directory);

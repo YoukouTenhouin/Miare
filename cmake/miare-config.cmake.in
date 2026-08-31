@@ -1,26 +1,29 @@
 @PACKAGE_INIT@
 
-find_path(MIARE_SODIUM_INCLUDE_DIR sodium.h REQUIRED)
-find_library(MIARE_SODIUM_LIBRARY NAMES sodium libsodium REQUIRED)
-find_path(MIARE_ZSTD_INCLUDE_DIR zstd.h REQUIRED)
-find_library(MIARE_ZSTD_LIBRARY NAMES zstd libzstd REQUIRED)
-
-if(NOT TARGET miare::sodium)
-    add_library(miare::sodium UNKNOWN IMPORTED)
-    set_target_properties(
-        miare::sodium
-        PROPERTIES
-            IMPORTED_LOCATION "${MIARE_SODIUM_LIBRARY}"
-            INTERFACE_INCLUDE_DIRECTORIES "${MIARE_SODIUM_INCLUDE_DIR}")
+if(@MIARE_HAS_SODIUM@)
+    find_path(MIARE_SODIUM_INCLUDE_DIR sodium.h REQUIRED)
+    find_library(MIARE_SODIUM_LIBRARY NAMES sodium libsodium REQUIRED)
+    if(NOT TARGET miare::sodium)
+        add_library(miare::sodium UNKNOWN IMPORTED)
+        set_target_properties(
+            miare::sodium
+            PROPERTIES
+                IMPORTED_LOCATION "${MIARE_SODIUM_LIBRARY}"
+                INTERFACE_INCLUDE_DIRECTORIES "${MIARE_SODIUM_INCLUDE_DIR}")
+    endif()
 endif()
 
-if(NOT TARGET miare::zstd)
-    add_library(miare::zstd UNKNOWN IMPORTED)
-    set_target_properties(
-        miare::zstd
-        PROPERTIES
-            IMPORTED_LOCATION "${MIARE_ZSTD_LIBRARY}"
-            INTERFACE_INCLUDE_DIRECTORIES "${MIARE_ZSTD_INCLUDE_DIR}")
+if(@MIARE_HAS_ZSTD@)
+    find_path(MIARE_ZSTD_INCLUDE_DIR zstd.h REQUIRED)
+    find_library(MIARE_ZSTD_LIBRARY NAMES zstd libzstd REQUIRED)
+    if(NOT TARGET miare::zstd)
+        add_library(miare::zstd UNKNOWN IMPORTED)
+        set_target_properties(
+            miare::zstd
+            PROPERTIES
+                IMPORTED_LOCATION "${MIARE_ZSTD_LIBRARY}"
+                INTERFACE_INCLUDE_DIRECTORIES "${MIARE_ZSTD_INCLUDE_DIR}")
+    endif()
 endif()
 
 include("${CMAKE_CURRENT_LIST_DIR}/miare-targets.cmake")

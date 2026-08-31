@@ -112,6 +112,7 @@ private:
     bool released_ = false;
 };
 
+#if MIARE_HAS_SODIUM
 class DeterministicCryptoProvider final
     : public detail::CryptoProvider,
       private ProviderFailureInjection {
@@ -247,14 +248,16 @@ private:
     bool randomEntered_ = false;
     bool releaseRandom_ = false;
 };
+#endif
 
+#if MIARE_HAS_ZSTD
 class FaultInjectingCompressionProvider final
     : public detail::CompressionProvider,
       private ProviderFailureInjection {
 public:
     [[nodiscard]] std::size_t compressBound(std::size_t inputBytes) const override {
         if (requestMaximumOutputStorage_) {
-            return ZSTD_compressBound(detail::maxProviderUnitBytes);
+            return detail::zstdCompressBound(detail::maxProviderUnitBytes);
         }
         return delegate_.compressBound(inputBytes);
     }
@@ -309,6 +312,7 @@ private:
     bool requestMaximumOutputStorage_ = false;
     bool reportExcessiveOutput_ = false;
 };
+#endif
 
 class MemoryDurableFile final : public detail::DurableFile {
 public:
