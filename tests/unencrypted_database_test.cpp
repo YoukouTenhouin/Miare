@@ -460,6 +460,36 @@ void recoveryRejectsTornInactivePublication(
     reopened.close();
 }
 
+void writeCursorTreeAcceptsShorterLaterSeparators(
+    const TemporaryDirectory& directory) {
+    const auto path = directory.path() / "short-separators.miare";
+    auto database = miare::Database<>::createUnencrypted(path);
+    auto write = database.beginWrite();
+    const std::string value(100, 'v');
+    write.put(bytes(std::string(3, '\x01')), bytes(value));
+    for (std::size_t index = 0; index != 150; ++index) {
+        auto key = std::string(19, '\x10');
+        key[17] = static_cast<char>(index >> 8U);
+        key[18] = static_cast<char>(index);
+        write.put(bytes(key), bytes(value));
+    }
+    for (std::size_t index = 0; index != 150; ++index) {
+        auto key = std::string(18, '\x20');
+        key[16] = static_cast<char>(index >> 8U);
+        key[17] = static_cast<char>(index);
+        write.put(bytes(key), bytes(value));
+    }
+
+    auto cursor = write.scan();
+    std::size_t count = 0;
+    for (auto found = cursor.first(); found; found = cursor.next()) {
+        ++count;
+    }
+    assert(count == 301);
+    write.commit();
+    database.close();
+}
+
 } // namespace
 
 int main() {
@@ -481,4 +511,5 @@ int main() {
     checksumCorruptionIsReported(directory);
     bothPublicationChecksumLossIsCorruption(directory);
     recoveryRejectsTornInactivePublication(directory);
+    writeCursorTreeAcceptsShorterLaterSeparators(directory);
 }
