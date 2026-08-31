@@ -178,6 +178,10 @@ public:
             if (!GetOverlappedResult(handle_, &position, &count, TRUE)) {
                 const auto error = GetLastError();
                 CloseHandle(position.hEvent);
+                if (error == ERROR_HANDLE_EOF) {
+                    throw DatabaseError{Errc::Io,
+                                        "unexpected end of database file"};
+                }
                 SetLastError(error);
                 throwWindows(Errc::Io, "positioned read failed");
             }

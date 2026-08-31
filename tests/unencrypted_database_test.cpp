@@ -70,6 +70,23 @@ void expectDatabaseError(miare::Errc expected, Operation&& operation) {
     }
 }
 
+void shortFilesReportPlatformNeutralUnexpectedEnd(
+    const TemporaryDirectory& directory) {
+    const auto path = directory.path() / "short.miare";
+    {
+        std::ofstream output{path, std::ios::binary};
+        output << "not a database";
+    }
+
+    try {
+        (void)miare::Database<>::openUnencrypted(path);
+        assert(false);
+    } catch (const miare::DatabaseError& error) {
+        assert(error.code() == miare::Errc::Io);
+        assert(!error.nativeCode());
+    }
+}
+
 [[nodiscard]] std::string hex(miare::ByteView bytes) {
     constexpr char digits[] = "0123456789abcdef";
     std::string result;
@@ -511,5 +528,6 @@ int main() {
     checksumCorruptionIsReported(directory);
     bothPublicationChecksumLossIsCorruption(directory);
     recoveryRejectsTornInactivePublication(directory);
+    shortFilesReportPlatformNeutralUnexpectedEnd(directory);
     writeCursorTreeAcceptsShorterLaterSeparators(directory);
 }

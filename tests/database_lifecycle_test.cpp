@@ -204,6 +204,26 @@ void visibleCompatibilityFieldsHaveStableErrors(
     });
 }
 
+void shortFilesReportPlatformNeutralUnexpectedEnd(
+    const TemporaryDirectory& temporary) {
+    const auto path = temporary.path() / "short.miare";
+    {
+        std::ofstream output{path, std::ios::binary};
+        output << "not a database";
+    }
+
+    try {
+        (void)miare::Database<>::open(
+            path,
+            miare::EncryptionKeyView{keyBytes},
+            deterministicProviders(25));
+        assert(false);
+    } catch (const miare::DatabaseError& error) {
+        assert(error.code() == miare::Errc::Io);
+        assert(!error.nativeCode());
+    }
+}
+
 void oneAuthenticPublicationSlotIsEnough(const TemporaryDirectory& temporary) {
     const auto path = temporary.path() / "one-slot.miare";
     const miare::EncryptionKeyView key{keyBytes};
@@ -379,6 +399,7 @@ int main() {
     cleanCloseRemovesRolledBackBlobTail(temporary);
     wrongKeyAndBootstrapTamperingAreAuthenticationFailures(temporary);
     visibleCompatibilityFieldsHaveStableErrors(temporary);
+    shortFilesReportPlatformNeutralUnexpectedEnd(temporary);
     oneAuthenticPublicationSlotIsEnough(temporary);
     missingRequiredProviderFailsExplicitly(temporary);
     creationRejectsInvalidInputsWithoutReplacingFiles(temporary);
