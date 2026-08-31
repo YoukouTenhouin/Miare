@@ -122,6 +122,9 @@ int main() {
     }
 
     ZstdCompressionProvider compression;
+    assert(compression.compressBound(0) == zstdCompressBound(0));
+    assert(compression.compressBound(1024 * 1024) ==
+           zstdCompressBound(1024 * 1024));
     std::vector<std::byte> uncompressed(1024 * 1024, std::byte{0x2a});
     std::vector<std::byte> frame(compression.compressBound(uncompressed.size()));
     const auto frameSize = compression.compress(uncompressed, frame);
@@ -196,6 +199,22 @@ int main() {
     auto providers = ProviderSet::system();
     (void)ProviderAccess::crypto(providers);
     (void)ProviderAccess::compression(providers);
+    auto cryptoProviders = ProviderSet::systemCrypto();
+    (void)ProviderAccess::crypto(cryptoProviders);
+    try {
+        (void)ProviderAccess::compression(cryptoProviders);
+        assert(false);
+    } catch (const DatabaseError& error) {
+        assert(error.code() == Errc::ProviderUnavailable);
+    }
+    auto compressionProviders = ProviderSet::systemCompression();
+    (void)ProviderAccess::compression(compressionProviders);
+    try {
+        (void)ProviderAccess::crypto(compressionProviders);
+        assert(false);
+    } catch (const DatabaseError& error) {
+        assert(error.code() == Errc::ProviderUnavailable);
+    }
     static_assert(!std::is_constructible_v<
                   ProviderSet,
                   std::unique_ptr<CryptoProvider>,

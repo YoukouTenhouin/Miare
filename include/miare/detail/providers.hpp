@@ -3,7 +3,17 @@
 #include <miare/error.hpp>
 #include <miare/types.hpp>
 
+#ifndef MIARE_HAS_SODIUM
+#define MIARE_HAS_SODIUM 1
+#endif
+#ifndef MIARE_HAS_ZSTD
+#define MIARE_HAS_ZSTD 1
+#endif
+
+#if MIARE_HAS_SODIUM
 #include <sodium.h>
+#endif
+#if MIARE_HAS_ZSTD
 #ifndef ZSTD_STATIC_LINKING_ONLY
 #define ZSTD_STATIC_LINKING_ONLY
 #define MIARE_UNDEFINE_ZSTD_STATIC_LINKING_ONLY
@@ -13,6 +23,7 @@
 #ifdef MIARE_UNDEFINE_ZSTD_STATIC_LINKING_ONLY
 #undef ZSTD_STATIC_LINKING_ONLY
 #undef MIARE_UNDEFINE_ZSTD_STATIC_LINKING_ONLY
+#endif
 #endif
 
 #include <algorithm>
@@ -35,6 +46,14 @@ inline constexpr std::size_t aeadNonceBytes = 24;
 inline constexpr std::size_t authenticationTagBytes = 16;
 inline constexpr std::size_t maxProviderUnitBytes = 16U * 1024U * 1024U;
 inline constexpr std::size_t maxRandomRequestBytes = 1024U * 1024U;
+
+[[nodiscard]] constexpr std::size_t zstdCompressBound(
+    std::size_t inputBytes) noexcept {
+    const auto margin = inputBytes < 128U * 1024U
+        ? ((128U * 1024U - inputBytes) >> 11U)
+        : 0U;
+    return inputBytes + (inputBytes >> 8U) + margin;
+}
 
 class EntropySource {
 public:
@@ -127,6 +146,7 @@ inline void requireSize(MutableByteView bytes, std::size_t expected, const char*
     requireSize(ByteView{bytes.data(), bytes.size()}, expected, name);
 }
 
+#if MIARE_HAS_SODIUM
 class SodiumCryptoProvider final : public CryptoProvider {
 public:
     SodiumCryptoProvider() {
@@ -311,12 +331,18 @@ private:
         throw DatabaseError{Errc::ProviderUnavailable, message};
     }
 };
+#endif
 
+#if MIARE_HAS_ZSTD
 class ZstdCompressionProvider final : public CompressionProvider {
 public:
     [[nodiscard]] std::size_t compressBound(std::size_t inputBytes) const override {
         requireDecodedBound(inputBytes);
-        return ZSTD_compressBound(inputBytes);
+        const auto bound = ZSTD_compressBound(inputBytes);
+        if (bound != zstdCompressBound(inputBytes)) {
+            throwProviderFailure("Zstandard compression bound is incompatible");
+        }
+        return bound;
     }
 
     [[nodiscard]] std::size_t compress(
@@ -419,6 +445,7 @@ private:
         throw DatabaseError{Errc::Corrupt, message};
     }
 };
+#endif
 
 } // namespace miare::detail
 
@@ -436,12 +463,30 @@ public:
         return ProviderSet{nullptr, nullptr};
     }
 
+#if MIARE_HAS_SODIUM
+    /// Creates a production provider set with only the libsodium capability.
+    [[nodiscard]] static ProviderSet systemCrypto() {
+        return ProviderSet{
+            std::make_unique<detail::SodiumCryptoProvider>(), nullptr};
+    }
+#endif
+
+#if MIARE_HAS_ZSTD
+    /// Creates a production provider set with only the Zstandard capability.
+    [[nodiscard]] static ProviderSet systemCompression() {
+        return ProviderSet{
+            nullptr, std::make_unique<detail::ZstdCompressionProvider>()};
+    }
+#endif
+
+#if MIARE_HAS_SODIUM && MIARE_HAS_ZSTD
     /// Creates the production provider set backed by libsodium and Zstandard.
     [[nodiscard]] static ProviderSet system() {
         return ProviderSet{
             std::make_unique<detail::SodiumCryptoProvider>(),
             std::make_unique<detail::ZstdCompressionProvider>()};
     }
+#endif
 
     /// Moves ownership of every provider capability.
     ProviderSet(ProviderSet&&) noexcept = default;
