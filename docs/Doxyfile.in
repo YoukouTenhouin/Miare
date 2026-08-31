@@ -1,0 +1,67 @@
+PROJECT_NAME           = "Miare"
+PROJECT_NUMBER         = "@PROJECT_VERSION@"
+PROJECT_BRIEF          = "C++20 header-only embedded database"
+
+OUTPUT_DIRECTORY       = "@CMAKE_CURRENT_BINARY_DIR@"
+CREATE_SUBDIRS         = NO
+ALLOW_UNICODE_NAMES    = YES
+OUTPUT_LANGUAGE        = English
+
+INPUT                  = "@CMAKE_CURRENT_SOURCE_DIR@/README.md" \
+                         "@CMAKE_CURRENT_SOURCE_DIR@/docs/index.md" \
+                         "@CMAKE_CURRENT_SOURCE_DIR@/docs/getting-started.md" \
+                         "@CMAKE_CURRENT_SOURCE_DIR@/docs/transactions.md" \
+                         "@CMAKE_CURRENT_SOURCE_DIR@/docs/blobs.md" \
+                         "@CMAKE_CURRENT_SOURCE_DIR@/docs/operations.md" \
+                         "@CMAKE_CURRENT_SOURCE_DIR@/docs/public-transaction-contract.md" \
+                         "@CMAKE_CURRENT_SOURCE_DIR@/docs/recovery-maintenance-verification-contract.md" \
+                         "@CMAKE_CURRENT_SOURCE_DIR@/docs/portable-btree-blob-format.md" \
+                         "@CMAKE_CURRENT_SOURCE_DIR@/docs/v1-qualification.md" \
+                         "@CMAKE_CURRENT_SOURCE_DIR@/include/miare/database.hpp" \
+                         "@CMAKE_CURRENT_SOURCE_DIR@/include/miare/types.hpp" \
+                         "@CMAKE_CURRENT_SOURCE_DIR@/include/miare/error.hpp" \
+                         "@CMAKE_CURRENT_SOURCE_DIR@/include/miare/result.hpp" \
+                         "@CMAKE_CURRENT_SOURCE_DIR@/include/miare/detail/providers.hpp" \
+                         "@CMAKE_CURRENT_SOURCE_DIR@/include/miare/detail/ordered_cursor.hpp" \
+                         "@CMAKE_CURRENT_SOURCE_DIR@/examples/key_value.cpp" \
+                         "@CMAKE_CURRENT_SOURCE_DIR@/examples/blob.cpp" \
+                         "@CMAKE_CURRENT_SOURCE_DIR@/examples/example_support.hpp"
+FILE_PATTERNS          = *.hpp *.md
+RECURSIVE              = NO
+EXCLUDE_SYMBOLS        = miare::detail::* miare::testing::* example::* std::* main
+USE_MDFILE_AS_MAINPAGE = "@CMAKE_CURRENT_SOURCE_DIR@/docs/index.md"
+
+EXTRACT_ALL            = NO
+EXTRACT_PRIVATE        = NO
+EXTRACT_PACKAGE        = NO
+EXTRACT_STATIC         = YES
+EXTRACT_LOCAL_CLASSES  = NO
+HIDE_UNDOC_MEMBERS     = NO
+HIDE_UNDOC_CLASSES     = NO
+BUILTIN_STL_SUPPORT    = YES
+
+JAVADOC_AUTOBRIEF      = YES
+MARKDOWN_SUPPORT       = YES
+AUTOLINK_SUPPORT       = YES
+TOC_INCLUDE_HEADINGS   = 4
+
+FULL_PATH_NAMES        = YES
+STRIP_FROM_PATH        = "@CMAKE_CURRENT_SOURCE_DIR@/"
+SOURCE_BROWSER         = YES
+INLINE_SOURCES         = NO
+
+QUIET                  = NO
+WARNINGS               = YES
+WARN_IF_UNDOCUMENTED   = YES
+WARN_IF_DOC_ERROR      = YES
+WARN_NO_PARAMDOC       = NO
+WARN_AS_ERROR          = YES
+
+GENERATE_HTML          = YES
+HTML_OUTPUT            = html
+GENERATE_TREEVIEW      = YES
+DISABLE_INDEX          = NO
+GENERATE_LATEX         = NO
+GENERATE_XML           = NO
+
+HAVE_DOT               = NO

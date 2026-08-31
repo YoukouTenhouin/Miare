@@ -48,6 +48,12 @@ makeOrderedCursorLifetime(
             std::this_thread::get_id()});
 }
 
+/// Navigation handle exposed as `Database::ReadCursor` or `Database::WriteCursor`.
+///
+/// A cursor is move-constructible, non-copyable, and initially unpositioned.
+/// It is bound to its transaction thread. Returned key and value views remain
+/// valid until movement, destruction, transaction termination, or write-cursor
+/// invalidation.
 template<class Allocator, class Limits, bool Write>
 class OrderedCursor {
 private:
@@ -94,6 +100,8 @@ public:
         ++lifetime_->liveCursors;
     }
 
+    /// Positions at the first key in the configured range.
+    /// @return `true` if a key was found.
     [[nodiscard]] bool first() {
         requireFunctional();
         const auto found = lower_
@@ -102,6 +110,8 @@ public:
         return found && acceptUpperBound();
     }
 
+    /// Positions at the last key in the configured range.
+    /// @return `true` if a key was found.
     [[nodiscard]] bool last() {
         requireFunctional();
         bool found;
@@ -122,6 +132,8 @@ public:
         return true;
     }
 
+    /// Positions at the first in-range key not less than `key`.
+    /// @return `true` if a key was found.
     [[nodiscard]] bool seekLowerBound(ByteView key) {
         requireFunctional();
         if (key.size() > Limits::maxKeyBytes) {
@@ -137,6 +149,8 @@ public:
         return found && acceptUpperBound();
     }
 
+    /// Moves to the next key in the range.
+    /// @return `false` after crossing the range and becoming unpositioned.
     [[nodiscard]] bool next() {
         requirePositioned();
         if (!moveToNextValue() || !acceptUpperBound()) {
@@ -146,6 +160,8 @@ public:
         return true;
     }
 
+    /// Moves to the previous key in the range.
+    /// @return `false` after crossing the range and becoming unpositioned.
     [[nodiscard]] bool previous() {
         requirePositioned();
         if (!moveToPreviousValue() || !acceptLowerBound()) {
@@ -155,15 +171,18 @@ public:
         return true;
     }
 
+    /// Returns whether the cursor is functional and positioned on a key.
     [[nodiscard]] bool positioned() const noexcept {
         return functional() && positioned_;
     }
 
+    /// Returns a view of the current key.
     [[nodiscard]] ByteView key() const {
         requirePositioned();
         return leaf().values[valueIndex_].key;
     }
 
+    /// Returns a view of the current value.
     [[nodiscard]] ByteView value() const {
         requirePositioned();
         return leaf().values[valueIndex_].value;
