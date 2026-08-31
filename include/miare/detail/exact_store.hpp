@@ -924,8 +924,7 @@ template<class Entries>
     auto prefixLength = first.size();
     for (auto index = begin + 1; index != end && prefixLength != 0; ++index) {
         prefixLength = commonPrefixLength(
-            first.first(prefixLength),
-            ByteView{entries[index].key}.first(prefixLength));
+            first.first(prefixLength), ByteView{entries[index].key});
     }
     return prefixLength;
 }
@@ -1014,11 +1013,9 @@ template<class Allocator, class Nodes>
         ? 0
         : nodes[begin + 1].minimumKey.size();
     for (auto index = begin + 2; index < end; ++index) {
-        prefixLength = std::min(
-            prefixLength,
-            commonPrefixLength(
-                ByteView{nodes[begin + 1].minimumKey}.first(prefixLength),
-                ByteView{nodes[index].minimumKey}.first(prefixLength)));
+        prefixLength = commonPrefixLength(
+            ByteView{nodes[begin + 1].minimumKey}.first(prefixLength),
+            ByteView{nodes[index].minimumKey});
     }
     std::uint64_t used = PageLayout::bytes + prefixLength + (end - begin - 1) * 8ULL;
     for (auto index = begin + 1; index != end; ++index) {
@@ -1046,11 +1043,9 @@ template<class Limits, class Allocator, class Nodes>
         ? 0
         : nodes[begin + 1].minimumKey.size();
     for (auto index = begin + 2; index < end; ++index) {
-        prefixLength = std::min(
-            prefixLength,
-            commonPrefixLength(
-                ByteView{nodes[begin + 1].minimumKey}.first(prefixLength),
-                ByteView{nodes[index].minimumKey}.first(prefixLength)));
+        prefixLength = commonPrefixLength(
+            ByteView{nodes[begin + 1].minimumKey}.first(prefixLength),
+            ByteView{nodes[index].minimumKey});
     }
     const auto used = internalUsedLength<Allocator>(nodes, begin, end);
     if (used > payload.size()) {

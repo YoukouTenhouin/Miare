@@ -67,6 +67,9 @@ target_compile_definitions(
 
 include(GNUInstallDirs)
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+install(
+    FILES LICENSE
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/miare)
 install(TARGETS miare EXPORT miare-targets)
 install(
     EXPORT miare-targets

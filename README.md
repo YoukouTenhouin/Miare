@@ -6,6 +6,9 @@ crash recovery, verification, backup, and online maintenance in one portable
 database file. Encryption and compression are independent creation-time
 choices.
 
+Miare is available under the Mozilla Public License 2.0. See
+`LICENSE` for the complete terms.
+
 The V1 behavior and file format are frozen and qualified across Linux, macOS,
 and Windows. Existing encrypted V1 files remain byte-compatible. Miare project
 code is header-only; libsodium and Zstandard are linked only when their system

@@ -70,6 +70,23 @@ void expectDatabaseError(miare::Errc expected, Operation&& operation) {
     }
 }
 
+void shortFilesReportPlatformNeutralUnexpectedEnd(
+    const TemporaryDirectory& directory) {
+    const auto path = directory.path() / "short.miare";
+    {
+        std::ofstream output{path, std::ios::binary};
+        output << "not a database";
+    }
+
+    try {
+        (void)miare::Database<>::openUnencrypted(path);
+        assert(false);
+    } catch (const miare::DatabaseError& error) {
+        assert(error.code() == miare::Errc::Io);
+        assert(!error.nativeCode());
+    }
+}
+
 [[nodiscard]] std::string hex(miare::ByteView bytes) {
     constexpr char digits[] = "0123456789abcdef";
     std::string result;
@@ -460,6 +477,36 @@ void recoveryRejectsTornInactivePublication(
     reopened.close();
 }
 
+void writeCursorTreeAcceptsShorterLaterSeparators(
+    const TemporaryDirectory& directory) {
+    const auto path = directory.path() / "short-separators.miare";
+    auto database = miare::Database<>::createUnencrypted(path);
+    auto write = database.beginWrite();
+    const std::string value(100, 'v');
+    write.put(bytes(std::string(3, '\x01')), bytes(value));
+    for (std::size_t index = 0; index != 150; ++index) {
+        auto key = std::string(19, '\x10');
+        key[17] = static_cast<char>(index >> 8U);
+        key[18] = static_cast<char>(index);
+        write.put(bytes(key), bytes(value));
+    }
+    for (std::size_t index = 0; index != 150; ++index) {
+        auto key = std::string(18, '\x20');
+        key[16] = static_cast<char>(index >> 8U);
+        key[17] = static_cast<char>(index);
+        write.put(bytes(key), bytes(value));
+    }
+
+    auto cursor = write.scan();
+    std::size_t count = 0;
+    for (auto found = cursor.first(); found; found = cursor.next()) {
+        ++count;
+    }
+    assert(count == 301);
+    write.commit();
+    database.close();
+}
+
 } // namespace
 
 int main() {
@@ -481,4 +528,6 @@ int main() {
     checksumCorruptionIsReported(directory);
     bothPublicationChecksumLossIsCorruption(directory);
     recoveryRejectsTornInactivePublication(directory);
+    shortFilesReportPlatformNeutralUnexpectedEnd(directory);
+    writeCursorTreeAcceptsShorterLaterSeparators(directory);
 }
