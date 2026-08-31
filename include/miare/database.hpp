@@ -1212,6 +1212,10 @@ public:
     }
 
     /// Creates and opens a new unencrypted database without overwriting `path`.
+    ///
+    /// This keyless path never derives keys or invokes an AEAD provider. Its
+    /// unkeyed checksums detect accidental corruption but not malicious edits.
+    /// Zstandard compression requires a compression-capable provider set.
     [[nodiscard]] static Database createUnencrypted(
         const std::filesystem::path& path,
         UnencryptedCreateOptions options = {},
@@ -1284,6 +1288,8 @@ public:
     }
 
     /// Opens an existing unencrypted database and performs recovery if needed.
+    ///
+    /// Throws `DatabaseError` with `Errc::KeyRequired` for an encrypted file.
     [[nodiscard]] static Database openUnencrypted(
         const std::filesystem::path& path,
         ProviderSet providers = ProviderSet::none(),
@@ -1354,6 +1360,9 @@ public:
     }
 
     /// Verifies an exclusively owned unencrypted database file without modifying it.
+    ///
+    /// A valid report establishes checksum and structural validity only; it is
+    /// not cryptographic authentication or proof against adversarial changes.
     [[nodiscard]] static VerificationReport verifyUnencryptedFile(
         const std::filesystem::path& path,
         ProviderSet providers = ProviderSet::none(),

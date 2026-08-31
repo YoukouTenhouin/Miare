@@ -1,9 +1,10 @@
 # Miare V1 documentation
 
 Miare is a header-only C++20 embedded database with an ordered byte-string
-keyspace and first-class transactional Blobs. Every committed database is
-authenticated and encrypted. The default backend uses copy-on-write B+ tree
-generations, snapshot readers, and synchronous durable commits.
+keyspace and first-class transactional Blobs. Each database independently
+selects encryption and compression when created. The default backend uses
+copy-on-write B+ tree generations, snapshot readers, and synchronous durable
+commits.
 
 Start with these guides:
 
